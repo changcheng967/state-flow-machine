@@ -140,9 +140,12 @@ class Trainer:
         total_correct = 0
         total_samples = 0
 
-        start_time = time.time()
+        epoch_start = time.time()
+        print(f"  Training started at {time.strftime('%H:%M:%S')}")
 
         for batch_idx, batch in enumerate(self.train_loader):
+            batch_start = time.time()
+
             input_ids = batch["input_ids"].to(self.device)
             attention_mask = batch["attention_mask"].to(self.device)
             labels = batch["final_value"].to(self.device)
@@ -185,9 +188,20 @@ class Trainer:
 
             self.global_step += 1
 
-        epoch_time = time.time() - start_time
+            # Progress indicator - print dot for each batch
+            sys.stdout.write('.')
+            sys.stdout.flush()
+
+            # Print timing for first batch (usually slow due to NPU compilation)
+            if batch_idx == 0:
+                batch_time = time.time() - batch_start
+                print(f' [first batch: {batch_time:.2f}s]')
+
+        epoch_time = time.time() - epoch_start
         avg_loss = total_loss / len(self.train_loader)
         accuracy = total_correct / total_samples
+
+        print(f' done [{epoch_time:.2f}s total]')
 
         return {
             "loss": avg_loss,
@@ -381,6 +395,14 @@ def run_experiment(
         model_name="execution"
     )
 
+    # NPU warmup - compile graph with dummy input
+    if "npu" in str(device):
+        print("Warming up NPU (compiling graph for Execution System)...")
+        dummy = torch.randint(0, 100, (2, 32)).to(device)
+        with torch.no_grad():
+            _ = execution_wrapper(dummy)
+        print("NPU warmup complete.")
+
     execution_history = execution_trainer.train(
         num_epochs=config.num_epochs,
         save_dir=save_dir
@@ -412,6 +434,14 @@ def run_experiment(
         model_name="transformer",
         is_transformer=True
     )
+
+    # NPU warmup - compile graph with dummy input
+    if "npu" in str(device):
+        print("Warming up NPU (compiling graph for Transformer)...")
+        dummy = torch.randint(0, 100, (2, 32)).to(device)
+        with torch.no_grad():
+            _ = transformer(dummy, mask=torch.zeros(2, 32, dtype=torch.bool, device=device))
+        print("NPU warmup complete.")
 
     transformer_history = transformer_trainer.train(
         num_epochs=config.num_epochs,
