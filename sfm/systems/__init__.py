@@ -1,7 +1,7 @@
 """SFM Systems package - the 4 specialized systems."""
 
 from .perception import PerceptionSystem, PerceptionLayer, TokenEmbedding
-from .execution import ExecutionSystem, StatementProcessor, VariableBinder
+from .execution import ExecutionSystem
 from .structure import StructureSystem, CodeGraph, NODE_TYPES, EDGE_TYPES
 from .meta import MetaSystem, HypothesisRegister, PlanStack, VerificationHead
 
@@ -12,8 +12,6 @@ __all__ = [
     "TokenEmbedding",
     # Execution (System 2)
     "ExecutionSystem",
-    "StatementProcessor",
-    "VariableBinder",
     # Structure (System 3)
     "StructureSystem",
     "CodeGraph",

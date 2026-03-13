@@ -35,7 +35,7 @@ class SFMConfig:
     execution_num_slots: int = 64  # State Slot Bank size
     execution_slot_dim: int = 128  # Dimension per slot
     execution_num_heads: int = 4
-    execution_max_ticks: int = 8  # Max internal ticks per statement
+    execution_max_ticks: int = 2  # Max internal ticks per statement (reduced for speed)
     execution_halting_threshold: float = 0.5
 
     # DeltaNet cell parameters
@@ -103,7 +103,7 @@ class SFMConfig:
             execution_num_slots=16,
             execution_slot_dim=64,
             execution_num_heads=2,
-            execution_max_ticks=4,
+            execution_max_ticks=2,
             deltanet_hidden_dim=128,
             deltanet_num_heads=2,
             structure_node_dim=64,
