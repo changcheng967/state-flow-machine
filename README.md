@@ -96,14 +96,16 @@ sfm/
     └── visualize.py
 ```
 
-## Hardware Support
+## Hardware Requirements
 
-Auto-detects and uses:
-1. Huawei Ascend NPUs (torch_npu)
-2. NVIDIA CUDA
-3. CPU (fallback)
+**Designed for Huawei Ascend NPUs only.**
 
-No configuration needed — just run.
+Requires:
+- Huawei Ascend NPU (910ProA recommended)
+- torch_npu package
+- CANN software stack
+
+No CUDA or CPU fallback — this architecture is optimized for Ascend hardware.
 
 ## Testing
 
