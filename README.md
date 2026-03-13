@@ -57,11 +57,37 @@ logits = model(tokens)  # (1, 64, 32000)
 Proves System 2 (State Slots) works better than transformers for tracking program state.
 
 ```bash
-# Quick smoke test
+# Quick smoke test (single NPU)
 python experiments/exp0_state_tracking/run.py --quick
 
-# Full experiment
+# Full experiment (single NPU)
 python experiments/exp0_state_tracking/run.py --epochs 10 --samples 10000
+```
+
+### Multi-NPU Distributed Training
+
+```bash
+# 4 NPUs on single node
+bash scripts/train_multi_npu.sh --npus 4
+
+# Quick test on 4 NPUs
+bash scripts/train_multi_npu.sh --npus 4 --quick
+
+# Multi-node training (2 nodes, 4 NPUs each)
+# On node 0 (master):
+bash scripts/train_multi_npu.sh --npus 4 --nodes 2 --node_rank 0 --master_addr 10.0.0.1
+
+# On node 1:
+bash scripts/train_multi_npu.sh --npus 4 --nodes 2 --node_rank 1 --master_addr 10.0.0.1
+```
+
+Or using torchrun directly:
+```bash
+# Single node, 4 NPUs
+torchrun --nproc_per_node=4 experiments/exp0_state_tracking/train_distributed.py
+
+# With gradient accumulation (effective batch size = 32 * 4 * 4 = 512)
+torchrun --nproc_per_node=4 experiments/exp0_state_tracking/train_distributed.py --grad_accum 4
 ```
 
 **PASS criteria**: State Slots generalize to 4× program length, transformer doesn't.
@@ -106,6 +132,20 @@ Requires:
 - CANN software stack
 
 No CUDA or CPU fallback — this architecture is optimized for Ascend hardware.
+
+## Distributed Training Features
+
+- **DataParallel (DP)** - Single process, multiple NPUs
+- **DistributedDataParallel (DDP)** - Multi-process, best performance
+- **Gradient Accumulation** - Simulate larger batch sizes
+- **Mixed Precision (AMP)** - Automatic loss scaling for fp16
+- **HCCL Backend** - Huawei's collective communication library
+
+```python
+# Check distributed setup
+from sfm.utils import print_distributed_info
+print_distributed_info()
+```
 
 ## Testing
 
