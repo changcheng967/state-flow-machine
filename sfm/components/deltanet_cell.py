@@ -1,5 +1,5 @@
 """
-DeltaNet Recurrent Cell - OPTIMIZED with Parallel Scan
+DeltaNet Recurrent Cell - CUBE-FIRST PARALLEL SCAN
 
 The core component enabling state tracking. Uses eigenvalues in [-1, 1]
 (not [0, 1] like standard RNNs) which enables tracking state transformations
@@ -8,7 +8,11 @@ that transformers cannot do (TC0 circuit complexity limit).
 Key insight: Negative eigenvalues allow the cell to "subtract" state,
 enabling reversible computations and proper tracking of variable mutations.
 
-OPTIMIZATION: Parallel scan replaces sequential Python loop with batched ops.
+CUBE-FIRST OPTIMIZATION for Ascend NPU:
+- Reshape sequence into chunks of size 16 (matches Cube unit width)
+- Within-chunk recurrence uses MATRIX MULTIPLICATION (runs on Cube)
+- Between-chunk carry uses Vector unit
+- This gives Cube+Vector pipeline parallelism
 """
 
 import torch
@@ -20,15 +24,11 @@ import math
 
 class DeltaNetCell(nn.Module):
     """
-    DeltaNet recurrent cell with learnable eigenvalues in [-1, 1] - OPTIMIZED.
+    DeltaNet recurrent cell with learnable eigenvalues in [-1, 1].
 
-    Uses parallel scan for O(log n) sequential operations instead of O(n).
-
-    The recurrence is:
-        h_t = lambda_t * alpha_t * h_{t-1} + beta_t * x_t
-
-    Which can be computed in parallel as:
-        h_t = (prod a_1..t) * h_0 + sum_{j=1}^{t} (prod a_{j+1}..t) * b_j
+    CUBE-FIRST: Uses matrix-based parallel scan within 16-step chunks.
+    The 16x16 lower-triangular matrix M is computed and multiplied,
+    utilizing the DaVinci Cube unit efficiently.
     """
 
     def __init__(
@@ -38,7 +38,7 @@ class DeltaNetCell(nn.Module):
         num_heads: int = 4,
         eigenvalue_init: float = 0.9,
         dropout: float = 0.1,
-        chunk_size: int = 16  # For chunked parallel scan
+        chunk_size: int = 16  # Cube unit width for optimal performance
     ):
         super().__init__()
 
@@ -50,6 +50,8 @@ class DeltaNetCell(nn.Module):
         self.chunk_size = chunk_size
 
         assert hidden_dim % num_heads == 0, "hidden_dim must be divisible by num_heads"
+        assert hidden_dim % 16 == 0, "hidden_dim must be multiple of 16 for Cube optimization"
+        assert self.head_dim % 16 == 0 or self.head_dim >= 16, "head_dim should be >= 16 for Cube"
 
         # Combined projections for efficiency
         self.input_proj = nn.Linear(input_dim, hidden_dim, bias=False)
@@ -67,6 +69,9 @@ class DeltaNetCell(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
 
+        # Pre-compute chunk scan matrices for chunk_size=16
+        self._register_chunk_matrices()
+
     def _init_eigenvalues(self, init_value: float):
         """Initialize eigenvalue parameters."""
         if abs(init_value) >= 1:
@@ -78,121 +83,169 @@ class DeltaNetCell(nn.Module):
         """Get eigenvalues constrained to [-1, 1]."""
         return torch.tanh(self.eigenvalue_raw)
 
-    def _parallel_scan(
+    def _register_chunk_matrices(self):
+        """Pre-compute indices for chunk-based parallel scan."""
+        # For chunk_size=16, we create a lower triangular matrix pattern
+        # This is used to compute the prefix products/sums efficiently
+        chunk_size = self.chunk_size
+        # Register indices for lower triangular construction
+        tri_indices = torch.tril_indices(chunk_size, chunk_size)
+        self.register_buffer('tri_indices', tri_indices, persistent=False)
+
+    def _compute_chunk_matrix(self, a_chunk: torch.Tensor) -> torch.Tensor:
+        """
+        Compute the 16x16 lower-triangular matrix M for chunk scan.
+
+        M[i,j] = prod(a_k, k=j+1..i) for i>j
+        M[i,i] = 1
+        M[i,j] = 0 for i<j
+
+        This matrix multiply runs on the Cube unit: M @ B_chunk
+
+        Args:
+            a_chunk: (batch, chunk_len, num_heads) - decay factors
+
+        Returns:
+            M: (batch, chunk_len, chunk_len, num_heads) - lower triangular matrices
+        """
+        batch_size, chunk_len, num_heads = a_chunk.shape
+
+        # Compute cumulative products: cumprod[i] = a_0 * a_1 * ... * a_i
+        cumprod = torch.cumprod(a_chunk, dim=1)  # (batch, chunk_len, num_heads)
+
+        # For M[i,j] = prod(a_k, k=j+1..i) = cumprod[i] / cumprod[j]
+        # For i=j: M[i,i] = 1
+        # For i<j: M[i,j] = 0
+
+        # Expand for broadcasting: (batch, chunk_len, 1, num_heads) / (batch, 1, chunk_len, num_heads)
+        cumprod_i = cumprod.unsqueeze(2)  # (batch, chunk_len, 1, num_heads)
+        cumprod_j = cumprod.unsqueeze(1)  # (batch, 1, chunk_len, num_heads)
+
+        # Compute ratio: (batch, chunk_len, chunk_len, num_heads)
+        # Use safe division with 1.0 for positions where j > i (will be zeroed anyway)
+        # M[i,j] = cumprod[i] / cumprod[j-1] for i >= j, with cumprod[-1] = 1
+
+        # For i >= j: M[i,j] = cumprod[i] / (cumprod[j-1] if j > 0 else 1)
+        # We can compute this as: cumprod[i] / cumprod[j] * a_j for i > j
+
+        # Simpler approach: create lower triangular mask and use cumprod
+        # M[i,j] = cumprod[i] / cumprod[j-1] for i > j (with cumprod[-1] = 1)
+        # M[i,i] = 1
+
+        # Create padded cumprod with 1 at position -1
+        ones = torch.ones(batch_size, 1, num_heads, device=a_chunk.device, dtype=a_chunk.dtype)
+        cumprod_padded = torch.cat([ones, cumprod], dim=1)  # (batch, chunk_len+1, num_heads)
+
+        # M[i,j] = cumprod[i] / cumprod[j-1+1] = cumprod[i] / cumprod[j] for i >= j
+        # But we need to handle the indexing correctly
+
+        # Create lower triangular mask
+        mask = torch.tril(torch.ones(chunk_len, chunk_len, device=a_chunk.device, dtype=a_chunk.dtype))
+        mask = mask.unsqueeze(0).unsqueeze(-1)  # (1, chunk_len, chunk_len, 1)
+
+        # For positions i >= j: M[i,j] = cumprod[i] / cumprod_padded[j]
+        # where cumprod_padded[j] = 1 for j=0, else cumprod[j-1]
+        cumprod_j_padded = cumprod_padded[:, :-1, :].unsqueeze(1)  # (batch, 1, chunk_len, num_heads)
+        cumprod_i_exp = cumprod.unsqueeze(2)  # (batch, chunk_len, 1, num_heads)
+
+        # Safe division
+        M = torch.where(
+            cumprod_j_padded.abs() > 1e-8,
+            cumprod_i_exp / cumprod_j_padded,
+            torch.zeros_like(cumprod_i_exp)
+        )
+
+        # Apply mask and set diagonal to 1
+        M = M * mask
+
+        # Set diagonal to 1 (i=j positions)
+        diag_mask = torch.eye(chunk_len, device=a_chunk.device, dtype=a_chunk.dtype)
+        diag_mask = diag_mask.unsqueeze(0).unsqueeze(-1)  # (1, chunk_len, chunk_len, 1)
+        M = M * (1 - diag_mask) + diag_mask
+
+        return M  # (batch, chunk_len, chunk_len, num_heads)
+
+    def _cube_parallel_scan(
         self,
         a: torch.Tensor,  # (batch, seq_len, num_heads, 1) - decay factors
         b: torch.Tensor,  # (batch, seq_len, num_heads, head_dim) - inputs
         h0: torch.Tensor  # (batch, num_heads, head_dim) - initial state
     ) -> torch.Tensor:
         """
-        Parallel scan for linear recurrence: h_t = a_t * h_{t-1} + b_t
+        Cube-first parallel scan for linear recurrence: h_t = a_t * h_{t-1} + b_t
 
-        Uses associative scan: compute prefix products and weighted sums.
+        Uses chunked matrix-based scan for within-chunk computation (Cube unit),
+        with sequential carry between chunks (Vector unit).
         """
         batch_size, seq_len, num_heads, head_dim = b.shape
+        device = b.device
+        dtype = b.dtype
 
-        # Reshape a for broadcasting: (batch, seq_len, num_heads, 1)
-        # a_t = decay factor at each timestep
+        chunk_size = self.chunk_size
 
-        # Compute cumulative products of a (prefix products)
-        # We need: prod_{i=1}^{t} a_i for each t
-        # cumprod gives us this directly
+        # Pad sequence to multiple of chunk_size
+        pad_len = (chunk_size - seq_len % chunk_size) % chunk_size
+        if pad_len > 0:
+            a = F.pad(a, (0, 0, 0, 0, 0, pad_len))
+            b = F.pad(b, (0, 0, 0, 0, 0, pad_len))
+            padded_seq_len = seq_len + pad_len
+        else:
+            padded_seq_len = seq_len
 
-        # For numerical stability with potential negative values, we work directly
-        # cumprod handles the sign correctly
+        num_chunks = padded_seq_len // chunk_size
 
-        # a_cumprod[t] = a_0 * a_1 * ... * a_{t-1}
-        # We want to start with a_0 * h0, so we prepend 1
-        a_flat = a.squeeze(-1)  # (batch, seq_len, num_heads)
+        # Reshape to chunks: (batch, num_chunks, chunk_size, ...)
+        a_flat = a.squeeze(-1)  # (batch, padded_seq_len, num_heads)
+        a_chunks = a_flat.view(batch_size, num_chunks, chunk_size, num_heads)
+        b_chunks = b.view(batch_size, num_chunks, chunk_size, num_heads, head_dim)
 
-        # Compute: h_t = a_t * h_{t-1} + b_t
-        # In parallel form:
-        # h_t = (prod_{i=0}^{t-1} a_i) * h_0 + sum_{j=0}^{t-1} (prod_{i=j+1}^{t-1} a_i) * b_j
-
-        # First, compute the decay coefficients for b
-        # coef[t, j] = prod_{i=j+1}^{t} a_i for j < t, else 0
-
-        # Simplified approach using chunked sequential for stability
-        # Process in chunks to balance parallelism and numerical stability
-
-        chunk_size = min(self.chunk_size, seq_len)
+        # Process each chunk
         h = h0  # (batch, num_heads, head_dim)
         outputs = []
 
-        for chunk_start in range(0, seq_len, chunk_size):
-            chunk_end = min(chunk_start + chunk_size, seq_len)
-            chunk_len = chunk_end - chunk_start
+        for chunk_idx in range(num_chunks):
+            a_chunk = a_chunks[:, chunk_idx, :, :]  # (batch, chunk_size, num_heads)
+            b_chunk = b_chunks[:, chunk_idx, :, :, :]  # (batch, chunk_size, num_heads, head_dim)
 
-            a_chunk = a_flat[:, chunk_start:chunk_end, :]  # (batch, chunk_len, num_heads)
-            b_chunk = b[:, chunk_start:chunk_end, :, :]  # (batch, chunk_len, num_heads, head_dim)
+            # CUBE OPERATION: Compute chunk scan matrix M
+            M = self._compute_chunk_matrix(a_chunk)  # (batch, chunk_size, chunk_size, num_heads)
 
-            # Within chunk, compute parallel scan
-            # h_0 = h (from previous chunk or initial)
-            # h_t = a_t * h_{t-1} + b_t
+            # CUBE OPERATION: M @ B_chunk - matrix multiply for each batch and head
+            # Reshape for batched matmul: treat (batch, num_heads) as batch dims
+            # M: (batch, chunk_size, chunk_size, num_heads) -> (batch*num_heads, chunk_size, chunk_size)
+            # B: (batch, chunk_size, num_heads, head_dim) -> (batch*num_heads, chunk_size, head_dim)
 
-            # Compute prefix products within chunk
-            # cum_a[t] = prod_{i=0}^{t} a_i
-            cum_a = torch.cumprod(a_chunk, dim=1)  # (batch, chunk_len, num_heads)
+            M_flat = M.permute(0, 3, 1, 2).reshape(batch_size * num_heads, chunk_size, chunk_size)
+            B_flat = b_chunk.permute(0, 2, 3, 1).reshape(batch_size * num_heads, chunk_size, head_dim)
 
-            # Compute contributions: for position t, the contribution from position j (j <= t)
-            # is: (prod_{i=j+1}^{t} a_i) * b_j = (cum_a[t] / cum_a[j]) * b_j
+            # CUBE: Matrix multiply M @ B
+            h_contrib = torch.bmm(M_flat, B_flat)  # (batch*num_heads, chunk_size, head_dim)
+            h_contrib = h_contrib.view(batch_size, num_heads, chunk_size, head_dim)
+            h_contrib = h_contrib.permute(0, 2, 1, 3)  # (batch, chunk_size, num_heads, head_dim)
 
-            # For t=0: h_0 = a_0 * h + b_0
-            # For t=1: h_1 = a_1 * h_0 + b_1 = a_1 * a_0 * h + a_1 * b_0 + b_1
-            # etc.
+            # VECTOR OPERATION: Add initial state contribution
+            # h_chunk[t] includes h0 * (prod a_0..a_{t-1}) contribution
+            # This is the first term of the scan
+            cum_a = torch.cumprod(a_chunk, dim=1)  # (batch, chunk_size, num_heads)
+            h0_contrib = cum_a.unsqueeze(-1) * h.unsqueeze(1).unsqueeze(-1)
+            # h: (batch, num_heads, head_dim) -> (batch, 1, num_heads, head_dim)
+            # cum_a: (batch, chunk_size, num_heads) -> (batch, chunk_size, num_heads, 1)
 
-            # Compute: cum_a[t] * h + sum_{j=0}^{t} (cum_a[t] / cum_a[j]) * b_j
+            h0_contrib = cum_a.unsqueeze(-1) * h.unsqueeze(1)  # (batch, chunk_size, num_heads, head_dim)
 
-            # First term: cum_a[t] * h
-            # h is (batch, num_heads, head_dim)
-            # cum_a is (batch, chunk_len, num_heads)
-            h_expanded = h.unsqueeze(1)  # (batch, 1, num_heads, head_dim)
-            cum_a_expanded = cum_a.unsqueeze(-1)  # (batch, chunk_len, num_heads, 1)
-
-            first_term = cum_a_expanded * h_expanded  # (batch, chunk_len, num_heads, head_dim)
-
-            # Second term: sum_{j=0}^{t} (cum_a[t] / cum_a[j]) * b_j
-            # This is a lower triangular matrix multiplication
-            # We can compute it efficiently using cumulative sums
-
-            # For the scan: define c_j = b_j / cum_a[j]
-            # Then: sum_{j=0}^{t} cum_a[t] * c_j = cum_a[t] * sum_{j=0}^{t} c_j
-
-            # Avoid division by zero by using a small epsilon
-            cum_a_safe = cum_a.unsqueeze(-1)  # (batch, chunk_len, num_heads, 1)
-            cum_a_safe = torch.clamp(cum_a_safe, min=1e-6)
-
-            # Prepend cum_a=1 for position -1 (before chunk)
-            cum_a_with_first = torch.cat([
-                torch.ones(batch_size, 1, num_heads, 1, device=a.device, dtype=a.dtype),
-                cum_a_safe
-            ], dim=1)  # (batch, chunk_len+1, num_heads, 1)
-
-            # c_j = b_j / cum_a[j] (using cum_a up to position j-1)
-            # Actually for position j, we want cum_a up to j-1
-            # So c_j = b_j / cum_a_with_first[j]
-            c = b_chunk / cum_a_with_first[:, 1:, :, :]  # (batch, chunk_len, num_heads, head_dim)
-
-            # Cumulative sum of c
-            cum_c = torch.cumsum(c, dim=1)  # (batch, chunk_len, num_heads, head_dim)
-
-            # Second term: cum_a[t] * cum_c[t]
-            second_term = cum_a_safe * cum_c  # (batch, chunk_len, num_heads, head_dim)
-
-            # Total: h_t = first_term + second_term
-            # But we need to account for initial h correctly
-            # Actually first_term = cum_a[t] * h accounts for the initial state
-            # And second_term accounts for the b contributions
-
-            h_chunk = first_term + second_term  # (batch, chunk_len, num_heads, head_dim)
+            # Total: h_chunk = h0_contrib + h_contrib
+            h_chunk = h0_contrib + h_contrib  # (batch, chunk_size, num_heads, head_dim)
 
             outputs.append(h_chunk)
 
-            # Update h for next chunk (last position of this chunk)
+            # VECTOR OPERATION: Carry forward last hidden state for next chunk
             h = h_chunk[:, -1, :, :]  # (batch, num_heads, head_dim)
 
         # Concatenate all chunks
-        h_all = torch.cat(outputs, dim=1)  # (batch, seq_len, num_heads, head_dim)
+        h_all = torch.cat(outputs, dim=1)  # (batch, padded_seq_len, num_heads, head_dim)
+
+        # Remove padding
+        h_all = h_all[:, :seq_len, :, :]  # (batch, seq_len, num_heads, head_dim)
 
         return h_all
 
@@ -202,7 +255,7 @@ class DeltaNetCell(nn.Module):
         h: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Forward pass - OPTIMIZED with parallel scan.
+        Forward pass with Cube-first parallel scan.
 
         Args:
             x: Input tensor (batch, seq_len, input_dim) or (batch, input_dim).
@@ -231,7 +284,6 @@ class DeltaNetCell(nn.Module):
         x_proj = self.layer_norm(x_proj)
 
         # BATCHED: Compute gates for all positions
-        # For simplicity, use x_proj directly (could add h contribution)
         gates = self.gate_proj(x_proj)  # (batch, seq_len, num_heads * 2)
         alpha_gate, beta_gate = gates.chunk(2, dim=-1)  # Each: (batch, seq_len, num_heads)
         alpha_gate = torch.sigmoid(alpha_gate)
@@ -251,8 +303,8 @@ class DeltaNetCell(nn.Module):
         # Initial hidden state as heads
         h0 = h.view(batch_size, self.num_heads, self.head_dim)  # (batch, num_heads, head_dim)
 
-        # Parallel scan
-        h_all = self._parallel_scan(a, b, h0)  # (batch, seq_len, num_heads, head_dim)
+        # Cube-first parallel scan
+        h_all = self._cube_parallel_scan(a, b, h0)  # (batch, seq_len, num_heads, head_dim)
 
         # Reshape to full hidden dim
         h_all = h_all.view(batch_size, seq_len, self.hidden_dim)  # (batch, seq_len, hidden_dim)
@@ -357,21 +409,21 @@ class DeltaNetStack(nn.Module):
 if __name__ == "__main__":
     # Smoke test
     print("=" * 60)
-    print("DeltaNet Cell (Optimized Parallel Scan) Smoke Test")
+    print("DeltaNet Cell (Cube-First Parallel Scan) Smoke Test")
     print("=" * 60)
 
     torch.manual_seed(42)
     import time
 
     batch_size = 4
-    seq_len = 128  # Longer sequence to test parallelism
+    seq_len = 128
     input_dim = 64
-    hidden_dim = 128
+    hidden_dim = 256  # Multiple of 16
     num_heads = 4
 
     # Test single cell
-    print("\n1. Testing DeltaNetCell with parallel scan...")
-    cell = DeltaNetCell(input_dim, hidden_dim, num_heads, chunk_size=32)
+    print("\n1. Testing DeltaNetCell with Cube-first parallel scan...")
+    cell = DeltaNetCell(input_dim, hidden_dim, num_heads, chunk_size=16)
 
     x = torch.randn(batch_size, seq_len, input_dim)
 
@@ -388,8 +440,17 @@ if __name__ == "__main__":
     assert h.shape == (batch_size, hidden_dim), "Hidden state shape mismatch!"
     print("   [OK] DeltaNetCell test passed!")
 
+    # Verify dimensions are multiples of 16
+    print("\n2. Verifying dimension alignment (multiples of 16)...")
+    assert hidden_dim % 16 == 0, f"hidden_dim {hidden_dim} not multiple of 16"
+    assert (hidden_dim // num_heads) % 16 == 0 or (hidden_dim // num_heads) >= 16, \
+        f"head_dim {hidden_dim // num_heads} not optimal for Cube"
+    print(f"   hidden_dim: {hidden_dim} (x{hidden_dim // 16})")
+    print(f"   head_dim: {hidden_dim // num_heads}")
+    print("   [OK] Dimension alignment verified!")
+
     # Performance test
-    print("\n2. Performance test (100 iterations)...")
+    print("\n3. Performance test (100 iterations)...")
     start = time.time()
     for _ in range(100):
         output, h = cell(x, h)
@@ -397,7 +458,7 @@ if __name__ == "__main__":
     print(f"   100 iterations: {elapsed:.3f}s ({elapsed*10:.1f}ms per iter)")
 
     # Test single step
-    print("\n3. Testing single-step execution...")
+    print("\n4. Testing single-step execution...")
     x_single = torch.randn(batch_size, input_dim)
     output_single, h_new = cell(x_single, h)
     print(f"   Single input shape: {x_single.shape}")
@@ -406,7 +467,7 @@ if __name__ == "__main__":
     print("   [OK] Single-step test passed!")
 
     # Test layer
-    print("\n4. Testing DeltaNetLayer...")
+    print("\n5. Testing DeltaNetLayer...")
     layer = DeltaNetLayer(input_dim, hidden_dim, num_heads)
     output, h = layer(x)
     print(f"   Layer output shape: {output.shape}")
@@ -414,7 +475,7 @@ if __name__ == "__main__":
     print("   [OK] DeltaNetLayer test passed!")
 
     # Test stack
-    print("\n5. Testing DeltaNetStack...")
+    print("\n6. Testing DeltaNetStack...")
     stack = DeltaNetStack(input_dim, hidden_dim, num_layers=3, num_heads=num_heads)
 
     start = time.time()
@@ -429,14 +490,14 @@ if __name__ == "__main__":
     print("   [OK] DeltaNetStack test passed!")
 
     # Test eigenvalue constraints
-    print("\n6. Testing eigenvalue constraints...")
+    print("\n7. Testing eigenvalue constraints...")
     eigenvalues = cell.get_eigenvalues()
     assert (eigenvalues >= -1).all() and (eigenvalues <= 1).all(), "Eigenvalues out of bounds!"
     print(f"   Eigenvalues in [-1, 1]: {eigenvalues}")
     print("   [OK] Eigenvalue constraint test passed!")
 
     # Test gradient flow
-    print("\n7. Testing gradient flow...")
+    print("\n8. Testing gradient flow...")
     loss = output.sum()
     loss.backward()
     grad_count = sum(1 for p in cell.parameters() if p.grad is not None and p.grad.abs().sum() > 0)
@@ -449,5 +510,5 @@ if __name__ == "__main__":
     print(f"\n   Total parameters in cell: {total_params:,}")
 
     print("\n" + "=" * 60)
-    print("All DeltaNet (Optimized) tests passed!")
+    print("All DeltaNet (Cube-First) tests passed!")
     print("=" * 60)

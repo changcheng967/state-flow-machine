@@ -3,6 +3,9 @@ SFM Configuration — All hyperparameters in one place.
 
 This module defines all hyperparameters for the State-Flow Machine architecture.
 Modify these values to experiment with different model sizes.
+
+ASCEND NPU OPTIMIZATION: All dimensions are multiples of 16 for DaVinci Cube unit.
+The Cube unit has a 16x16x16 MAC array, so dimensions aligned to 16 maximize utilization.
 """
 
 from dataclasses import dataclass, field
@@ -17,10 +20,10 @@ class SFMConfig:
     vocab_size: int = 32000
     max_seq_len: int = 4096
 
-    # Shared embedding dimension
+    # Shared embedding dimension (multiple of 16 for Cube)
     d_model: int = 512
 
-    # Cross-system bridge dimension
+    # Cross-system bridge dimension (multiple of 16)
     d_bridge: int = 256
 
     # Dropout (applied throughout)
@@ -28,26 +31,26 @@ class SFMConfig:
 
     # === System 1: Perception ===
     perception_num_layers: int = 8
-    perception_num_heads: int = 8
-    perception_ff_dim: int = 2048
+    perception_num_heads: int = 8  # head_dim = 512/8 = 64 (multiple of 16)
+    perception_ff_dim: int = 2048  # multiple of 16
 
     # === System 2: Execution ===
-    execution_num_slots: int = 64  # State Slot Bank size
-    execution_slot_dim: int = 128  # Dimension per slot
-    execution_num_heads: int = 4
-    execution_max_ticks: int = 2  # Max internal ticks per statement (reduced for speed)
+    execution_num_slots: int = 64  # multiple of 16
+    execution_slot_dim: int = 128  # multiple of 16
+    execution_num_heads: int = 4   # head_dim = 128/4 = 32 (multiple of 16)
+    execution_max_ticks: int = 2   # reduced for speed
     execution_halting_threshold: float = 0.5
 
-    # DeltaNet cell parameters
+    # DeltaNet cell parameters (all multiples of 16)
     deltanet_hidden_dim: int = 256
-    deltanet_num_heads: int = 4
-    deltanet_eigenvalue_init: float = 0.9  # Initialize eigenvalues close to 1
+    deltanet_num_heads: int = 4  # head_dim = 256/4 = 64 (multiple of 16)
+    deltanet_eigenvalue_init: float = 0.9
 
     # === System 3: Structure ===
-    structure_node_dim: int = 256
-    structure_edge_dim: int = 128
+    structure_node_dim: int = 256  # multiple of 16
+    structure_edge_dim: int = 128  # multiple of 16
     structure_num_layers: int = 4
-    structure_num_heads: int = 4
+    structure_num_heads: int = 4   # head_dim = 256/4 = 64 (multiple of 16)
     structure_max_nodes: int = 1024
     structure_max_edges: int = 4096
 
@@ -62,21 +65,20 @@ class SFMConfig:
     )
 
     # === System 4: Meta ===
-    meta_hidden_dim: int = 256
-    meta_num_heads: int = 4
-    meta_hypothesis_dim: int = 128
+    meta_hidden_dim: int = 256  # multiple of 16
+    meta_num_heads: int = 4     # head_dim = 256/4 = 64
+    meta_hypothesis_dim: int = 128  # multiple of 16
     meta_plan_stack_depth: int = 8
     meta_verification_threshold: float = 0.8
 
     # === Training ===
-    learning_rate: float = 1e-4
+    learning_rate: float = 3e-4  # INCREASED for regression
     weight_decay: float = 0.01
-    warmup_steps: int = 1000
+    warmup_steps: int = 500
     max_grad_norm: float = 1.0
     seed: int = 42
 
     # === Bridge synchronization ===
-    # Systems exchange info every N perception layers
     bridge_sync_interval: int = 2
 
     def __post_init__(self):
@@ -87,35 +89,46 @@ class SFMConfig:
             "execution_slot_dim must be divisible by execution_num_heads"
         assert self.d_model > 0 and self.d_bridge > 0, \
             "Dimensions must be positive"
+        # Verify all dimensions are multiples of 16 for Cube optimization
+        assert self.d_model % 16 == 0, "d_model must be multiple of 16"
+        assert self.d_bridge % 16 == 0, "d_bridge must be multiple of 16"
+        assert self.execution_slot_dim % 16 == 0, "execution_slot_dim must be multiple of 16"
+        assert self.deltanet_hidden_dim % 16 == 0, "deltanet_hidden_dim must be multiple of 16"
 
     @classmethod
     def small(cls) -> "SFMConfig":
-        """Small configuration for testing/debugging - INCREASED CAPACITY."""
+        """
+        Small configuration for testing/debugging.
+
+        ALL dimensions are multiples of 16 for DaVinci Cube optimization.
+        """
         return cls(
             vocab_size=1000,
             max_seq_len=512,
-            d_model=256,  # INCREASED from 128
-            d_bridge=128,  # INCREASED from 64
+            d_model=256,      # 16 * 16
+            d_bridge=256,     # 16 * 16 (INCREASED for better capacity)
             dropout=0.1,
             perception_num_layers=2,
-            perception_num_heads=4,
-            perception_ff_dim=512,  # INCREASED from 256
-            execution_num_slots=32,  # INCREASED from 16
-            execution_slot_dim=128,  # INCREASED from 64
-            execution_num_heads=4,  # INCREASED from 2
+            perception_num_heads=4,   # head_dim = 64
+            perception_ff_dim=512,    # 16 * 32
+            execution_num_slots=64,   # 16 * 4 (INCREASED)
+            execution_slot_dim=128,   # 16 * 8
+            execution_num_heads=4,    # head_dim = 32
             execution_max_ticks=2,
-            deltanet_hidden_dim=256,  # INCREASED from 128
-            deltanet_num_heads=4,  # INCREASED from 2
-            structure_node_dim=128,  # INCREASED from 64
-            structure_edge_dim=64,  # INCREASED from 32
+            deltanet_hidden_dim=256,  # 16 * 16
+            deltanet_num_heads=4,     # head_dim = 64
+            structure_node_dim=256,   # 16 * 16
+            structure_edge_dim=128,   # 16 * 8
             structure_num_layers=2,
-            structure_num_heads=4,  # INCREASED from 2
+            structure_num_heads=4,    # head_dim = 64
             structure_max_nodes=256,
             structure_max_edges=512,
-            meta_hidden_dim=128,  # INCREASED from 64
-            meta_num_heads=4,  # INCREASED from 2
-            meta_hypothesis_dim=64,  # INCREASED from 32
+            meta_hidden_dim=256,      # 16 * 16
+            meta_num_heads=4,         # head_dim = 64
+            meta_hypothesis_dim=128,  # 16 * 8
             meta_plan_stack_depth=4,
+            learning_rate=3e-4,
+            warmup_steps=500,
         )
 
     @classmethod
@@ -125,31 +138,31 @@ class SFMConfig:
 
     @classmethod
     def large(cls) -> "SFMConfig":
-        """Large configuration for more capacity."""
+        """Large configuration for more capacity (all dimensions multiples of 16)."""
         return cls(
             vocab_size=32000,
             max_seq_len=8192,
-            d_model=768,
-            d_bridge=384,
+            d_model=768,       # 16 * 48
+            d_bridge=384,      # 16 * 24
             dropout=0.1,
             perception_num_layers=12,
-            perception_num_heads=12,
-            perception_ff_dim=3072,
-            execution_num_slots=128,
-            execution_slot_dim=192,
-            execution_num_heads=6,
+            perception_num_heads=12,  # head_dim = 64
+            perception_ff_dim=3072,   # 16 * 192
+            execution_num_slots=128,  # 16 * 8
+            execution_slot_dim=192,   # 16 * 12
+            execution_num_heads=6,    # head_dim = 32
             execution_max_ticks=8,
-            deltanet_hidden_dim=512,
-            deltanet_num_heads=8,
-            structure_node_dim=384,
-            structure_edge_dim=192,
+            deltanet_hidden_dim=512,  # 16 * 32
+            deltanet_num_heads=8,     # head_dim = 64
+            structure_node_dim=384,   # 16 * 24
+            structure_edge_dim=192,   # 16 * 12
             structure_num_layers=6,
-            structure_num_heads=6,
+            structure_num_heads=6,    # head_dim = 64
             structure_max_nodes=2048,
             structure_max_edges=8192,
-            meta_hidden_dim=384,
-            meta_num_heads=6,
-            meta_hypothesis_dim=192,
+            meta_hidden_dim=384,      # 16 * 24
+            meta_num_heads=6,         # head_dim = 64
+            meta_hypothesis_dim=192,  # 16 * 12
             meta_plan_stack_depth=12,
         )
 
@@ -170,9 +183,12 @@ class ExperimentConfig:
 
     # Training
     batch_size: int = 32
-    num_epochs: int = 10
+    num_epochs: int = 50  # INCREASED from 10
     eval_every: int = 100
     save_every: int = 500
+
+    # Gradient accumulation
+    grad_accum_steps: int = 2  # effective_batch = 32 * 4 * 2 = 256
 
     # Evaluation
     eval_max_length_multiplier: int = 4  # Test generalization to 4x length
@@ -192,6 +208,7 @@ class ExperimentConfig:
             num_epochs=1,
             eval_every=10,
             save_every=50,
+            grad_accum_steps=1,
         )
 
 

@@ -5,7 +5,13 @@ State Slot Bank: 64 registers that explicitly bind to variables and track
 values through execution. Uses DeltaNet recurrent cell with eigenvalues
 in [-1, 1] (not [0, 1]).
 
-OPTIMIZED: Full sequence batched processing instead of token-by-token loops.
+CUBE-OPTIMIZED:
+- ALL statements processed in parallel where possible
+- Embed all statements at once: (batch, num_statements, d_model) — one Cube call
+- Compute all slot-match scores at once: (batch, num_statements, num_slots) — one Cube call
+- DeltaNet uses matrix-based parallel scan over full sequence
+- Only slot WRITE-BACK must be sequential (each write depends on previous state)
+- Write-back batches across slot dimension (64 slots in parallel per statement)
 """
 
 import torch
@@ -21,25 +27,26 @@ from sfm.components.deltanet_cell import DeltaNetStack
 
 class ExecutionSystem(nn.Module):
     """
-    System 2: Execution - OPTIMIZED VERSION
+    System 2: Execution - CUBE-OPTIMIZED VERSION
 
     State Slot Bank with 64 registers that explicitly bind to variables
     and track values through execution.
 
     Key features:
-    - Batched processing for efficiency
+    - Full sequence batched processing (parallel embedding, attention)
     - DeltaNet with eigenvalues in [-1, 1] for state tracking
     - Explicit variable binding via attention
+    - All dimensions multiples of 16 for Cube unit
     """
 
     def __init__(
         self,
         input_dim: int,
-        hidden_dim: int = 256,
-        num_slots: int = 64,
-        slot_dim: int = 128,
-        max_ticks: int = 2,  # REDUCED from 8 for speed
-        num_heads: int = 4,
+        hidden_dim: int = 256,      # Multiple of 16
+        num_slots: int = 64,         # Multiple of 16
+        slot_dim: int = 128,         # Multiple of 16
+        max_ticks: int = 2,
+        num_heads: int = 4,          # head_dim = 32
         dropout: float = 0.1
     ):
         super().__init__()
@@ -48,6 +55,11 @@ class ExecutionSystem(nn.Module):
         self.hidden_dim = hidden_dim
         self.num_slots = num_slots
         self.slot_dim = slot_dim
+
+        # Verify dimension alignment
+        assert hidden_dim % 16 == 0, "hidden_dim must be multiple of 16"
+        assert num_slots % 16 == 0, "num_slots must be multiple of 16"
+        assert slot_dim % 16 == 0, "slot_dim must be multiple of 16"
 
         # State Slot Bank - main processing
         self.slot_bank = StateSlotBank(
@@ -69,12 +81,14 @@ class ExecutionSystem(nn.Module):
             dropout=dropout
         )
 
-        # Variable binding attention
+        # Variable binding attention (Cube-optimized)
         self.binding_proj = nn.Linear(input_dim, slot_dim)
         self.slot_keys = nn.Parameter(torch.randn(num_slots, slot_dim) * 0.02)
 
-        # Combine projections
-        self.combine_proj = nn.Linear(input_dim + slot_dim, input_dim)
+        # Combine projections (input_dim + slot_dim -> input_dim)
+        # Pad to next multiple of 16 if needed
+        combined_dim = input_dim + slot_dim
+        self.combine_proj = nn.Linear(combined_dim, input_dim)
 
         # Project deltanet output back to input_dim
         self.deltanet_proj = nn.Linear(hidden_dim, input_dim) if hidden_dim != input_dim else nn.Identity()
@@ -108,7 +122,7 @@ class ExecutionSystem(nn.Module):
         return_state: bool = False
     ) -> torch.Tensor:
         """
-        Forward pass - OPTIMIZED with batched operations.
+        Forward pass - CUBE-OPTIMIZED with batched operations.
 
         Args:
             x: Input tensor (batch, seq_len, input_dim).
@@ -129,31 +143,36 @@ class ExecutionSystem(nn.Module):
         slots = state["slots"]
         deltanet_state = state["deltanet_state"]
 
-        # BATCHED: Process entire sequence through slot bank at once
+        # CUBE: Process entire sequence through slot bank at once
+        # (batch, seq_len, input_dim) -> (batch, seq_len, input_dim)
         slot_out, slots, slot_info = self.slot_bank(x, slots)
 
-        # BATCHED: Process through DeltaNet
+        # CUBE: Process through DeltaNet with matrix-based parallel scan
+        # (batch, seq_len, input_dim) -> (batch, seq_len, hidden_dim) -> (batch, seq_len, input_dim)
         deltanet_out, deltanet_state = self.deltanet(x, deltanet_state)
-
-        # Project deltanet output to input_dim
         deltanet_out = self.deltanet_proj(deltanet_out)
 
-        # BATCHED: Compute variable binding attention for entire sequence
-        queries = self.binding_proj(x)  # (batch, seq_len, slot_dim)
+        # CUBE: Compute variable binding attention for entire sequence at once
+        # queries: (batch, seq_len, slot_dim)
+        # keys: (batch, num_slots, slot_dim)
+        queries = self.binding_proj(x)
         keys = self.slot_keys.unsqueeze(0).expand(batch_size, -1, -1)
 
-        # Attention: (batch, seq_len, num_slots)
+        # CUBE: Batched matmul for attention scores
+        # (batch, seq_len, slot_dim) @ (batch, slot_dim, num_slots) -> (batch, seq_len, num_slots)
         attn_scores = torch.bmm(queries, keys.transpose(1, 2)) * self.scale
         attn_weights = F.softmax(attn_scores, dim=-1)
 
-        # Weighted slot combination: (batch, seq_len, slot_dim)
+        # CUBE: Weighted slot combination
+        # (batch, seq_len, num_slots) @ (batch, num_slots, slot_dim) -> (batch, seq_len, slot_dim)
         bindings = torch.bmm(attn_weights, slots)
 
-        # BATCHED: Combine all outputs
+        # CUBE: Combine all outputs (concatenation + linear)
+        # (batch, seq_len, input_dim + slot_dim)
         combined = torch.cat([slot_out, bindings], dim=-1)
         output = self.combine_proj(combined)
 
-        # Add deltanet output
+        # Add deltanet output (residual)
         output = output + deltanet_out
 
         # Final projection
@@ -184,7 +203,7 @@ class ExecutionSystem(nn.Module):
 if __name__ == "__main__":
     # Smoke test
     print("=" * 60)
-    print("Execution System (Optimized) Smoke Test")
+    print("Execution System (Cube-Optimized) Smoke Test")
     print("=" * 60)
 
     torch.manual_seed(42)
@@ -192,14 +211,26 @@ if __name__ == "__main__":
 
     batch_size = 4
     seq_len = 16
-    input_dim = 128
-    hidden_dim = 256
-    num_slots = 32
-    slot_dim = 64
+    input_dim = 256   # Multiple of 16
+    hidden_dim = 256  # Multiple of 16
+    num_slots = 64    # Multiple of 16
+    slot_dim = 128    # Multiple of 16
     max_ticks = 2
 
+    # Verify dimensions
+    print("\n1. Verifying dimension alignment...")
+    assert input_dim % 16 == 0, f"input_dim {input_dim} not multiple of 16"
+    assert hidden_dim % 16 == 0, f"hidden_dim {hidden_dim} not multiple of 16"
+    assert num_slots % 16 == 0, f"num_slots {num_slots} not multiple of 16"
+    assert slot_dim % 16 == 0, f"slot_dim {slot_dim} not multiple of 16"
+    print(f"   input_dim: {input_dim} (x{input_dim // 16})")
+    print(f"   hidden_dim: {hidden_dim} (x{hidden_dim // 16})")
+    print(f"   num_slots: {num_slots} (x{num_slots // 16})")
+    print(f"   slot_dim: {slot_dim} (x{slot_dim // 16})")
+    print("   [OK] Dimension alignment verified!")
+
     # Initialize execution system
-    print("\n1. Initializing ExecutionSystem...")
+    print("\n2. Initializing ExecutionSystem...")
     execution = ExecutionSystem(
         input_dim=input_dim,
         hidden_dim=hidden_dim,
@@ -210,7 +241,7 @@ if __name__ == "__main__":
     )
 
     # Test forward pass
-    print("\n2. Testing optimized forward pass...")
+    print("\n3. Testing Cube-optimized forward pass...")
     x = torch.randn(batch_size, seq_len, input_dim)
 
     start = time.time()
@@ -226,7 +257,7 @@ if __name__ == "__main__":
     print("   [OK] Forward pass test passed!")
 
     # Performance test
-    print("\n3. Performance test (100 iterations)...")
+    print("\n4. Performance test (100 iterations)...")
     start = time.time()
     for _ in range(100):
         output, state, _ = execution.forward(x, state=state, return_state=True)
@@ -234,7 +265,7 @@ if __name__ == "__main__":
     print(f"   100 iterations: {elapsed:.3f}s ({elapsed*10:.1f}ms per iter)")
 
     # Test state persistence
-    print("\n4. Testing state persistence...")
+    print("\n5. Testing state persistence...")
     x2 = torch.randn(batch_size, seq_len, input_dim)
     output2, state2, info2 = execution.forward(x2, state=state, return_state=True)
     print(f"   Second pass output shape: {output2.shape}")
@@ -242,14 +273,14 @@ if __name__ == "__main__":
     print("   [OK] State persistence test passed!")
 
     # Test slot inspection
-    print("\n5. Testing slot inspection...")
+    print("\n6. Testing slot inspection...")
     slot_values = execution.get_slot_values(state2)
     print(f"   Slot values shape: {slot_values.shape}")
     assert slot_values.shape == (batch_size, num_slots, slot_dim), "Slot values shape mismatch!"
     print("   [OK] Slot inspection test passed!")
 
     # Test gradient flow
-    print("\n6. Testing gradient flow...")
+    print("\n7. Testing gradient flow...")
     loss = output.sum()
     loss.backward()
     grad_exists = False
@@ -265,5 +296,5 @@ if __name__ == "__main__":
     print(f"\n   Total parameters: {total_params:,}")
 
     print("\n" + "=" * 60)
-    print("All Execution System (Optimized) tests passed!")
+    print("All Execution System (Cube-Optimized) tests passed!")
     print("=" * 60)

@@ -4,18 +4,31 @@ Training Script for State Tracking Experiment
 Trains both SFM Execution System (State Slots) and Transformer baseline
 for comparison on the state tracking task.
 
-FEATURES:
-- Multi-NPU DDP support (HCCL backend for Ascend)
+CUBE-OPTIMIZED for Ascend NPU:
+- Multi-NPU DDP support (HCCL backend)
 - Automatic Mixed Precision (AMP) for FP16 training
-- Gradient accumulation for larger effective batch sizes
-- Proper NPU warmup with real batch shapes
-- Fixed tensor shapes to avoid graph recompilation
-- Detailed timing for all phases
+- Gradient accumulation: effective_batch = batch_size * npus * accumulation_steps
+- Default: batch_size=32, accumulation_steps=2, so effective_batch = 32*4*2 = 256
+- Cosine annealing with linear warmup (500 steps)
+- torch.npu.synchronize() before timing measurements
+- Warmup with REAL batch shape
+
+LEARNING FIXES:
+- REGRESSION with MSE loss (not 500-class classification)
+- Output head: nn.Linear(d_model, 1) with sigmoid
+- Labels: float values normalized to [0, 1]
+- Accuracy = (prediction * 100).round() == target
+- Learning rate: 3e-4
+- Epochs: 50
 """
 
 # IMPORTANT: Import torch_npu FIRST before any torch.npu calls
-# torch_npu monkey-patches torch to add the .npu namespace
 import torch_npu
+
+# Apply NPU optimizations
+import os
+os.environ.setdefault('HCCL_CONNECT_TIMEOUT', '1200')
+os.environ.setdefault('HCCL_EXEC_TIMEOUT', '1200')
 
 import torch
 import torch.nn as nn
@@ -23,23 +36,65 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
 from typing import Dict, Optional, Tuple
 import time
-import os
 import sys
 import json
 import argparse
+import math
 
 sys.path.insert(0, str(__file__).rsplit('experiments', 1)[0])
 
 from sfm.config import SFMConfig, ExperimentConfig
 from sfm.systems.execution import ExecutionSystem
-from sfm.utils.device import get_device, set_seed
+from sfm.utils.device import get_device, set_seed, synchronize
 from sfm.tokenizer.code_tokenizer import SimpleTokenizer
 from baseline_transformer import TransformerEncoderOnly
 from dataset import create_dataloaders
 from generate_data import generate_and_save
+
+
+class WarmupCosineScheduler:
+    """
+    Cosine annealing with linear warmup.
+
+    - Linear warmup for warmup_steps
+    - Then cosine decay to min_lr
+    """
+
+    def __init__(
+        self,
+        optimizer,
+        warmup_steps: int,
+        total_steps: int,
+        min_lr: float = 1e-6
+    ):
+        self.optimizer = optimizer
+        self.warmup_steps = warmup_steps
+        self.total_steps = total_steps
+        self.min_lr = min_lr
+        self.base_lr = optimizer.param_groups[0]['lr']
+        self.current_step = 0
+
+    def step(self):
+        """Update learning rate."""
+        self.current_step += 1
+
+        if self.current_step <= self.warmup_steps:
+            # Linear warmup
+            lr = self.base_lr * self.current_step / self.warmup_steps
+        else:
+            # Cosine decay
+            progress = (self.current_step - self.warmup_steps) / (self.total_steps - self.warmup_steps)
+            lr = self.min_lr + 0.5 * (self.base_lr - self.min_lr) * (1 + math.cos(math.pi * progress))
+
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = lr
+
+        return lr
+
+    def get_lr(self) -> float:
+        return self.optimizer.param_groups[0]['lr']
 
 
 class StateTrackingWrapper(nn.Module):
@@ -75,7 +130,6 @@ class StateTrackingWrapper(nn.Module):
             pooled = (x * mask_exp).sum(dim=1) / mask_exp.sum(dim=1).clamp(min=1)
         else:
             pooled = x.mean(dim=1)
-        # Return (batch, 1), squeeze to (batch,) for loss computation
         return self.regressor(pooled).squeeze(-1)  # (batch,)
 
     def count_parameters(self) -> int:
@@ -83,7 +137,7 @@ class StateTrackingWrapper(nn.Module):
 
 
 class Trainer:
-    """Trainer with AMP, gradient accumulation, and detailed timing."""
+    """Trainer with AMP, gradient accumulation, and cosine warmup scheduler."""
 
     def __init__(
         self,
@@ -91,14 +145,16 @@ class Trainer:
         train_loader,
         val_loader,
         device: torch.device,
-        learning_rate: float = 1e-4,
+        learning_rate: float = 3e-4,  # INCREASED from 1e-4
         weight_decay: float = 0.01,
         max_grad_norm: float = 1.0,
         model_name: str = "model",
         is_transformer: bool = False,
-        grad_accum_steps: int = 1,
+        grad_accum_steps: int = 2,  # Default for effective batch 256
         use_amp: bool = True,
-        rank: int = 0
+        rank: int = 0,
+        warmup_steps: int = 500,
+        num_epochs: int = 50
     ):
         self.model = model
         self.train_loader = train_loader
@@ -112,8 +168,17 @@ class Trainer:
         self.rank = rank
 
         self.optimizer = AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-        self.scheduler = CosineAnnealingLR(self.optimizer, T_max=len(train_loader) * 10, eta_min=learning_rate * 0.01)
-        # REGRESSION: Use MSELoss instead of CrossEntropyLoss
+
+        # Cosine annealing with warmup
+        total_steps = len(train_loader) * num_epochs
+        self.scheduler = WarmupCosineScheduler(
+            self.optimizer,
+            warmup_steps=warmup_steps,
+            total_steps=total_steps,
+            min_lr=1e-6
+        )
+
+        # REGRESSION: Use MSELoss
         self.criterion = nn.MSELoss()
 
         # AMP scaler
@@ -121,7 +186,6 @@ class Trainer:
             try:
                 self.scaler = torch.npu.amp.GradScaler()
             except AttributeError:
-                # Fallback for older PyTorch
                 self.scaler = torch.cuda.amp.GradScaler()
         else:
             self.scaler = None
@@ -165,23 +229,22 @@ class Trainer:
 
         epoch_start = time.time()
         if self.rank == 0:
-            print(f"  Training started at {time.strftime('%H:%M:%S')}")
+            print(f"  Training started at {time.strftime('%H:%M:%S')}, LR: {self.scheduler.get_lr():.2e}")
 
         self.optimizer.zero_grad()
 
         for batch_idx, batch in enumerate(self.train_loader):
             input_ids = batch["input_ids"].to(self.device)
             attention_mask = batch["attention_mask"].to(self.device)
-            # REGRESSION: Get normalized target [0, 1] as float
             labels_norm = batch["final_value_normalized"].to(self.device).float()
-            labels_raw = batch["final_value"].to(self.device)  # For accuracy calc
+            labels_raw = batch["final_value"].to(self.device)
 
             mask = self._get_mask(attention_mask)
 
-            # Forward with AMP - output is (batch,) in range [0, 1]
+            # Forward with AMP
             predictions = self._forward_with_amp(input_ids, mask)
 
-            # Compute MSE loss (both in [0, 1] range)
+            # Compute MSE loss
             if self.use_amp:
                 try:
                     with torch.npu.amp.autocast():
@@ -217,8 +280,7 @@ class Trainer:
 
             # Track metrics
             total_loss += loss.item() * self.grad_accum_steps
-            # REGRESSION accuracy: correct if rounded prediction matches target
-            predicted_values = (predictions * 100).round().clamp(0, 100)  # Back to [0, 100]
+            predicted_values = (predictions * 100).round().clamp(0, 100)
             total_correct += (predicted_values == labels_raw).sum().item()
             total_samples += labels_raw.size(0)
             self.global_step += 1
@@ -228,9 +290,11 @@ class Trainer:
                 sys.stdout.write('.')
                 sys.stdout.flush()
                 if batch_idx == 0:
+                    synchronize()  # Ensure accurate timing
                     batch_time = time.time() - epoch_start
                     print(f' [first batch: {batch_time:.2f}s]')
 
+        synchronize()  # Synchronize before timing
         epoch_time = time.time() - epoch_start
         avg_loss = total_loss / len(self.train_loader)
         accuracy = total_correct / total_samples
@@ -264,7 +328,6 @@ class Trainer:
             loss = self.criterion(predictions, labels_norm)
 
             total_loss += loss.item()
-            # REGRESSION accuracy
             predicted_values = (predictions * 100).round().clamp(0, 100)
             total_correct += (predicted_values == labels_raw).sum().item()
             total_samples += labels_raw.size(0)
@@ -284,6 +347,7 @@ class Trainer:
 
         if self.rank == 0:
             print(f"\nTraining {self.model_name}...")
+            print(f"  Effective batch size: {len(self.train_loader.dataset) // len(self.train_loader) * self.grad_accum_steps}")
             print("-" * 60)
 
         for epoch in range(num_epochs):
@@ -302,9 +366,9 @@ class Trainer:
 
             # Validate (only rank 0)
             if self.rank == 0:
-                # Synchronize all processes before evaluation in distributed mode
                 if dist.is_initialized():
                     dist.barrier()
+                synchronize()
                 val_metrics = self.evaluate(self.val_loader)
                 history["val_loss"].append(val_metrics["loss"])
                 history["val_accuracy"].append(val_metrics["accuracy"])
@@ -315,7 +379,6 @@ class Trainer:
                 # Save best model
                 if save_dir and val_metrics["loss"] < self.best_val_loss:
                     self.best_val_loss = val_metrics["loss"]
-                    # Get underlying model from DDP wrapper
                     model_to_save = self.model.module if hasattr(self.model, 'module') else self.model
                     save_path = os.path.join(save_dir, f"{self.model_name}_best.pt")
                     torch.save({
@@ -334,7 +397,6 @@ def setup_distributed(rank: int, world_size: int):
     os.environ['MASTER_ADDR'] = '127.0.0.1'
     os.environ['MASTER_PORT'] = '29500'
 
-    # HCCL backend (lowercase!) for Ascend NPU distributed training
     backend = 'hccl'
     try:
         dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
@@ -344,7 +406,6 @@ def setup_distributed(rank: int, world_size: int):
         print(f"[Rank {rank}] HCCL is required for multi-NPU training on Ascend. Exiting.")
         sys.exit(1)
 
-    # torch_npu must be imported before this call
     torch.npu.set_device(rank)
 
 
@@ -356,10 +417,11 @@ def cleanup_distributed():
 def warmup_npu(model, train_loader, device, is_transformer: bool = False):
     """Warmup NPU with real batch to compile graphs (REGRESSION)."""
     print("Warming up NPU with real batch shape...")
+    synchronize()
+
     warmup_batch = next(iter(train_loader))
     input_ids = warmup_batch["input_ids"].to(device)
     attention_mask = warmup_batch["attention_mask"].to(device)
-    # REGRESSION: Use normalized target
     labels_norm = warmup_batch["final_value_normalized"].to(device).float()
 
     model.train()
@@ -376,12 +438,7 @@ def warmup_npu(model, train_loader, device, is_transformer: bool = False):
     loss.backward()
     model.zero_grad(set_to_none=True)
 
-    # Synchronize to ensure compilation finishes
-    try:
-        torch.npu.synchronize()
-    except AttributeError:
-        pass
-
+    synchronize()
     print("NPU warmup complete (graph compiled).")
 
 
@@ -394,9 +451,7 @@ def run_experiment(
     rank: int = 0,
     world_size: int = 1
 ) -> Dict:
-    """
-    Run the full state tracking experiment.
-    """
+    """Run the full state tracking experiment."""
     timings = {}
 
     # Rank 0 creates directories and generates data
@@ -405,7 +460,6 @@ def run_experiment(
         data_dir = os.path.join(save_dir, "data")
         os.makedirs(data_dir, exist_ok=True)
 
-        # Generate data
         print("Generating data...")
         t0 = time.time()
         generate_and_save(
@@ -420,11 +474,10 @@ def run_experiment(
     else:
         data_dir = os.path.join(save_dir, "data")
 
-    # Synchronize in distributed mode
     if distributed:
         dist.barrier()
 
-    # Create tokenizer (SimpleTokenizer for speed)
+    # Create tokenizer
     if rank == 0:
         print("\nCreating tokenizer...")
     t0 = time.time()
@@ -451,7 +504,9 @@ def run_experiment(
     timings["dataloader_creation"] = time.time() - t0
 
     results = {}
-    grad_accum_steps = 4 if distributed else 1
+    # Gradient accumulation: effective_batch = batch_size * world_size * grad_accum_steps
+    # For 32 * 4 * 2 = 256
+    grad_accum_steps = config.grad_accum_steps if distributed else 1
     use_amp = "npu" in str(device)
 
     # ========== Train Execution System ==========
@@ -474,18 +529,16 @@ def run_experiment(
     execution_wrapper = StateTrackingWrapper(
         execution,
         vocab_size=tokenizer.vocab_size_actual,
-        num_classes=1  # REGRESSION: single scalar output
+        num_classes=1
     ).to(device)
 
     if distributed:
         execution_wrapper = DDP(execution_wrapper, device_ids=[rank], find_unused_parameters=True)
 
     if rank == 0:
-        # Get param count (unwrap DDP if needed)
         model_for_count = execution_wrapper.module if hasattr(execution_wrapper, 'module') else execution_wrapper
         print(f"Execution System parameters: {model_for_count.count_parameters():,}")
 
-    # NPU warmup
     if "npu" in str(device):
         model_to_warmup = execution_wrapper.module if hasattr(execution_wrapper, 'module') else execution_wrapper
         warmup_npu(model_to_warmup, train_loader, device, is_transformer=False)
@@ -496,18 +549,22 @@ def run_experiment(
         train_loader,
         val_loader,
         device,
-        learning_rate=1e-4,
+        learning_rate=sfm_config.learning_rate,
         model_name="execution",
         grad_accum_steps=grad_accum_steps,
         use_amp=use_amp,
-        rank=rank
+        rank=rank,
+        warmup_steps=sfm_config.warmup_steps,
+        num_epochs=config.num_epochs
     )
 
     t0 = time.time()
+    synchronize()
     execution_history = execution_trainer.train(
         num_epochs=config.num_epochs,
         save_dir=save_dir if rank == 0 else None
     )
+    synchronize()
     timings["execution_training"] = time.time() - t0
     results["execution"] = execution_history
 
@@ -524,7 +581,7 @@ def run_experiment(
         num_heads=4,
         num_layers=4,
         d_ff=sfm_config.d_model * 4,
-        num_output_classes=1  # REGRESSION: single scalar output
+        num_output_classes=1
     ).to(device)
 
     if distributed:
@@ -534,7 +591,6 @@ def run_experiment(
         model_for_count = transformer.module if hasattr(transformer, 'module') else transformer
         print(f"Transformer parameters: {model_for_count.count_parameters():,}")
 
-    # NPU warmup
     if "npu" in str(device):
         model_to_warmup = transformer.module if hasattr(transformer, 'module') else transformer
         warmup_npu(model_to_warmup, train_loader, device, is_transformer=True)
@@ -545,23 +601,27 @@ def run_experiment(
         train_loader,
         val_loader,
         device,
-        learning_rate=1e-4,
+        learning_rate=sfm_config.learning_rate,
         model_name="transformer",
         is_transformer=True,
         grad_accum_steps=grad_accum_steps,
         use_amp=use_amp,
-        rank=rank
+        rank=rank,
+        warmup_steps=sfm_config.warmup_steps,
+        num_epochs=config.num_epochs
     )
 
     t0 = time.time()
+    synchronize()
     transformer_history = transformer_trainer.train(
         num_epochs=config.num_epochs,
         save_dir=save_dir if rank == 0 else None
     )
+    synchronize()
     timings["transformer_training"] = time.time() - t0
     results["transformer"] = transformer_history
 
-    # Save results (rank 0 only)
+    # Save results
     if rank == 0:
         results["timings"] = timings
         results_path = os.path.join(save_dir, "results.json")
@@ -569,7 +629,6 @@ def run_experiment(
             json.dump(results, f, indent=2)
         print(f"\nResults saved to {results_path}")
 
-        # Print timing breakdown
         print("\n" + "=" * 60)
         print("TIMING BREAKDOWN")
         print("=" * 60)
@@ -584,20 +643,18 @@ def run_experiment(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train state tracking models")
     parser.add_argument("--quick", action="store_true", help="Quick test mode")
-    parser.add_argument("--epochs", type=int, default=5, help="Number of epochs")
+    parser.add_argument("--epochs", type=int, default=50, help="Number of epochs")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
-    parser.add_argument("--samples", type=int, default=5000, help="Training samples")
+    parser.add_argument("--samples", type=int, default=10000, help="Training samples")
     parser.add_argument("--save_dir", type=str, default="outputs/exp0", help="Save directory")
-    # NOTE: Do NOT add --local-rank here. torchrun sets LOCAL_RANK via environment variable.
     args = parser.parse_args()
 
-    # Get local_rank from environment variable (set by torchrun)
+    # Get local_rank from environment (set by torchrun)
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     is_distributed = world_size > 1
 
     if is_distributed:
-        # Distributed training (launched via torchrun)
         setup_distributed(local_rank, world_size)
         device = torch.device(f"npu:{local_rank}")
 
@@ -628,7 +685,6 @@ if __name__ == "__main__":
         finally:
             cleanup_distributed()
     else:
-        # Single NPU
         set_seed(42)
         device = get_device()
 
@@ -656,7 +712,6 @@ if __name__ == "__main__":
             world_size=1
         )
 
-        # Print summary
         if "execution" in results:
             print("\n" + "=" * 60)
             print("EXPERIMENT SUMMARY")

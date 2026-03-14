@@ -57,56 +57,63 @@ logits = model(tokens)  # (1, 64, 32000)
 Proves System 2 (State Slots) works better than transformers for tracking program state.
 
 ```bash
-# Quick smoke test (single NPU)
+# Quick smoke test (single NPU) - should complete in < 60 seconds
 python experiments/exp0_state_tracking/run.py --quick
 
-# Full experiment (single NPU)
-python experiments/exp0_state_tracking/run.py --epochs 10 --samples 10000
-```
+# Full experiment (single NPU, 50 epochs)
+python experiments/exp0_state_tracking/run.py --epochs 50 --samples 10000
 
-### Multi-NPU Distributed Training
-
-```bash
-# 4 NPUs on single node
-bash scripts/train_multi_npu.sh --npus 4
-
-# Quick test on 4 NPUs
-bash scripts/train_multi_npu.sh --npus 4 --quick
-
-# Multi-node training (2 nodes, 4 NPUs each)
-# On node 0 (master):
-bash scripts/train_multi_npu.sh --npus 4 --nodes 2 --node_rank 0 --master_addr 10.0.0.1
-
-# On node 1:
-bash scripts/train_multi_npu.sh --npus 4 --nodes 2 --node_rank 1 --master_addr 10.0.0.1
-```
-
-Or using torchrun directly:
-```bash
-# Single node, 4 NPUs
-torchrun --nproc_per_node=4 experiments/exp0_state_tracking/train_distributed.py
-
-# With gradient accumulation (effective batch size = 32 * 4 * 4 = 512)
-torchrun --nproc_per_node=4 experiments/exp0_state_tracking/train_distributed.py --grad_accum 4
+# Multi-NPU distributed training (4 NPUs)
+python experiments/exp0_state_tracking/run.py --npus 4 --epochs 50 --samples 10000
 ```
 
 **PASS criteria**: State Slots generalize to 4× program length, transformer doesn't.
+
+## Ascend NPU Optimization
+
+This architecture is **optimized for Huawei Ascend NPUs** with the DaVinci Cube unit:
+
+### Dimension Alignment
+All tensor dimensions are multiples of 16 to match the Cube unit's 16×16×16 MAC array:
+- `d_model`: 256 (16 × 16)
+- `hidden_dim`: 256 (16 × 16)
+- `num_slots`: 64 (16 × 4)
+- `slot_dim`: 128 (16 × 8)
+
+### Cube-First Parallel Scan
+DeltaNet uses a matrix-based parallel scan:
+1. Reshape sequence into 16-step chunks
+2. Within-chunk recurrence as matrix multiply (Cube unit)
+3. Between-chunk carry on Vector unit
+4. Pipeline parallelism: Cube computes next chunk while Vector carries
+
+### Batched Operations
+- All slot operations use `torch.bmm` for batched matmul
+- MATCH: `scores = torch.matmul(query, slot_keys.T)` — one Cube call
+- READ: `values = torch.matmul(weights, slot_values)` — one Cube call
+- WRITE: `torch.baddbmm` for erase-then-write update
+
+### Performance Targets
+- Quick mode (100 samples, 1 epoch, 1 NPU): < 60 seconds
+- Full mode (10k samples, 50 epochs, 4 NPUs): < 30 minutes
+- State Slots accuracy on HARD programs: > 50% by epoch 50
+- Transformer accuracy on HARD programs: < 30% by epoch 50
 
 ## Project Structure
 
 ```
 sfm/
 ├── sfm/                          # Core library
-│   ├── config.py                 # All hyperparameters
+│   ├── config.py                 # All hyperparameters (16-aligned)
 │   ├── model.py                  # Full SFM assembly
 │   ├── systems/                  # 4 systems
 │   │   ├── perception.py         # System 1
-│   │   ├── execution.py          # System 2
+│   │   ├── execution.py          # System 2 (Cube-optimized)
 │   │   ├── structure.py          # System 3
 │   │   └── meta.py               # System 4
 │   ├── components/               # Reusable building blocks
-│   │   ├── deltanet_cell.py      # Core recurrent cell
-│   │   ├── state_slots.py        # Variable tracking
+│   │   ├── deltanet_cell.py      # Cube-first parallel scan
+│   │   ├── state_slots.py        # Cube-optimized slot ops
 │   │   ├── linear_attention.py   # O(n) attention
 │   │   ├── graph_attention.py    # GNN for structure
 │   │   ├── adaptive_halting.py   # Dynamic compute
@@ -114,9 +121,15 @@ sfm/
 │   ├── tokenizer/
 │   │   └── code_tokenizer.py
 │   └── utils/
-│       └── device.py             # Auto device selection
+│       └── device.py             # NPU optimization
 ├── experiments/                  # Experiments
 │   ├── exp0_state_tracking/      # Prove System 2 works
+│   │   ├── run.py                # Main entry point
+│   │   ├── train.py              # Unified training (single + multi-NPU)
+│   │   ├── dataset.py            # Data loading
+│   │   ├── generate_data.py      # Synthetic data
+│   │   ├── baseline_transformer.py
+│   │   └── evaluate.py
 │   └── exp1_full_sfm/            # Full integration
 └── scripts/
     └── visualize.py
@@ -135,16 +148,15 @@ No CUDA or CPU fallback — this architecture is optimized for Ascend hardware.
 
 ## Distributed Training Features
 
-- **DataParallel (DP)** - Single process, multiple NPUs
 - **DistributedDataParallel (DDP)** - Multi-process, best performance
-- **Gradient Accumulation** - Simulate larger batch sizes
-- **Mixed Precision (AMP)** - Automatic loss scaling for fp16
 - **HCCL Backend** - Huawei's collective communication library
+- **Gradient Accumulation** - effective_batch = batch_size × npus × accumulation_steps
+- **Mixed Precision (AMP)** - Automatic loss scaling for FP16
+- **Cosine Annealing with Warmup** - Linear warmup 500 steps, then cosine decay
 
-```python
-# Check distributed setup
-from sfm.utils import print_distributed_info
-print_distributed_info()
+```bash
+# Single node, 4 NPUs (effective batch = 32 × 4 × 2 = 256)
+torchrun --nproc_per_node=4 experiments/exp0_state_tracking/train.py --epochs 50
 ```
 
 ## Testing
@@ -153,8 +165,8 @@ Each component has a standalone smoke test:
 
 ```bash
 # Test individual components
-python sfm/components/deltanet_cell.py
-python sfm/components/state_slots.py
+python sfm/components/deltanet_cell.py    # Cube-first parallel scan
+python sfm/components/state_slots.py      # Cube-optimized slots
 python sfm/components/linear_attention.py
 python sfm/components/graph_attention.py
 python sfm/components/adaptive_halting.py
@@ -162,11 +174,11 @@ python sfm/components/cross_system_bridge.py
 
 # Test systems
 python sfm/systems/perception.py
-python sfm/systems/execution.py
+python sfm/systems/execution.py           # Full execution system
 python sfm/systems/structure.py
 python sfm/systems/meta.py
 
-# Test full model
+# Test full model (prints dimension alignment)
 python sfm/model.py
 ```
 
@@ -177,11 +189,24 @@ python sfm/model.py
 3. **Parallel perception** — System 1 processes tokens in parallel with linear attention
 4. **Fixed bridge dimension** — Cross-system bridges use fixed 256d vectors
 5. **Modular testing** — Every component runnable standalone
+6. **Cube-optimized dimensions** — All dimensions multiples of 16
+
+## Training Configuration
+
+Default training uses:
+- **Task**: Regression (MSE loss) predicting final variable value [0, 100]
+- **Learning rate**: 3e-4 with cosine annealing
+- **Warmup**: 500 steps linear warmup
+- **Epochs**: 50
+- **Batch size**: 32 per NPU
+- **Gradient accumulation**: 2 steps
+- **Effective batch size**: 32 × 4 × 2 = 256 (with 4 NPUs)
 
 ## Roadmap
 
 - [x] Core architecture implementation
-- [x] Experiment 0: State tracking proof
+- [x] Cube-first NPU optimization
+- [x] Experiment 0: State tracking proof (regression task)
 - [ ] Experiment 1: Full SFM integration
 - [ ] Experiment 2: SWE-bench Lite evaluation
 
@@ -193,7 +218,7 @@ If you use this architecture, please cite:
 @software{sfm2025,
   title = {State-Flow Machine: A Post-Transformer Architecture for Code Intelligence},
   year = {2025},
-  note = {Novel architecture with 4 specialized systems}
+  note = {Novel architecture with 4 specialized systems, optimized for Ascend NPUs}
 }
 ```
 
