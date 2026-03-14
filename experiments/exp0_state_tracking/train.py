@@ -571,7 +571,7 @@ def run_experiment(
         learning_rate=sfm_config.learning_rate,
         model_name="execution",
         grad_accum_steps=grad_accum_steps,
-        use_amp=use_amp,
+        use_amp=False,  # Disable AMP for State Slots (FP16 overflow in DeltaNet cumprod)
         rank=rank,
         warmup_steps=sfm_config.warmup_steps,
         num_epochs=config.num_epochs
@@ -596,10 +596,10 @@ def run_experiment(
     t0 = time.time()
     transformer_fair = TransformerEncoderOnly(
         vocab_size=tokenizer.vocab_size_actual,
-        d_model=160,           # Smaller for fair comparison
+        d_model=128,           # Reduced for parameter-matched comparison (~670K)
         num_heads=4,
         num_layers=3,
-        d_ff=640,            # d_model * 4
+        d_ff=512,              # d_model * 4
         num_output_classes=1
     ).to(device)
 

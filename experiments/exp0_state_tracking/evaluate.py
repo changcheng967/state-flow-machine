@@ -208,13 +208,13 @@ def load_model(
         )
         model = StateTrackingWrapper(execution, vocab_size)
     elif model_type == "transformer_fair":
-        # Transformer-Fair: ~660K params (parameter-matched with State Slots)
+        # Transformer-Fair: ~670K params (parameter-matched with State Slots)
         model = TransformerEncoderOnly(
             vocab_size=vocab_size,
-            d_model=160,
+            d_model=128,
             num_heads=4,
             num_layers=3,
-            d_ff=640,
+            d_ff=512,
             num_output_classes=1
         )
     elif model_type == "transformer_large":
