@@ -13,6 +13,10 @@ FEATURES:
 - Detailed timing for all phases
 """
 
+# IMPORTANT: Import torch_npu FIRST before any torch.npu calls
+# torch_npu monkey-patches torch to add the .npu namespace
+import torch_npu
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -321,21 +325,21 @@ class Trainer:
 
 
 def setup_distributed(rank: int, world_size: int):
-    """Initialize distributed training with HCCL backend, fallback to gloo."""
+    """Initialize distributed training with HCCL backend for Ascend NPUs."""
     os.environ['MASTER_ADDR'] = '127.0.0.1'
     os.environ['MASTER_PORT'] = '29500'
 
-    # Try HCCL first (Ascend), fallback to gloo
+    # HCCL backend (lowercase!) for Ascend NPU distributed training
     backend = 'hccl'
     try:
         dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
         print(f"[Rank {rank}] Initialized distributed training with backend: {backend}")
     except Exception as e:
-        print(f"[Rank {rank}] HCCL backend failed ({e}), falling back to gloo")
-        backend = 'gloo'
-        dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
-        print(f"[Rank {rank}] Initialized distributed training with backend: {backend}")
+        print(f"[Rank {rank}] ERROR: HCCL backend initialization failed: {e}")
+        print(f"[Rank {rank}] HCCL is required for multi-NPU training on Ascend. Exiting.")
+        sys.exit(1)
 
+    # torch_npu must be imported before this call
     torch.npu.set_device(rank)
 
 
