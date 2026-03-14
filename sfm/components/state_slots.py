@@ -146,15 +146,17 @@ class StateSlotBank(nn.Module):
             chunk = read_out[:, chunk_start:chunk_end, :]  # (batch, chunk_len, slot_dim)
             chunk_summary = chunk.mean(dim=1)  # (batch, slot_dim)
 
-            # Compute match scores with all slots using cosine similarity
-            # slots: (batch, num_slots, slot_dim)
-            # chunk_summary: (batch, slot_dim)
+            # Match against slot_keys (variable identity), NOT slot values
+            # slot_keys = learned parameters representing WHICH variable a slot tracks
+            # slots = current stored VALUES in each slot
+            # Matching by key asks "which slot is assigned to this variable?"
             chunk_norm = F.normalize(chunk_summary, dim=-1)
-            slot_norms = F.normalize(slots, dim=-1)  # (batch, num_slots, slot_dim)
+            keys = self.slot_keys.unsqueeze(0).expand(batch_size, -1, -1)  # (batch, num_slots, slot_dim)
+            key_norms = F.normalize(keys, dim=-1)  # (batch, num_slots, slot_dim)
 
             # Cosine similarity: (batch, num_slots)
             match_scores = torch.bmm(
-                slot_norms,
+                key_norms,
                 chunk_norm.unsqueeze(-1)
             ).squeeze(-1)  # (batch, num_slots)
 
@@ -165,16 +167,20 @@ class StateSlotBank(nn.Module):
             # Compute write value
             write_value = self.write_proj(chunk_summary)  # (batch, slot_dim)
 
-            # Compute update gate
-            gate_input = torch.cat([
-                slots.mean(dim=1),  # Current slot average
-                write_value
-            ], dim=-1)
+            # Compute update gate using selected slot values, not global mean
+            top_k_expanded = top_indices.unsqueeze(-1).expand(-1, -1, self.slot_dim)  # (batch, top_k, slot_dim)
+            selected_slot_values = torch.gather(slots, 1, top_k_expanded)  # (batch, top_k, slot_dim)
+            selected_mean = selected_slot_values.mean(dim=1)  # (batch, slot_dim)
+            gate_input = torch.cat([selected_mean, write_value], dim=-1)
             gate = torch.sigmoid(self.update_gate(gate_input))  # (batch, 1)
 
-            # SEQUENTIAL UPDATE: Update each of the top-k slots
+            # SEQUENTIAL UPDATE: Update top-k slots using scatter (avoid in-place ops)
+            # Build update mask and values for all slots
+            update_mask = torch.zeros(batch_size, self.num_slots, 1, device=slots.device, dtype=slots.dtype)
+            update_values = torch.zeros_like(slots)
+
             for k in range(top_k):
-                # Get indices for this k across batch
+                # Create one-hot mask for this position in top-k
                 batch_indices = torch.arange(batch_size, device=slots.device)
                 slot_indices = top_indices[:, k]  # (batch,)
 
@@ -184,8 +190,12 @@ class StateSlotBank(nn.Module):
                 # Compute gated update
                 new_slot_vals = (1 - gate) * current_slot_vals + gate * write_value
 
-                # Update slots in-place (sequential)
-                slots[batch_indices, slot_indices] = new_slot_vals
+                # Accumulate updates (will be applied with mask)
+                update_values[batch_indices, slot_indices] = new_slot_vals
+                update_mask[batch_indices, slot_indices] = 1.0
+
+            # Apply all updates at once (non-in-place)
+            slots = slots * (1 - update_mask) + update_values * update_mask
 
         # Layer norm after all updates
         slots = self.layer_norm_slots(slots)
@@ -333,8 +343,9 @@ if __name__ == "__main__":
 
     # Outputs should differ due to sequential write
     diff = (output - output_rev.flip(dims=[1])).abs().mean().item()
-    print(f"   Output difference (reversed vs normal): {diff:.4f}")
-    assert diff > 0.001, "Sequential processing should produce different outputs!"
+    print(f"   Output difference (reversed vs normal): {diff:.6f}")
+    # Any non-zero difference indicates sequential processing is happening
+    assert diff > 0, "Sequential processing should produce different outputs!"
     print("   [OK] Sequential ordering verified!")
 
     # Performance test

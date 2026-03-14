@@ -88,7 +88,7 @@ def main():
         )
         sfm_config = SFMConfig.small()
         base_length = args.base_length
-        multipliers = [1, 2, 4]
+        multipliers = [1, 2, 4, 8]
 
     os.makedirs(args.save_dir, exist_ok=True)
 
@@ -143,7 +143,7 @@ def main():
             save_dir=args.save_dir,
             base_length=base_length,
             multipliers=multipliers,
-            samples_per_length=50 if not args.quick else 10,
+            samples_per_length=1000 if not args.quick else 10,
             quick=args.quick
         )
 
@@ -177,13 +177,16 @@ def main():
         exec_results = eval_results.get("execution", {})
         trans_results = eval_results.get("transformer", {})
 
-        print(f"\n{'Length':<12} {'State Slots':<15} {'Transformer':<15} {'Delta':<10}")
-        print("-" * 52)
+        # Updated table format matching evaluate.py
+        print(f"\n{'Length':<8} {'SS EMA':<10} {'TF EMA':<10} {'SS Close':<10} {'TF Close':<10} {'Delta':<10}")
+        print("-" * 68)
 
         for mult in multipliers:
-            exec_acc = exec_results.get(mult, {}).get("accuracy", 0)
-            trans_acc = trans_results.get(mult, {}).get("accuracy", 0)
-            delta = exec_acc - trans_acc
+            exec_ema = exec_results.get(mult, {}).get("exact_match", 0)
+            trans_ema = trans_results.get(mult, {}).get("exact_match", 0)
+            exec_close = exec_results.get(mult, {}).get("close_match", 0)
+            trans_close = trans_results.get(mult, {}).get("close_match", 0)
+            delta = exec_ema - trans_ema
 
             status = ""
             if mult == 4 and delta > 0.05:
@@ -191,13 +194,13 @@ def main():
             elif mult == 4 and delta <= 0:
                 status = "[X] FAIL"
 
-            print(f"{mult}x{'':<10} {exec_acc:<15.4f} {trans_acc:<15.4f} {delta:+.4f}    {status}")
+            print(f"{mult}x{'':<6} {exec_ema:<10.4f} {trans_ema:<10.4f} {exec_close:<10.4f} {trans_close:<10.4f} {delta:+.4f}    {status}")
 
         # Final verdict
         print("\n" + "-" * 70)
         if 4 in multipliers:
-            exec_at_4x = exec_results.get(4, {}).get("accuracy", 0)
-            trans_at_4x = trans_results.get(4, {}).get("accuracy", 0)
+            exec_at_4x = exec_results.get(4, {}).get("exact_match", 0)
+            trans_at_4x = trans_results.get(4, {}).get("exact_match", 0)
 
             if exec_at_4x > trans_at_4x + 0.05:
                 print("VERDICT: [OK] PASS - State Slots significantly outperform transformer at 4x length")

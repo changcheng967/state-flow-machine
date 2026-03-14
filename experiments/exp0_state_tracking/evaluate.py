@@ -134,7 +134,6 @@ class Evaluator:
         self.device = device
         self.model_name = model_name
         self.is_transformer = is_transformer
-        self.criterion = nn.MSELoss()  # REGRESSION
 
     @torch.no_grad()
     def evaluate_samples(
@@ -186,8 +185,8 @@ class Evaluator:
             predicted_value = (prediction.item() * 100)
             final_value_norm = final_value / 100.0
 
-            # Metrics
-            exact_match = 1 if abs(predicted_value - final_value) < 0.5 else 0
+            # Metrics - exact match requires rounding to correct integer
+            exact_match = 1 if round(predicted_value) == final_value else 0
             close_match = 1 if abs(predicted_value - final_value) < 5 else 0
 
             total_exact += exact_match
