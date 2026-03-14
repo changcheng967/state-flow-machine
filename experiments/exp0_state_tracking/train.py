@@ -395,12 +395,20 @@ def run_experiment(
         model_name="execution"
     )
 
-    # NPU warmup - compile graph with dummy input
+    # NPU warmup with real batch shape (compiles forward AND backward graphs)
     if "npu" in str(device):
-        print("Warming up NPU (compiling graph for Execution System)...")
-        dummy = torch.randint(0, 100, (2, 32)).to(device)
-        with torch.no_grad():
-            _ = execution_wrapper(dummy)
+        print("Warming up NPU with real batch shape (Execution System)...")
+        warmup_batch = next(iter(train_loader))
+        input_ids = warmup_batch["input_ids"].to(device)
+        attention_mask = warmup_batch["attention_mask"].to(device)
+        labels = warmup_batch["final_value"].to(device).clamp(0, 499)
+
+        # Forward + backward to compile both graphs
+        execution_wrapper.train()
+        logits = execution_wrapper(input_ids, attention_mask=attention_mask)
+        loss = F.cross_entropy(logits, labels)
+        loss.backward()
+        execution_wrapper.zero_grad()
         print("NPU warmup complete.")
 
     execution_history = execution_trainer.train(
@@ -435,12 +443,22 @@ def run_experiment(
         is_transformer=True
     )
 
-    # NPU warmup - compile graph with dummy input
+    # NPU warmup with real batch shape (compiles forward AND backward graphs)
     if "npu" in str(device):
-        print("Warming up NPU (compiling graph for Transformer)...")
-        dummy = torch.randint(0, 100, (2, 32)).to(device)
-        with torch.no_grad():
-            _ = transformer(dummy, mask=torch.zeros(2, 32, dtype=torch.bool, device=device))
+        print("Warming up NPU with real batch shape (Transformer)...")
+        warmup_batch = next(iter(train_loader))
+        input_ids = warmup_batch["input_ids"].to(device)
+        attention_mask = warmup_batch["attention_mask"].to(device)
+        labels = warmup_batch["final_value"].to(device).clamp(0, 499)
+
+        # Forward + backward to compile both graphs
+        transformer.train()
+        # Transformer expects mask where True = padding
+        mask = (attention_mask == 0)
+        logits = transformer(input_ids, mask=mask)
+        loss = F.cross_entropy(logits, labels)
+        loss.backward()
+        transformer.zero_grad()
         print("NPU warmup complete.")
 
     transformer_history = transformer_trainer.train(
