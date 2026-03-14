@@ -227,10 +227,8 @@ class DeltaNetCell(nn.Module):
             # h_chunk[t] includes h0 * (prod a_0..a_{t-1}) contribution
             # This is the first term of the scan
             cum_a = torch.cumprod(a_chunk, dim=1)  # (batch, chunk_size, num_heads)
-            h0_contrib = cum_a.unsqueeze(-1) * h.unsqueeze(1).unsqueeze(-1)
             # h: (batch, num_heads, head_dim) -> (batch, 1, num_heads, head_dim)
             # cum_a: (batch, chunk_size, num_heads) -> (batch, chunk_size, num_heads, 1)
-
             h0_contrib = cum_a.unsqueeze(-1) * h.unsqueeze(1)  # (batch, chunk_size, num_heads, head_dim)
 
             # Total: h_chunk = h0_contrib + h_contrib
@@ -500,8 +498,8 @@ if __name__ == "__main__":
     print("\n8. Testing gradient flow...")
     loss = output.sum()
     loss.backward()
-    grad_count = sum(1 for p in cell.parameters() if p.grad is not None and p.grad.abs().sum() > 0)
-    print(f"   Parameters with gradients: {grad_count}/{len(list(cell.parameters()))}")
+    grad_count = sum(1 for p in stack.parameters() if p.grad is not None and p.grad.abs().sum() > 0)
+    print(f"   Parameters with gradients: {grad_count}/{len(list(stack.parameters()))}")
     assert grad_count > 0, "No gradients found!"
     print("   [OK] Gradient flow test passed!")
 
