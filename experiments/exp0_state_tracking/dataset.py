@@ -2,17 +2,19 @@
 Dataset for State Tracking Experiment
 
 PyTorch Dataset for loading and processing state tracking programs.
+
+FIXED TENSOR SHAPES: All samples padded to EXACTLY max_length for NPU graph caching.
 """
 
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, DistributedSampler
 from typing import List, Dict, Optional, Tuple
 import json
 import os
 import sys
 
 sys.path.insert(0, str(__file__).rsplit('experiments', 1)[0])
-from sfm.tokenizer.code_tokenizer import CodeTokenizer
+from sfm.tokenizer.code_tokenizer import SimpleTokenizer
 
 
 class StateTrackingDataset(Dataset):
@@ -20,27 +22,25 @@ class StateTrackingDataset(Dataset):
     Dataset for state tracking experiment.
 
     Each sample is a program with a target variable and its final value.
+    ALL samples are padded to EXACTLY max_length for consistent tensor shapes.
     """
 
     def __init__(
         self,
         data_path: str,
-        tokenizer: CodeTokenizer,
-        max_length: int = 256,
-        include_trace: bool = False
+        tokenizer: SimpleTokenizer,
+        max_length: int = 256
     ):
         """
         Initialize dataset.
 
         Args:
             data_path: Path to JSON data file.
-            tokenizer: Code tokenizer.
-            max_length: Maximum sequence length.
-            include_trace: Whether to include execution traces.
+            tokenizer: Tokenizer (SimpleTokenizer recommended for speed).
+            max_length: EXACT sequence length for all samples.
         """
         self.tokenizer = tokenizer
         self.max_length = max_length
-        self.include_trace = include_trace
 
         # Load data
         with open(data_path, 'r') as f:
@@ -53,19 +53,18 @@ class StateTrackingDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """
-        Get a single sample.
+        Get a single sample with FIXED shape.
 
         Args:
             idx: Sample index.
 
         Returns:
-            Dict with input_ids, labels, and metadata.
+            Dict with tensors of fixed shape (max_length,).
         """
         sample = self.data[idx]
 
         # Format program as input
         program_lines = sample["program"]
-        target_var = sample["target_variable"]
         final_value = sample["final_value"]
 
         # Create input text
@@ -73,130 +72,53 @@ class StateTrackingDataset(Dataset):
 
         # Tokenize
         input_ids = self.tokenizer.encode(input_text)
-        input_ids = input_ids[:self.max_length - 1]
 
-        # Create labels (predict final value)
-        # The label is the final value tokenized
-        label_text = str(final_value)
-        label_ids = self.tokenizer.encode(label_text)
-
-        # Pad input
-        pad_id = self.tokenizer.special_tokens["<pad>"]
-        attention_mask = [1] * len(input_ids)
-        while len(input_ids) < self.max_length:
-            input_ids.append(pad_id)
-            attention_mask.append(0)
-
-        return {
-            "input_ids": torch.tensor(input_ids, dtype=torch.long),
-            "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
-            "labels": torch.tensor(label_ids[0] if label_ids else 0, dtype=torch.long),
-            "final_value": torch.tensor(final_value, dtype=torch.long),
-            "target_variable": target_var,
-            "num_lines": sample["num_lines"]
-        }
-
-
-class StateTrackingDatasetWithTrace(Dataset):
-    """
-    Dataset that includes execution traces for training state slots.
-    """
-
-    def __init__(
-        self,
-        data_path: str,
-        tokenizer: CodeTokenizer,
-        max_length: int = 256,
-        num_variables: int = 5
-    ):
-        """
-        Initialize dataset.
-
-        Args:
-            data_path: Path to JSON data file.
-            tokenizer: Code tokenizer.
-            max_length: Maximum sequence length.
-            num_variables: Number of variables to track.
-        """
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-        self.num_variables = num_variables
-
-        with open(data_path, 'r') as f:
-            self.data = json.load(f)
-
-        print(f"Loaded {len(self.data)} samples from {data_path}")
-
-    def __len__(self) -> int:
-        return len(self.data)
-
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        """
-        Get a single sample with execution trace.
-        """
-        sample = self.data[idx]
-        program_lines = sample["program"]
-        trace = sample.get("trace", [])
-        final_value = sample["final_value"]
-
-        # Create state tracking targets
-        # For each step, we want to predict the state after that step
-        state_targets = []
-
-        for step in trace:
-            # Create state vector (values of each variable)
-            state = step.get("state", {})
-            state_vec = []
-            for i in range(self.num_variables):
-                var = chr(ord('a') + i)
-                state_vec.append(state.get(var, 0))
-            state_targets.append(state_vec)
-
-        # Pad state targets
-        while len(state_targets) < self.max_length:
-            state_targets.append([0] * self.num_variables)
-
-        state_targets = state_targets[:self.max_length]
-
-        # Tokenize input
-        input_text = "\n".join(program_lines)
-        input_ids = self.tokenizer.encode(input_text)
+        # TRUNCATE to max_length (keep space for any special tokens)
         input_ids = input_ids[:self.max_length]
 
-        # Pad input
-        pad_id = self.tokenizer.special_tokens["<pad>"]
+        # Get padding token
+        pad_id = self.tokenizer.token_to_id.get("<pad>", 0)
+
+        # Create attention mask BEFORE padding (1 for real tokens)
         attention_mask = [1] * len(input_ids)
-        while len(input_ids) < self.max_length:
-            input_ids.append(pad_id)
-            attention_mask.append(0)
+
+        # PAD to EXACTLY max_length (ensures all batches have same shape)
+        padding_length = self.max_length - len(input_ids)
+        input_ids = input_ids + [pad_id] * padding_length
+        attention_mask = attention_mask + [0] * padding_length
+
+        # Clamp final_value to valid class range
+        final_value = max(0, min(499, final_value))
 
         return {
             "input_ids": torch.tensor(input_ids, dtype=torch.long),
             "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
-            "labels": torch.tensor(final_value, dtype=torch.long),
-            "state_targets": torch.tensor(state_targets, dtype=torch.float),
-            "num_lines": sample["num_lines"]
+            "final_value": torch.tensor(final_value, dtype=torch.long),
         }
 
 
 def create_dataloaders(
     data_dir: str,
-    tokenizer: CodeTokenizer,
+    tokenizer,
     batch_size: int = 32,
     max_length: int = 256,
-    include_trace: bool = False,
-    num_workers: int = 0
+    num_workers: int = 0,
+    distributed: bool = False,
+    rank: int = 0,
+    world_size: int = 1
 ) -> Tuple[DataLoader, DataLoader]:
     """
     Create train and validation dataloaders.
 
     Args:
         data_dir: Directory containing train.json and val.json.
-        tokenizer: Code tokenizer.
-        batch_size: Batch size.
-        max_length: Maximum sequence length.
-        include_trace: Whether to include execution traces.
+        tokenizer: Tokenizer.
+        batch_size: Batch size per GPU.
+        max_length: EXACT sequence length for all samples.
         num_workers: Number of data loading workers.
+        distributed: Whether to use DistributedSampler.
+        rank: Current process rank.
+        world_size: Total number of processes.
 
     Returns:
         Tuple of (train_loader, val_loader).
@@ -204,34 +126,59 @@ def create_dataloaders(
     train_path = os.path.join(data_dir, "train.json")
     val_path = os.path.join(data_dir, "val.json")
 
-    DatasetClass = StateTrackingDatasetWithTrace if include_trace else StateTrackingDataset
-
-    train_dataset = DatasetClass(
+    train_dataset = StateTrackingDataset(
         train_path,
         tokenizer,
         max_length=max_length
     )
 
-    val_dataset = DatasetClass(
+    val_dataset = StateTrackingDataset(
         val_path,
         tokenizer,
         max_length=max_length
     )
 
+    # Create samplers
+    if distributed:
+        train_sampler = DistributedSampler(
+            train_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True
+        )
+        val_sampler = DistributedSampler(
+            val_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=False
+        )
+        shuffle = False  # Sampler handles shuffling
+    else:
+        train_sampler = None
+        val_sampler = None
+        shuffle = True
+
+    # pin_memory=False for NPU (only works for CUDA)
+    pin_memory = False
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=shuffle if not distributed else False,
+        sampler=train_sampler if distributed else None,
         num_workers=num_workers,
-        pin_memory=True
+        pin_memory=pin_memory,
+        drop_last=True  # Ensure consistent batch sizes
     )
 
     val_loader = DataLoader(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
+        sampler=val_sampler if distributed else None,
         num_workers=num_workers,
-        pin_memory=True
+        pin_memory=pin_memory,
+        drop_last=False
     )
 
     return train_loader, val_loader
@@ -243,17 +190,14 @@ if __name__ == "__main__":
     print("State Tracking Dataset Test")
     print("=" * 60)
 
-    # First generate some test data
     from generate_data import SimpleProgramGenerator
-
     import tempfile
-    import os
 
     with tempfile.TemporaryDirectory() as tmpdir:
         # Generate test data
-        generator = SimpleProgramGenerator(num_variables=5, max_program_length=10, seed=42)
-        train_data = generator.generate_dataset(100, include_trace=True)
-        val_data = generator.generate_dataset(20, include_trace=True)
+        generator = SimpleProgramGenerator(num_variables=5, max_program_length=10, seed=42, difficulty="easy")
+        train_data = generator.generate_dataset(100)
+        val_data = generator.generate_dataset(20)
 
         train_path = os.path.join(tmpdir, "train.json")
         val_path = os.path.join(tmpdir, "val.json")
@@ -263,46 +207,46 @@ if __name__ == "__main__":
         with open(val_path, 'w') as f:
             json.dump(val_data, f)
 
-        print(f"\n1. Generated test data in {tmpdir}")
+        print(f"\n1. Generated test data")
 
-        # Create tokenizer
-        print("\n2. Creating tokenizer...")
-        tokenizer = CodeTokenizer(vocab_size=1000, min_freq=1)
+        # Create SimpleTokenizer
+        print("\n2. Creating SimpleTokenizer...")
+        tokenizer = SimpleTokenizer()
         corpus = ["\n".join(s["program"]) for s in train_data + val_data]
-        tokenizer.train(corpus, verbose=False)
+        tokenizer.train(corpus, verbose=True)
         print(f"   Vocabulary size: {tokenizer.vocab_size_actual}")
 
-        # Test basic dataset
+        # Test dataset
         print("\n3. Testing StateTrackingDataset...")
         dataset = StateTrackingDataset(train_path, tokenizer, max_length=64)
         print(f"   Dataset size: {len(dataset)}")
 
-        sample = dataset[0]
-        print(f"   Sample input_ids shape: {sample['input_ids'].shape}")
-        print(f"   Sample labels: {sample['labels'].item()}")
-        print(f"   Sample final_value: {sample['final_value'].item()}")
-
-        # Test dataset with trace
-        print("\n4. Testing StateTrackingDatasetWithTrace...")
-        dataset_trace = StateTrackingDatasetWithTrace(train_path, tokenizer, max_length=64)
-        sample = dataset_trace[0]
-        print(f"   Sample input_ids shape: {sample['input_ids'].shape}")
-        print(f"   Sample state_targets shape: {sample['state_targets'].shape}")
+        # Check all samples have same shape
+        shapes = set()
+        for i in range(min(10, len(dataset))):
+            sample = dataset[i]
+            shapes.add(tuple(sample['input_ids'].shape))
+        print(f"   Unique shapes (should be 1): {len(shapes)} - {shapes}")
 
         # Test dataloaders
-        print("\n5. Testing dataloaders...")
+        print("\n4. Testing dataloaders...")
         train_loader, val_loader = create_dataloaders(
             tmpdir,
             tokenizer,
             batch_size=8,
-            max_length=64,
-            include_trace=True
+            max_length=64
         )
+
+        # Check all batches have same shape
+        batch_shapes = set()
+        for batch in train_loader:
+            batch_shapes.add(tuple(batch['input_ids'].shape))
+        print(f"   Unique batch shapes (should be 1): {len(batch_shapes)} - {batch_shapes}")
 
         batch = next(iter(train_loader))
         print(f"   Batch input_ids shape: {batch['input_ids'].shape}")
-        print(f"   Batch state_targets shape: {batch['state_targets'].shape}")
-        print(f"   Batch labels shape: {batch['labels'].shape}")
+        print(f"   Batch attention_mask shape: {batch['attention_mask'].shape}")
+        print(f"   Batch final_value shape: {batch['final_value'].shape}")
 
         print("\n" + "=" * 60)
         print("All Dataset tests passed!")

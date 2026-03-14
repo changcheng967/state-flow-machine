@@ -6,9 +6,14 @@ End-to-end script that:
 2. Trains Execution System (State Slots)
 3. Trains Transformer baseline
 4. Evaluates generalization to longer sequences
-5. Reports comparison
+5. Reports comparison with timing breakdown
 
 PASS = State Slots generalize to 4x program length, transformer doesn't.
+
+USAGE:
+    python run.py --quick                              # smoke test, 1 NPU
+    python run.py --npus 4 --epochs 10                 # 4 NPUs
+    python run.py --npus 4 --epochs 10 --samples 50000 # full run
 """
 
 import os
@@ -21,71 +26,49 @@ sys.path.insert(0, str(__file__).rsplit('experiments', 1)[0])
 
 from sfm.config import SFMConfig, ExperimentConfig
 from sfm.utils.device import get_device, set_seed
-from train import run_experiment
-from evaluate import run_evaluation
 
 
 def main():
     parser = argparse.ArgumentParser(
         description="Run State Tracking Experiment (Exp 0)"
     )
-    parser.add_argument(
-        "--quick",
-        action="store_true",
-        help="Run quick test with minimal samples"
-    )
-    parser.add_argument(
-        "--train_only",
-        action="store_true",
-        help="Only train models, skip evaluation"
-    )
-    parser.add_argument(
-        "--eval_only",
-        action="store_true",
-        help="Only evaluate existing models"
-    )
-    parser.add_argument(
-        "--save_dir",
-        type=str,
-        default="outputs/exp0",
-        help="Directory to save results"
-    )
-    parser.add_argument(
-        "--epochs",
-        type=int,
-        default=5,
-        help="Number of training epochs"
-    )
-    parser.add_argument(
-        "--batch_size",
-        type=int,
-        default=32,
-        help="Batch size"
-    )
-    parser.add_argument(
-        "--samples",
-        type=int,
-        default=5000,
-        help="Number of training samples"
-    )
-    parser.add_argument(
-        "--base_length",
-        type=int,
-        default=10,
-        help="Base program length for generalization test"
-    )
+    parser.add_argument("--quick", action="store_true",
+                        help="Run quick test with minimal samples")
+    parser.add_argument("--train_only", action="store_true",
+                        help="Only train models, skip evaluation")
+    parser.add_argument("--eval_only", action="store_true",
+                        help="Only evaluate existing models")
+    parser.add_argument("--save_dir", type=str, default="outputs/exp0",
+                        help="Directory to save results")
+    parser.add_argument("--epochs", type=int, default=5,
+                        help="Number of training epochs")
+    parser.add_argument("--batch_size", type=int, default=32,
+                        help="Batch size")
+    parser.add_argument("--samples", type=int, default=5000,
+                        help="Number of training samples")
+    parser.add_argument("--base_length", type=int, default=10,
+                        help="Base program length for generalization test")
+    parser.add_argument("--npus", type=int, default=1,
+                        help="Number of NPUs for distributed training")
+    parser.add_argument("--difficulty", type=str, default="easy",
+                        choices=["easy", "medium", "hard"],
+                        help="Data difficulty level")
 
     args = parser.parse_args()
 
     # Setup
     set_seed(42)
-    device = get_device()
 
     print("=" * 70)
     print("STATE-FLOW MACHINE EXPERIMENT 0: STATE TRACKING")
     print("=" * 70)
-    print(f"\nDevice: {device}")
-    print(f"Save directory: {args.save_dir}")
+    print(f"\nConfiguration:")
+    print(f"  NPUs: {args.npus}")
+    print(f"  Save directory: {args.save_dir}")
+    print(f"  Epochs: {args.epochs}")
+    print(f"  Batch size: {args.batch_size}")
+    print(f"  Training samples: {args.samples}")
+    print(f"  Difficulty: {args.difficulty}")
 
     if args.quick:
         print("\n*** QUICK MODE - Minimal samples for smoke test ***")
@@ -117,19 +100,31 @@ def main():
         print("PHASE 1: TRAINING")
         print("=" * 70)
 
-        training_results = run_experiment(
-            config=exp_config,
-            sfm_config=sfm_config,
-            device=device,
-            save_dir=args.save_dir
-        )
+        if args.npus > 1:
+            # Multi-NPU training
+            run_distributed_training(exp_config, sfm_config, args)
+        else:
+            # Single NPU training
+            device = get_device()
+            from train import run_experiment
+            training_results = run_experiment(
+                config=exp_config,
+                sfm_config=sfm_config,
+                device=device,
+                save_dir=args.save_dir,
+                distributed=False,
+                rank=0,
+                world_size=1
+            )
 
     # Evaluation phase
+    eval_results = None
     if not args.train_only:
         print("\n" + "=" * 70)
         print("PHASE 2: EVALUATION")
         print("=" * 70)
 
+        from evaluate import run_evaluation
         eval_results = run_evaluation(
             save_dir=args.save_dir,
             base_length=base_length,
@@ -145,11 +140,22 @@ def main():
     print("EXPERIMENT COMPLETE")
     print("=" * 70)
 
-    print(f"\nTotal time: {total_time / 60:.1f} minutes")
+    print(f"\nTotal time: {total_time / 60:.1f} minutes ({total_time:.1f}s)")
     print(f"Results saved to: {args.save_dir}")
 
+    # Print timing breakdown if available
+    results_path = os.path.join(args.save_dir, "results.json")
+    if os.path.exists(results_path):
+        with open(results_path, 'r') as f:
+            results = json.load(f)
+        if "timings" in results:
+            print("\n--- Timing Breakdown ---")
+            timings = results["timings"]
+            for name, t in timings.items():
+                print(f"  {name}: {t:.2f}s")
+
     # Print final comparison if we have evaluation results
-    if not args.train_only and 'eval_results' in dir():
+    if eval_results and not args.train_only:
         print("\n" + "-" * 70)
         print("GENERALIZATION RESULTS")
         print("-" * 70)
@@ -167,9 +173,9 @@ def main():
 
             status = ""
             if mult == 4 and delta > 0.05:
-                status = "✓ PASS"
+                status = "[OK] PASS"
             elif mult == 4 and delta <= 0:
-                status = "✗ FAIL"
+                status = "[X] FAIL"
 
             print(f"{mult}x{'':<10} {exec_acc:<15.4f} {trans_acc:<15.4f} {delta:+.4f}    {status}")
 
@@ -180,15 +186,42 @@ def main():
             trans_at_4x = trans_results.get(4, {}).get("accuracy", 0)
 
             if exec_at_4x > trans_at_4x + 0.05:
-                print("VERDICT: ✓ PASS - State Slots significantly outperform transformer at 4x length")
+                print("VERDICT: [OK] PASS - State Slots significantly outperform transformer at 4x length")
             elif exec_at_4x > trans_at_4x:
-                print("VERDICT: ~ MARGINAL - State Slots slightly better, needs more training")
+                print("VERDICT: [~] MARGINAL - State Slots slightly better, needs more training")
             else:
-                print("VERDICT: ✗ FAIL - Transformer matches or exceeds State Slots")
+                print("VERDICT: [X] FAIL - Transformer matches or exceeds State Slots")
 
     print("\n" + "=" * 70)
 
     return 0
+
+
+def run_distributed_training(exp_config, sfm_config, args):
+    """Run training with multiple NPUs using torchrun-style launch."""
+    import subprocess
+
+    print(f"\nLaunching distributed training on {args.npus} NPUs...")
+
+    # Use torchrun for multi-NPU
+    cmd = [
+        sys.executable, "-m", "torch.distributed.launch",
+        f"--nproc_per_node={args.npus}",
+        "--master_port=29500",
+        os.path.join(os.path.dirname(__file__), "train.py"),
+        f"--save_dir={args.save_dir}",
+        f"--epochs={args.epochs}",
+        f"--batch_size={args.batch_size}",
+        f"--samples={args.samples}",
+    ]
+
+    if args.quick:
+        cmd.append("--quick")
+
+    print(f"Command: {' '.join(cmd)}")
+
+    result = subprocess.run(cmd, capture_output=False)
+    return result.returncode
 
 
 if __name__ == "__main__":
