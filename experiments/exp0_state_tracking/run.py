@@ -265,7 +265,7 @@ def run_distributed_training(exp_config, sfm_config, args):
     if args.quick:
         cmd.append("--quick")
 
-    print(f"Command: {' '.join(cmd)})
+    print(f"Command: {' '.join(cmd)})")
 
     result = subprocess.run(cmd)
     return result.returncode
