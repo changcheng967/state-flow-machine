@@ -673,6 +673,8 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
     parser.add_argument("--samples", type=int, default=10000, help="Training samples")
     parser.add_argument("--save_dir", type=str, default="outputs/exp0", help="Save directory")
+    parser.add_argument("--difficulty", type=str, default="easy",
+                        choices=["easy", "medium", "hard"], help="Difficulty level")
     args = parser.parse_args()
 
     # Get local_rank from environment (set by torchrun)
