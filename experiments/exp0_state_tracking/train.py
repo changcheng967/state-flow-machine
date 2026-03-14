@@ -43,22 +43,24 @@ from generate_data import generate_and_save
 
 
 class StateTrackingWrapper(nn.Module):
-    """Wraps ExecutionSystem for state tracking classification."""
+    """Wraps ExecutionSystem for state tracking REGRESSION."""
 
     def __init__(
         self,
         execution_system: ExecutionSystem,
         vocab_size: int,
-        num_classes: int = 500
+        num_classes: int = 1  # REGRESSION: single scalar output
     ):
         super().__init__()
         self.execution = execution_system
         self.embedding = nn.Embedding(vocab_size, execution_system.input_dim)
-        self.classifier = nn.Sequential(
+        # REGRESSION: Output single scalar, apply sigmoid to constrain to [0, 1]
+        self.regressor = nn.Sequential(
             nn.LayerNorm(execution_system.input_dim),
             nn.Linear(execution_system.input_dim, execution_system.input_dim),
             nn.ReLU(),
-            nn.Linear(execution_system.input_dim, num_classes)
+            nn.Linear(execution_system.input_dim, 1),
+            nn.Sigmoid()  # Output in [0, 1]
         )
 
     def forward(
@@ -73,7 +75,8 @@ class StateTrackingWrapper(nn.Module):
             pooled = (x * mask_exp).sum(dim=1) / mask_exp.sum(dim=1).clamp(min=1)
         else:
             pooled = x.mean(dim=1)
-        return self.classifier(pooled)
+        # Return (batch, 1), squeeze to (batch,) for loss computation
+        return self.regressor(pooled).squeeze(-1)  # (batch,)
 
     def count_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters())
@@ -110,7 +113,8 @@ class Trainer:
 
         self.optimizer = AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
         self.scheduler = CosineAnnealingLR(self.optimizer, T_max=len(train_loader) * 10, eta_min=learning_rate * 0.01)
-        self.criterion = nn.CrossEntropyLoss()
+        # REGRESSION: Use MSELoss instead of CrossEntropyLoss
+        self.criterion = nn.MSELoss()
 
         # AMP scaler
         if use_amp:
@@ -153,7 +157,7 @@ class Trainer:
                 return self.model(input_ids, attention_mask=mask)
 
     def train_epoch(self) -> Dict[str, float]:
-        """Train for one epoch with gradient accumulation and AMP."""
+        """Train for one epoch with gradient accumulation and AMP (REGRESSION)."""
         self.model.train()
         total_loss = 0
         total_correct = 0
@@ -168,27 +172,25 @@ class Trainer:
         for batch_idx, batch in enumerate(self.train_loader):
             input_ids = batch["input_ids"].to(self.device)
             attention_mask = batch["attention_mask"].to(self.device)
-            labels = batch["final_value"].to(self.device)
+            # REGRESSION: Get normalized target [0, 1] as float
+            labels_norm = batch["final_value_normalized"].to(self.device).float()
+            labels_raw = batch["final_value"].to(self.device)  # For accuracy calc
 
             mask = self._get_mask(attention_mask)
 
-            # Forward with AMP
-            logits = self._forward_with_amp(input_ids, mask)
+            # Forward with AMP - output is (batch,) in range [0, 1]
+            predictions = self._forward_with_amp(input_ids, mask)
 
-            # Clamp labels
-            num_classes = logits.size(-1)
-            labels = labels.clamp(0, num_classes - 1)
-
-            # Compute loss
+            # Compute MSE loss (both in [0, 1] range)
             if self.use_amp:
                 try:
                     with torch.npu.amp.autocast():
-                        loss = self.criterion(logits, labels)
+                        loss = self.criterion(predictions, labels_norm)
                 except AttributeError:
                     with torch.cuda.amp.autocast():
-                        loss = self.criterion(logits, labels)
+                        loss = self.criterion(predictions, labels_norm)
             else:
-                loss = self.criterion(logits, labels)
+                loss = self.criterion(predictions, labels_norm)
 
             # Scale loss for gradient accumulation
             loss = loss / self.grad_accum_steps
@@ -215,9 +217,10 @@ class Trainer:
 
             # Track metrics
             total_loss += loss.item() * self.grad_accum_steps
-            predictions = logits.argmax(dim=-1)
-            total_correct += (predictions == labels).sum().item()
-            total_samples += labels.size(0)
+            # REGRESSION accuracy: correct if rounded prediction matches target
+            predicted_values = (predictions * 100).round().clamp(0, 100)  # Back to [0, 100]
+            total_correct += (predicted_values == labels_raw).sum().item()
+            total_samples += labels_raw.size(0)
             self.global_step += 1
 
             # Progress indicator
@@ -239,7 +242,7 @@ class Trainer:
 
     @torch.no_grad()
     def evaluate(self, dataloader) -> Dict[str, float]:
-        """Evaluate model."""
+        """Evaluate model (REGRESSION)."""
         self.model.eval()
         total_loss = 0
         total_correct = 0
@@ -248,24 +251,23 @@ class Trainer:
         for batch in dataloader:
             input_ids = batch["input_ids"].to(self.device)
             attention_mask = batch["attention_mask"].to(self.device)
-            labels = batch["final_value"].to(self.device)
+            labels_norm = batch["final_value_normalized"].to(self.device).float()
+            labels_raw = batch["final_value"].to(self.device)
 
             mask = self._get_mask(attention_mask)
 
             if self.is_transformer:
-                logits = self.model(input_ids, mask=mask)
+                predictions = self.model(input_ids, mask=mask)
             else:
-                logits = self.model(input_ids, attention_mask=mask)
+                predictions = self.model(input_ids, attention_mask=mask)
 
-            num_classes = logits.size(-1)
-            labels = labels.clamp(0, num_classes - 1)
-
-            loss = self.criterion(logits, labels)
+            loss = self.criterion(predictions, labels_norm)
 
             total_loss += loss.item()
-            predictions = logits.argmax(dim=-1)
-            total_correct += (predictions == labels).sum().item()
-            total_samples += labels.size(0)
+            # REGRESSION accuracy
+            predicted_values = (predictions * 100).round().clamp(0, 100)
+            total_correct += (predicted_values == labels_raw).sum().item()
+            total_samples += labels_raw.size(0)
 
         avg_loss = total_loss / len(dataloader)
         accuracy = total_correct / total_samples
@@ -300,6 +302,9 @@ class Trainer:
 
             # Validate (only rank 0)
             if self.rank == 0:
+                # Synchronize all processes before evaluation in distributed mode
+                if dist.is_initialized():
+                    dist.barrier()
                 val_metrics = self.evaluate(self.val_loader)
                 history["val_loss"].append(val_metrics["loss"])
                 history["val_accuracy"].append(val_metrics["accuracy"])
@@ -349,24 +354,25 @@ def cleanup_distributed():
 
 
 def warmup_npu(model, train_loader, device, is_transformer: bool = False):
-    """Warmup NPU with real batch to compile graphs."""
+    """Warmup NPU with real batch to compile graphs (REGRESSION)."""
     print("Warming up NPU with real batch shape...")
     warmup_batch = next(iter(train_loader))
     input_ids = warmup_batch["input_ids"].to(device)
     attention_mask = warmup_batch["attention_mask"].to(device)
-    labels = warmup_batch["final_value"].to(device).clamp(0, 499)
+    # REGRESSION: Use normalized target
+    labels_norm = warmup_batch["final_value_normalized"].to(device).float()
 
     model.train()
 
     # Forward
     if is_transformer:
         mask = (attention_mask == 0)
-        logits = model(input_ids, mask=mask)
+        predictions = model(input_ids, mask=mask)
     else:
-        logits = model(input_ids, attention_mask=attention_mask)
+        predictions = model(input_ids, attention_mask=attention_mask)
 
-    # Backward
-    loss = F.cross_entropy(logits, labels)
+    # Backward with MSE loss
+    loss = F.mse_loss(predictions, labels_norm)
     loss.backward()
     model.zero_grad(set_to_none=True)
 
@@ -468,7 +474,7 @@ def run_experiment(
     execution_wrapper = StateTrackingWrapper(
         execution,
         vocab_size=tokenizer.vocab_size_actual,
-        num_classes=500
+        num_classes=1  # REGRESSION: single scalar output
     ).to(device)
 
     if distributed:
@@ -518,7 +524,7 @@ def run_experiment(
         num_heads=4,
         num_layers=4,
         d_ff=sfm_config.d_model * 4,
-        num_output_classes=500
+        num_output_classes=1  # REGRESSION: single scalar output
     ).to(device)
 
     if distributed:

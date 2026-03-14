@@ -12,8 +12,8 @@ PASS = State Slots generalize to 4x program length, transformer doesn't.
 
 USAGE:
     python run.py --quick                              # smoke test, 1 NPU
-    python run.py --npus 4 --epochs 10                 # 4 NPUs
-    python run.py --npus 4 --epochs 10 --samples 50000 # full run
+    python run.py --npus 4 --epochs 50                 # 4 NPUs
+    python run.py --npus 4 --epochs 50 --samples 50000 # full run
 """
 
 import os
@@ -40,7 +40,7 @@ def main():
                         help="Only evaluate existing models")
     parser.add_argument("--save_dir", type=str, default="outputs/exp0",
                         help="Directory to save results")
-    parser.add_argument("--epochs", type=int, default=5,
+    parser.add_argument("--epochs", type=int, default=50,
                         help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=32,
                         help="Batch size")

@@ -191,7 +191,7 @@ class TransformerEncoderOnly(nn.Module):
     Encoder-only transformer for simpler baseline comparison.
 
     CUSTOM IMPLEMENTATION - No PyTorch transformer internals.
-    Uses pooled output for classification/regression.
+    REGRESSION: Output is single scalar in [0, 1] range.
     """
 
     def __init__(
@@ -203,7 +203,7 @@ class TransformerEncoderOnly(nn.Module):
         d_ff: int = 1024,
         max_seq_len: int = 512,
         dropout: float = 0.1,
-        num_output_classes: int = 1000
+        num_output_classes: int = 1  # REGRESSION: single scalar
     ):
         super().__init__()
 
@@ -215,11 +215,14 @@ class TransformerEncoderOnly(nn.Module):
         # Custom encoder (no nn.TransformerEncoder)
         self.encoder = TransformerEncoder(d_model, num_heads, d_ff, num_layers, dropout)
 
-        self.output_head = nn.Sequential(
+        # REGRESSION: Output single scalar with sigmoid
+        self.regressor = nn.Sequential(
+            nn.LayerNorm(d_model),
             nn.Linear(d_model, d_model),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(d_model, num_output_classes)
+            nn.Linear(d_model, 1),
+            nn.Sigmoid()  # Output in [0, 1]
         )
 
         self._init_weights()
@@ -241,7 +244,7 @@ class TransformerEncoderOnly(nn.Module):
         pooling: str = "mean"
     ) -> torch.Tensor:
         """
-        Forward pass.
+        Forward pass (REGRESSION).
 
         Args:
             x: Input tokens (batch, seq_len).
@@ -249,7 +252,7 @@ class TransformerEncoderOnly(nn.Module):
             pooling: Pooling method ("mean", "first", "last").
 
         Returns:
-            Output logits (batch, num_classes).
+            Output scalar (batch,) in [0, 1] range.
         """
         # Embed and add positional encoding
         x = self.embedding(x) * math.sqrt(self.d_model)
@@ -277,7 +280,8 @@ class TransformerEncoderOnly(nn.Module):
             else:
                 x = x[:, -1, :]
 
-        return self.output_head(x)
+        # REGRESSION: Return (batch,) not (batch, 1)
+        return self.regressor(x).squeeze(-1)
 
     def count_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters())

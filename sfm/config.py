@@ -90,31 +90,31 @@ class SFMConfig:
 
     @classmethod
     def small(cls) -> "SFMConfig":
-        """Small configuration for testing/debugging."""
+        """Small configuration for testing/debugging - INCREASED CAPACITY."""
         return cls(
             vocab_size=1000,
             max_seq_len=512,
-            d_model=128,
-            d_bridge=64,
+            d_model=256,  # INCREASED from 128
+            d_bridge=128,  # INCREASED from 64
             dropout=0.1,
             perception_num_layers=2,
             perception_num_heads=4,
-            perception_ff_dim=256,
-            execution_num_slots=16,
-            execution_slot_dim=64,
-            execution_num_heads=2,
+            perception_ff_dim=512,  # INCREASED from 256
+            execution_num_slots=32,  # INCREASED from 16
+            execution_slot_dim=128,  # INCREASED from 64
+            execution_num_heads=4,  # INCREASED from 2
             execution_max_ticks=2,
-            deltanet_hidden_dim=128,
-            deltanet_num_heads=2,
-            structure_node_dim=64,
-            structure_edge_dim=32,
+            deltanet_hidden_dim=256,  # INCREASED from 128
+            deltanet_num_heads=4,  # INCREASED from 2
+            structure_node_dim=128,  # INCREASED from 64
+            structure_edge_dim=64,  # INCREASED from 32
             structure_num_layers=2,
-            structure_num_heads=2,
+            structure_num_heads=4,  # INCREASED from 2
             structure_max_nodes=256,
             structure_max_edges=512,
-            meta_hidden_dim=64,
-            meta_num_heads=2,
-            meta_hypothesis_dim=32,
+            meta_hidden_dim=128,  # INCREASED from 64
+            meta_num_heads=4,  # INCREASED from 2
+            meta_hypothesis_dim=64,  # INCREASED from 32
             meta_plan_stack_depth=4,
         )
 

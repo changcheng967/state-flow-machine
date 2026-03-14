@@ -87,13 +87,15 @@ class StateTrackingDataset(Dataset):
         input_ids = input_ids + [pad_id] * padding_length
         attention_mask = attention_mask + [0] * padding_length
 
-        # Clamp final_value to valid class range
-        final_value = max(0, min(499, final_value))
+        # REGRESSION: Clamp to [0, 100] and normalize to [0, 1]
+        final_value = max(0, min(100, final_value))  # Clamp to [0, 100]
+        final_value_normalized = final_value / 100.0  # Normalize to [0, 1]
 
         return {
             "input_ids": torch.tensor(input_ids, dtype=torch.long),
             "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
-            "final_value": torch.tensor(final_value, dtype=torch.long),
+            "final_value": torch.tensor(final_value, dtype=torch.long),  # Raw value [0, 100]
+            "final_value_normalized": torch.tensor(final_value_normalized, dtype=torch.float),  # Normalized [0, 1]
         }
 
 

@@ -33,21 +33,21 @@ class SimpleProgramGenerator:
             "operators": ['+', '-'],
             "max_operand": 10,
             "clamp_values": True,
-            "clamp_range": (0, 500),
+            "clamp_range": (0, 100),  # CLAMPED to [0, 100] for regression
         },
         "medium": {
             "value_range": (0, 100),
             "operators": ['+', '-', '*'],
             "max_operand": 10,
             "clamp_values": True,
-            "clamp_range": (0, 500),
+            "clamp_range": (0, 100),  # CLAMPED to [0, 100] for regression
         },
         "hard": {
             "value_range": (0, 100),
             "operators": ['+', '-', '*'],
             "max_operand": 20,
-            "clamp_values": False,
-            "clamp_range": None,
+            "clamp_values": True,
+            "clamp_range": (0, 100),  # ALSO clamped for regression
         }
     }
 
