@@ -180,6 +180,7 @@ class ExperimentConfig:
     val_samples: int = 1000
     max_program_length: int = 20  # Max statements per program
     min_program_length: int = 3
+    difficulty: str = "easy"  # "easy", "medium", or "hard"
 
     # Training
     batch_size: int = 32

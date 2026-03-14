@@ -75,6 +75,7 @@ def main():
         exp_config = ExperimentConfig.quick()
         sfm_config = SFMConfig.small()
         exp_config.num_epochs = 1
+        exp_config.difficulty = args.difficulty
         base_length = 5
         multipliers = [1, 2]
     else:
@@ -84,7 +85,8 @@ def main():
             val_samples=args.samples // 10,
             max_program_length=20,
             batch_size=args.batch_size,
-            num_epochs=args.epochs
+            num_epochs=args.epochs,
+            difficulty=args.difficulty
         )
         sfm_config = SFMConfig.small()
         base_length = args.base_length

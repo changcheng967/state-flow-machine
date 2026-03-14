@@ -468,7 +468,7 @@ def run_experiment(
             val_samples=config.val_samples,
             max_program_length=config.max_program_length,
             seed=config.seed,
-            difficulty="easy"
+            difficulty=config.difficulty
         )
         timings["data_generation"] = time.time() - t0
     else:
