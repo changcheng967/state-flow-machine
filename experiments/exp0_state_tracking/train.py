@@ -321,10 +321,21 @@ class Trainer:
 
 
 def setup_distributed(rank: int, world_size: int):
-    """Initialize distributed training."""
+    """Initialize distributed training with HCCL backend, fallback to gloo."""
     os.environ['MASTER_ADDR'] = '127.0.0.1'
     os.environ['MASTER_PORT'] = '29500'
-    dist.init_process_group(backend='hccl', rank=rank, world_size=world_size)
+
+    # Try HCCL first (Ascend), fallback to gloo
+    backend = 'hccl'
+    try:
+        dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
+        print(f"[Rank {rank}] Initialized distributed training with backend: {backend}")
+    except Exception as e:
+        print(f"[Rank {rank}] HCCL backend failed ({e}), falling back to gloo")
+        backend = 'gloo'
+        dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
+        print(f"[Rank {rank}] Initialized distributed training with backend: {backend}")
+
     torch.npu.set_device(rank)
 
 
@@ -567,43 +578,45 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
     parser.add_argument("--samples", type=int, default=5000, help="Training samples")
     parser.add_argument("--save_dir", type=str, default="outputs/exp0", help="Save directory")
-    parser.add_argument("--npus", type=int, default=1, help="Number of NPUs for DDP")
+    # NOTE: Do NOT add --local-rank here. torchrun sets LOCAL_RANK via environment variable.
     args = parser.parse_args()
 
-    # Multi-NPU setup
-    if args.npus > 1:
-        import torch.multiprocessing as mp
+    # Get local_rank from environment variable (set by torchrun)
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    is_distributed = world_size > 1
 
-        def train_worker(rank, world_size, args):
-            setup_distributed(rank, world_size)
-            device = torch.device(f"npu:{rank}")
+    if is_distributed:
+        # Distributed training (launched via torchrun)
+        setup_distributed(local_rank, world_size)
+        device = torch.device(f"npu:{local_rank}")
 
-            if args.quick:
-                exp_config = ExperimentConfig.quick()
-                sfm_config = SFMConfig.small()
-                exp_config.num_epochs = 1
-            else:
-                exp_config = ExperimentConfig(
-                    train_samples=args.samples,
-                    val_samples=args.samples // 10,
-                    max_program_length=20,
-                    batch_size=args.batch_size,
-                    num_epochs=args.epochs
-                )
-                sfm_config = SFMConfig.small()
+        if args.quick:
+            exp_config = ExperimentConfig.quick()
+            sfm_config = SFMConfig.small()
+            exp_config.num_epochs = 1
+        else:
+            exp_config = ExperimentConfig(
+                train_samples=args.samples,
+                val_samples=args.samples // 10,
+                max_program_length=20,
+                batch_size=args.batch_size,
+                num_epochs=args.epochs
+            )
+            sfm_config = SFMConfig.small()
 
+        try:
             run_experiment(
                 config=exp_config,
                 sfm_config=sfm_config,
                 device=device,
                 save_dir=args.save_dir,
                 distributed=True,
-                rank=rank,
+                rank=local_rank,
                 world_size=world_size
             )
+        finally:
             cleanup_distributed()
-
-        mp.spawn(train_worker, args=(args.npus, args), nprocs=args.npus, join=True)
     else:
         # Single NPU
         set_seed(42)

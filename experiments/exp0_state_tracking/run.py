@@ -102,7 +102,11 @@ def main():
 
         if args.npus > 1:
             # Multi-NPU training
-            run_distributed_training(exp_config, sfm_config, args)
+            exit_code = run_distributed_training(exp_config, sfm_config, args)
+            if exit_code != 0:
+                print(f"\n[ERROR] Distributed training failed with exit code {exit_code}")
+                print("Check the error messages above. Exiting...")
+                return exit_code
         else:
             # Single NPU training
             device = get_device()
@@ -116,6 +120,16 @@ def main():
                 rank=0,
                 world_size=1
             )
+
+    # Synchronize NPU state before evaluation
+    if not args.train_only:
+        print("\nSynchronizing NPU state before evaluation...")
+        try:
+            import torch
+            torch.npu.synchronize()
+            time.sleep(2)  # Brief pause for NPU state cleanup
+        except Exception as e:
+            print(f"Note: NPU sync skipped ({e})")
 
     # Evaluation phase
     eval_results = None
@@ -198,14 +212,15 @@ def main():
 
 
 def run_distributed_training(exp_config, sfm_config, args):
-    """Run training with multiple NPUs using torchrun-style launch."""
+    """Run training with multiple NPUs using torchrun."""
     import subprocess
 
     print(f"\nLaunching distributed training on {args.npus} NPUs...")
 
-    # Use torchrun for multi-NPU
+    # Use torchrun (NOT deprecated torch.distributed.launch)
+    # torchrun sets LOCAL_RANK via environment variable instead of CLI arg
     cmd = [
-        sys.executable, "-m", "torch.distributed.launch",
+        sys.executable, "-m", "torch.distributed.run",
         f"--nproc_per_node={args.npus}",
         "--master_port=29500",
         os.path.join(os.path.dirname(__file__), "train.py"),
@@ -220,7 +235,7 @@ def run_distributed_training(exp_config, sfm_config, args):
 
     print(f"Command: {' '.join(cmd)}")
 
-    result = subprocess.run(cmd, capture_output=False)
+    result = subprocess.run(cmd)
     return result.returncode
 
 
