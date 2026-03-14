@@ -166,17 +166,19 @@ def generate_test_programs(
     """
     from generate_data import SimpleProgramGenerator
 
+    # Create generator with reasonable defaults - exact_length passed to generate_program()
     generator = SimpleProgramGenerator(
         num_variables=5,
-        max_program_length=exact_length,
-        min_program_length=exact_length,  # EXACT length!
+        max_program_length=exact_length,  # Upper bound
+        min_program_length=1,  # Lower bound (will be overridden by exact_length param)
         seed=seed,
         difficulty=difficulty
     )
 
     samples = []
     for _ in range(num_samples):
-        program, target, final_value = generator.generate_program()
+        # Use exact_length parameter directly - makes intent explicit
+        program, target, final_value = generator.generate_program(exact_length=exact_length)
         samples.append({
             "program": program,
             "target_variable": target,
@@ -257,23 +259,16 @@ def run_evaluation(
     # Load config
     config = SFMConfig.small()
 
-    # Load tokenizer from saved vocabulary
+    # Load tokenizer from saved vocabulary - HARD FAIL if missing
     vocab_path = os.path.join(save_dir, "tokenizer_vocab.json")
-    if os.path.exists(vocab_path):
-        print(f"Loading tokenizer from {vocab_path}")
-        tokenizer = SimpleTokenizer.load(vocab_path)
-    else:
-        # Fallback: recreate tokenizer from training data
-        print("Tokenizer vocab not found, recreating from training data...")
-        data_dir = os.path.join(save_dir, "data")
-        if os.path.exists(os.path.join(data_dir, "train.json")):
-            with open(os.path.join(data_dir, "train.json"), 'r') as f:
-                train_data = json.load(f)
-            corpus = ["\n".join(s["program"]) for s in train_data]
-            tokenizer = SimpleTokenizer()
-            tokenizer.train(corpus, verbose=False)
-        else:
-            raise FileNotFoundError(f"No tokenizer vocab at {vocab_path} and no training data to recreate")
+    if not os.path.exists(vocab_path):
+        raise FileNotFoundError(
+            f"Tokenizer vocabulary not found at {vocab_path}. "
+            "Training must be run first to generate tokenizer_vocab.json. "
+            "Falling back to recreation is disabled for reproducibility."
+        )
+    print(f"Loading tokenizer from {vocab_path}")
+    tokenizer = SimpleTokenizer.load(vocab_path)
 
     print(f"Tokenizer vocabulary size: {tokenizer.vocab_size_actual}")
 

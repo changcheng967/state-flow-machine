@@ -190,26 +190,52 @@ def main():
             trans_close = trans_results.get(mult, {}).get("close_match", 0)
             delta = exec_ema - trans_ema
 
+            # Mark key checkpoints
             status = ""
-            if mult == 4 and delta > 0.05:
-                status = "[OK] PASS"
-            elif mult == 4 and delta <= 0:
-                status = "[X] FAIL"
+            if mult in [4, 8]:
+                if delta > 0.05:
+                    status = "[OK]"
+                elif delta <= 0:
+                    status = "[X]"
 
             print(f"{mult}x{'':<6} {exec_ema:<10.4f} {trans_ema:<10.4f} {exec_close:<10.4f} {trans_close:<10.4f} {delta:+.4f}    {status}")
 
-        # Final verdict
+        # Final verdict - check BOTH 4x and 8x for strong generalization claim
         print("\n" + "-" * 70)
-        if 4 in multipliers:
-            exec_at_4x = exec_results.get(4, {}).get("exact_match", 0)
-            trans_at_4x = trans_results.get(4, {}).get("exact_match", 0)
+        print("VERDICT (single-seed preliminary result):")
 
-            if exec_at_4x > trans_at_4x + 0.05:
-                print("VERDICT: [OK] PASS - State Slots significantly outperform transformer at 4x length")
-            elif exec_at_4x > trans_at_4x:
-                print("VERDICT: [~] MARGINAL - State Slots slightly better, needs more training")
+        # Gather results at key lengths
+        exec_1x = exec_results.get(1, {}).get("exact_match", 0)
+        trans_1x = trans_results.get(1, {}).get("exact_match", 0)
+        exec_4x = exec_results.get(4, {}).get("exact_match", 0)
+        trans_4x = trans_results.get(4, {}).get("exact_match", 0)
+        exec_8x = exec_results.get(8, {}).get("exact_match", 0)
+        trans_8x = trans_results.get(8, {}).get("exact_match", 0)
+
+        # Compute generalization ratios
+        ss_ratio_4x = exec_4x / max(exec_1x, 0.001) if exec_1x > 0 else 0
+        tf_ratio_4x = trans_4x / max(trans_1x, 0.001) if trans_1x > 0 else 0
+        ss_ratio_8x = exec_8x / max(exec_1x, 0.001) if exec_1x > 0 else 0
+        tf_ratio_8x = trans_8x / max(trans_1x, 0.001) if trans_1x > 0 else 0
+
+        print(f"  Generalization ratios (EMA_length / EMA_1x):")
+        print(f"    State Slots: 4x={ss_ratio_4x:.2f}x, 8x={ss_ratio_8x:.2f}x")
+        print(f"    Transformer: 4x={tf_ratio_4x:.2f}x, 8x={tf_ratio_8x:.2f}x")
+
+        # Verdict based on multiple criteria
+        pass_4x = exec_4x > trans_4x + 0.05
+        pass_8x = exec_8x > trans_8x + 0.05 if 8 in multipliers else True
+        gap_widens = (exec_8x - trans_8x) >= (exec_4x - trans_4x) - 0.05 if 8 in multipliers else True
+
+        if pass_4x and pass_8x:
+            if gap_widens:
+                print("\n  [OK] STRONG PASS - State Slots outperform at 4x AND 8x, gap persists")
             else:
-                print("VERDICT: [X] FAIL - Transformer matches or exceeds State Slots")
+                print("\n  [OK] PASS - State Slots outperform at both 4x and 8x")
+        elif pass_4x:
+            print("\n  [~] MARGINAL - State Slots better at 4x but not 8x")
+        else:
+            print("\n  [X] FAIL - No significant generalization advantage")
 
     print("\n" + "=" * 70)
 

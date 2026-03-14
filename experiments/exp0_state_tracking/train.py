@@ -453,6 +453,8 @@ def run_experiment(
 ) -> Dict:
     """Run the full state tracking experiment."""
     timings = {}
+    exec_params = 0
+    trans_params = 0
 
     # Rank 0 creates directories and generates data
     if rank == 0:
@@ -541,7 +543,8 @@ def run_experiment(
 
     if rank == 0:
         model_for_count = execution_wrapper.module if hasattr(execution_wrapper, 'module') else execution_wrapper
-        print(f"Execution System parameters: {model_for_count.count_parameters():,}")
+        exec_params = model_for_count.count_parameters()
+        print(f"Execution System parameters: {exec_params:,}")
 
     if "npu" in str(device):
         model_to_warmup = execution_wrapper.module if hasattr(execution_wrapper, 'module') else execution_wrapper
@@ -593,7 +596,8 @@ def run_experiment(
 
     if rank == 0:
         model_for_count = transformer.module if hasattr(transformer, 'module') else transformer
-        print(f"Transformer parameters: {model_for_count.count_parameters():,}")
+        trans_params = model_for_count.count_parameters()
+        print(f"Transformer parameters: {trans_params:,}")
 
     if "npu" in str(device):
         model_to_warmup = transformer.module if hasattr(transformer, 'module') else transformer
@@ -628,10 +632,28 @@ def run_experiment(
     # Save results
     if rank == 0:
         results["timings"] = timings
+        # Save parameter counts for baseline fairness verification
+        results["parameter_counts"] = {
+            "state_slots": exec_params,
+            "transformer": trans_params,
+            "ratio": round(trans_params / exec_params, 2) if exec_params > 0 else 0
+        }
         results_path = os.path.join(save_dir, "results.json")
         with open(results_path, 'w') as f:
             json.dump(results, f, indent=2)
         print(f"\nResults saved to {results_path}")
+
+        # Print parameter comparison for baseline fairness
+        print("\n" + "=" * 60)
+        print("PARAMETER COUNTS (Baseline Fairness Check)")
+        print("=" * 60)
+        print(f"  State Slots:  {exec_params:,} params")
+        print(f"  Transformer:  {trans_params:,} params")
+        print(f"  Ratio (T/SS): {results['parameter_counts']['ratio']}x")
+        if 0.8 <= results['parameter_counts']['ratio'] <= 1.25:
+            print("  [OK] Models are approximately parameter-matched")
+        else:
+            print("  [!] WARNING: Models may not be fairly matched")
 
         print("\n" + "=" * 60)
         print("TIMING BREAKDOWN")
