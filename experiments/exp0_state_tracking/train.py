@@ -472,7 +472,7 @@ def run_experiment(
     ).to(device)
 
     if distributed:
-        execution_wrapper = DDP(execution_wrapper, device_ids=[rank])
+        execution_wrapper = DDP(execution_wrapper, device_ids=[rank], find_unused_parameters=True)
 
     if rank == 0:
         # Get param count (unwrap DDP if needed)
@@ -522,7 +522,7 @@ def run_experiment(
     ).to(device)
 
     if distributed:
-        transformer = DDP(transformer, device_ids=[rank])
+        transformer = DDP(transformer, device_ids=[rank], find_unused_parameters=True)
 
     if rank == 0:
         model_for_count = transformer.module if hasattr(transformer, 'module') else transformer
