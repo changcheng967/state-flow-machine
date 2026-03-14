@@ -254,11 +254,11 @@ def run_distributed_training(exp_config, sfm_config, args):
         sys.executable, "-m", "torch.distributed.run",
         f"--nproc_per_node={args.npus}",
         "--master_port=29500",
-        os.path.join(os.path.dirname(__file__), "train.py"),
+        os.path.join(os.path.dirname(__file__), " train.py"),
         f"--save_dir={args.save_dir}",
         f"--epochs={args.epochs}",
         f"--batch_size={args.batch_size}",
-        f"--samples={args.samples}",
+        f"--samples={args.samples}"
     ]
 
     if args.quick:
