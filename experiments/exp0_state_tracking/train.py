@@ -375,10 +375,12 @@ class Trainer:
                       f"Time: {train_metrics['time']:.2f}s")
 
             # Validate (only rank 0)
+            # IMPORTANT: barrier must be called by ALL ranks, not just rank 0
+            if dist.is_initialized():
+                dist.barrier()
+            synchronize()
+
             if self.rank == 0:
-                if dist.is_initialized():
-                    dist.barrier()
-                synchronize()
                 val_metrics = self.evaluate(self.val_loader)
                 history["val_loss"].append(val_metrics["loss"])
                 history["val_accuracy"].append(val_metrics["accuracy"])
@@ -819,7 +821,12 @@ if __name__ == "__main__":
             print("\nExecution System (State Slots):")
             print(f"  Final train accuracy: {results['execution']['train_accuracy'][-1]:.4f}")
             print(f"  Final val accuracy: {results['execution']['val_accuracy'][-1]:.4f}")
-            print("\nTransformer Baseline:")
-            print(f"  Final train accuracy: {results['transformer']['train_accuracy'][-1]:.4f}")
-            print(f"  Final val accuracy: {results['transformer']['val_accuracy'][-1]:.4f}")
+            if "transformer_fair" in results:
+                print("\nTransformer-Fair Baseline:")
+                print(f"  Final train accuracy: {results['transformer_fair']['train_accuracy'][-1]:.4f}")
+                print(f"  Final val accuracy: {results['transformer_fair']['val_accuracy'][-1]:.4f}")
+            if "transformer_large" in results:
+                print("\nTransformer-Large Baseline:")
+                print(f"  Final train accuracy: {results['transformer_large']['train_accuracy'][-1]:.4f}")
+                print(f"  Final val accuracy: {results['transformer_large']['val_accuracy'][-1]:.4f}")
             print("\n" + "=" * 60)

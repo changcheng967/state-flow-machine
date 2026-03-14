@@ -146,6 +146,7 @@ def main():
             base_length=base_length,
             multipliers=multipliers,
             samples_per_length=1000 if not args.quick else 10,
+            difficulty=args.difficulty,
             quick=args.quick
         )
 
@@ -172,23 +173,26 @@ def main():
 
     # Print final comparison if we have evaluation results
     if eval_results and not args.train_only:
-        print("\n" + "-" * 70)
+        print("\n" + "-" * 80)
         print("GENERALIZATION RESULTS")
-        print("-" * 70)
+        print("-" * 80)
 
         exec_results = eval_results.get("execution", {})
-        trans_results = eval_results.get("transformer", {})
+        tf_results = eval_results.get("transformer_fair", {})
+        tf_l_results = eval_results.get("transformer_large", {})
 
-        # Updated table format matching evaluate.py
-        print(f"\n{'Length':<8} {'SS EMA':<10} {'TF EMA':<10} {'SS Close':<10} {'TF Close':<10} {'Delta':<10}")
-        print("-" * 68)
+        # Three-model table format
+        print(f"\n{'Length':<8} {'SS EMA':<10} {'TF EMA':<10} {'TF-L EMA':<10} {'SS Close':<10} {'TF Close':<10} {'TF-L Close':<10} {'Delta':<10}")
+        print("-" * 88)
 
         for mult in multipliers:
             exec_ema = exec_results.get(mult, {}).get("exact_match", 0)
-            trans_ema = trans_results.get(mult, {}).get("exact_match", 0)
+            tf_ema = tf_results.get(mult, {}).get("exact_match", 0)
+            tf_l_ema = tf_l_results.get(mult, {}).get("exact_match", 0)
             exec_close = exec_results.get(mult, {}).get("close_match", 0)
-            trans_close = trans_results.get(mult, {}).get("close_match", 0)
-            delta = exec_ema - trans_ema
+            tf_close = tf_results.get(mult, {}).get("close_match", 0)
+            tf_l_close = tf_l_results.get(mult, {}).get("close_match", 0)
+            delta = exec_ema - tf_ema  # Compare against Transformer-Fair (parameter-matched)
 
             # Mark key checkpoints
             status = ""
@@ -198,44 +202,51 @@ def main():
                 elif delta <= 0:
                     status = "[X]"
 
-            print(f"{mult}x{'':<6} {exec_ema:<10.4f} {trans_ema:<10.4f} {exec_close:<10.4f} {trans_close:<10.4f} {delta:+.4f}    {status}")
+            print(f"{mult}x{'':<6} {exec_ema:<10.4f} {tf_ema:<10.4f} {tf_l_ema:<10.4f} "
+                  f"{exec_close:<10.4f} {tf_close:<10.4f} {tf_l_close:<10.4f} {delta:+.4f}    {status}")
 
         # Final verdict - check BOTH 4x and 8x for strong generalization claim
-        print("\n" + "-" * 70)
+        print("\n" + "-" * 80)
         print("VERDICT (single-seed preliminary result):")
 
         # Gather results at key lengths
         exec_1x = exec_results.get(1, {}).get("exact_match", 0)
-        trans_1x = trans_results.get(1, {}).get("exact_match", 0)
+        tf_1x = tf_results.get(1, {}).get("exact_match", 0)
+        tf_l_1x = tf_l_results.get(1, {}).get("exact_match", 0)
         exec_4x = exec_results.get(4, {}).get("exact_match", 0)
-        trans_4x = trans_results.get(4, {}).get("exact_match", 0)
+        tf_4x = tf_results.get(4, {}).get("exact_match", 0)
+        tf_l_4x = tf_l_results.get(4, {}).get("exact_match", 0)
         exec_8x = exec_results.get(8, {}).get("exact_match", 0)
-        trans_8x = trans_results.get(8, {}).get("exact_match", 0)
+        tf_8x = tf_results.get(8, {}).get("exact_match", 0)
+        tf_l_8x = tf_l_results.get(8, {}).get("exact_match", 0)
 
         # Compute generalization ratios
         ss_ratio_4x = exec_4x / max(exec_1x, 0.001) if exec_1x > 0 else 0
-        tf_ratio_4x = trans_4x / max(trans_1x, 0.001) if trans_1x > 0 else 0
+        tf_ratio_4x = tf_4x / max(tf_1x, 0.001) if tf_1x > 0 else 0
+        tf_l_ratio_4x = tf_l_4x / max(tf_l_1x, 0.001) if tf_l_1x > 0 else 0
         ss_ratio_8x = exec_8x / max(exec_1x, 0.001) if exec_1x > 0 else 0
-        tf_ratio_8x = trans_8x / max(trans_1x, 0.001) if trans_1x > 0 else 0
+        tf_ratio_8x = tf_8x / max(tf_1x, 0.001) if tf_1x > 0 else 0
+        tf_l_ratio_8x = tf_l_8x / max(tf_l_1x, 0.001) if tf_l_1x > 0 else 0
 
         print(f"  Generalization ratios (EMA_length / EMA_1x):")
-        print(f"    State Slots: 4x={ss_ratio_4x:.2f}x, 8x={ss_ratio_8x:.2f}x")
-        print(f"    Transformer: 4x={tf_ratio_4x:.2f}x, 8x={tf_ratio_8x:.2f}x")
+        print(f"    State Slots:       4x={ss_ratio_4x:.2f}x, 8x={ss_ratio_8x:.2f}x")
+        print(f"    Transformer-Fair:  4x={tf_ratio_4x:.2f}x, 8x={tf_ratio_8x:.2f}x")
+        print(f"    Transformer-Large: 4x={tf_l_ratio_4x:.2f}x, 8x={tf_l_ratio_8x:.2f}x")
 
-        # Verdict based on multiple criteria
-        pass_4x = exec_4x > trans_4x + 0.05
-        pass_8x = exec_8x > trans_8x + 0.05 if 8 in multipliers else True
-        gap_widens = (exec_8x - trans_8x) >= (exec_4x - trans_4x) - 0.05 if 8 in multipliers else True
+        # Verdict based on comparison with Transformer-Fair (parameter-matched baseline)
+        pass_4x = exec_4x > tf_4x + 0.05
+        pass_8x = exec_8x > tf_8x + 0.05 if 8 in multipliers else True
+        gap_widens = (exec_8x - tf_8x) >= (exec_4x - tf_4x) - 0.05 if 8 in multipliers else True
 
         if pass_4x and pass_8x:
             if gap_widens:
-                print("\n  [OK] STRONG PASS - State Slots outperform at 4x AND 8x, gap persists")
+                print("\n  [OK] STRONG PASS - State Slots outperform Transformer-Fair at 4x AND 8x, gap persists")
             else:
-                print("\n  [OK] PASS - State Slots outperform at both 4x and 8x")
+                print("\n  [OK] PASS - State Slots outperform Transformer-Fair at both 4x and 8x")
         elif pass_4x:
             print("\n  [~] MARGINAL - State Slots better at 4x but not 8x")
         else:
-            print("\n  [X] FAIL - No significant generalization advantage")
+            print("\n  [X] FAIL - No significant generalization advantage over Transformer-Fair")
 
     print("\n" + "=" * 70)
 
@@ -265,7 +276,7 @@ def run_distributed_training(exp_config, sfm_config, args):
     if args.quick:
         cmd.append("--quick")
 
-    print(f"Command: {' '.join(cmd)})")
+    print(f"Command: {' '.join(cmd)}")
 
     result = subprocess.run(cmd)
     return result.returncode

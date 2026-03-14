@@ -207,14 +207,28 @@ def load_model(
             dropout=config.dropout
         )
         model = StateTrackingWrapper(execution, vocab_size)
-    else:
+    elif model_type == "transformer_fair":
+        # Transformer-Fair: ~660K params (parameter-matched with State Slots)
         model = TransformerEncoderOnly(
             vocab_size=vocab_size,
-            d_model=config.d_model,
+            d_model=160,
+            num_heads=4,
+            num_layers=3,
+            d_ff=640,
+            num_output_classes=1
+        )
+    elif model_type == "transformer_large":
+        # Transformer-Large: ~3.26M params (for reference)
+        model = TransformerEncoderOnly(
+            vocab_size=vocab_size,
+            d_model=256,
             num_heads=4,
             num_layers=4,
-            d_ff=config.d_model * 4
+            d_ff=1024,
+            num_output_classes=1
         )
+    else:
+        raise ValueError(f"Unknown model_type: {model_type}")
 
     # Load checkpoint
     if os.path.exists(model_path):
@@ -233,7 +247,8 @@ def run_evaluation(
     save_dir: str,
     base_length: int = 10,
     multipliers: List[int] = [1, 2, 4, 8],
-    samples_per_length: int = 100,
+    samples_per_length: int = 1000,
+    difficulty: str = "easy",
     quick: bool = False
 ) -> Dict:
     """
@@ -244,6 +259,7 @@ def run_evaluation(
         base_length: Base program length (number of operations).
         multipliers: Length multipliers to test.
         samples_per_length: Samples per length multiplier.
+        difficulty: Data difficulty level (easy/medium/hard).
         quick: Quick test mode.
 
     Returns:
@@ -272,17 +288,27 @@ def run_evaluation(
 
     print(f"Tokenizer vocabulary size: {tokenizer.vocab_size_actual}")
 
-    results = {"execution": {}, "transformer": {}}
+    results = {
+        "execution": {},
+        "transformer_fair": {},
+        "transformer_large": {}
+    }
 
-    # Evaluate both models
-    for model_type, model_name in [("execution", "State Slots"), ("transformer", "Transformer")]:
+    # Three-model setup
+    model_configs = [
+        ("execution", "State Slots", False),
+        ("transformer_fair", "Transformer-Fair", True),
+        ("transformer_large", "Transformer-Large", True)
+    ]
+
+    for model_type, model_name, is_transformer in model_configs:
         model_path = os.path.join(save_dir, f"{model_type}_best.pt")
         print(f"\n{'=' * 60}")
         print(f"Evaluating {model_name}")
         print(f"{'=' * 60}")
 
         model = load_model(model_path, model_type, config, tokenizer.vocab_size_actual, device)
-        evaluator = Evaluator(model, tokenizer, device, model_name, is_transformer=(model_type == "transformer"))
+        evaluator = Evaluator(model, tokenizer, device, model_name, is_transformer=is_transformer)
 
         for mult in multipliers:
             target_length = base_length * mult
@@ -293,7 +319,7 @@ def run_evaluation(
                 num_samples=samples_per_length,
                 exact_length=target_length,
                 seed=42 + mult,  # Different seed per length
-                difficulty="easy"
+                difficulty=difficulty
             )
 
             # Evaluate
@@ -306,33 +332,35 @@ def run_evaluation(
             print(f"    MAE: {metrics['mae']:.2f}")
 
     # Print results table
-    print("\n" + "=" * 80)
+    print("\n" + "=" * 100)
     print("GENERALIZATION RESULTS")
-    print("=" * 80)
-    print(f"\n{'Length':<8} {'SS EMA':<10} {'TF EMA':<10} {'SS Close':<10} {'TF Close':<10} {'SS MSE':<10} {'TF MSE':<10}")
-    print("-" * 78)
+    print("=" * 100)
+    print(f"\n{'Length':<8} {'SS EMA':<10} {'TF EMA':<10} {'TF-L EMA':<10} {'SS Close':<10} {'TF Close':<10} {'TF-L Close':<10}")
+    print("-" * 88)
 
     for mult in multipliers:
         ss = results["execution"][mult]
-        tf = results["transformer"][mult]
-        print(f"{mult}x{'':<6} {ss['exact_match']:<10.4f} {tf['exact_match']:<10.4f} "
-              f"{ss['close_match']:<10.4f} {tf['close_match']:<10.4f} "
-              f"{ss['mse']:<10.6f} {tf['mse']:<10.6f}")
+        tf = results["transformer_fair"][mult]
+        tf_l = results["transformer_large"][mult]
+        print(f"{mult}x{'':<6} {ss['exact_match']:<10.4f} {tf['exact_match']:<10.4f} {tf_l['exact_match']:<10.4f} "
+              f"{ss['close_match']:<10.4f} {tf['close_match']:<10.4f} {tf_l['close_match']:<10.4f}")
 
     # Compute generalization ratios
-    print("\n" + "-" * 50)
+    print("\n" + "-" * 60)
     print("GENERALIZATION RATIOS (EMA_4x / EMA_1x):")
     if 1 in multipliers and 4 in multipliers:
         ss_ratio = results["execution"][4]["exact_match"] / max(results["execution"][1]["exact_match"], 0.001)
-        tf_ratio = results["transformer"][4]["exact_match"] / max(results["transformer"][1]["exact_match"], 0.001)
-        print(f"  State Slots: {ss_ratio:.2f}x")
-        print(f"  Transformer: {tf_ratio:.2f}x")
+        tf_ratio = results["transformer_fair"][4]["exact_match"] / max(results["transformer_fair"][1]["exact_match"], 0.001)
+        tf_l_ratio = results["transformer_large"][4]["exact_match"] / max(results["transformer_large"][1]["exact_match"], 0.001)
+        print(f"  State Slots:       {ss_ratio:.2f}x")
+        print(f"  Transformer-Fair:  {tf_ratio:.2f}x")
+        print(f"  Transformer-Large: {tf_l_ratio:.2f}x")
         if ss_ratio > tf_ratio + 0.1:
-            print(f"  VERDICT: PASS - State Slots generalize better")
+            print(f"  VERDICT: PASS - State Slots generalize better than Transformer-Fair")
         elif ss_ratio > tf_ratio:
-            print(f"  VERDICT: MARGINAL - Slight advantage")
+            print(f"  VERDICT: MARGINAL - Slight advantage over Transformer-Fair")
         else:
-            print(f"  VERDICT: FAIL - No advantage")
+            print(f"  VERDICT: FAIL - No advantage over Transformer-Fair")
 
     # Save results
     results_path = os.path.join(save_dir, "evaluation_results.json")
@@ -346,14 +374,16 @@ def run_evaluation(
         matplotlib.use('Agg')  # Non-interactive backend
         import matplotlib.pyplot as plt
 
-        fig, ax = plt.subplots(figsize=(10, 6))
+        fig, ax = plt.subplots(figsize=(12, 7))
 
         ss_accs = [results["execution"][m]["exact_match"] * 100 for m in multipliers]
-        tf_accs = [results["transformer"][m]["exact_match"] * 100 for m in multipliers]
+        tf_accs = [results["transformer_fair"][m]["exact_match"] * 100 for m in multipliers]
+        tf_l_accs = [results["transformer_large"][m]["exact_match"] * 100 for m in multipliers]
         x_labels = [f"{m}x" for m in multipliers]
 
         ax.plot(x_labels, ss_accs, 'b-o', linewidth=2, markersize=8, label='State Slots')
-        ax.plot(x_labels, tf_accs, 'r--s', linewidth=2, markersize=8, label='Transformer')
+        ax.plot(x_labels, tf_accs, 'r--s', linewidth=2, markersize=8, label='Transformer-Fair')
+        ax.plot(x_labels, tf_l_accs, 'g:^', linewidth=2, markersize=8, label='Transformer-Large')
 
         ax.set_xlabel('Length Multiplier', fontsize=12)
         ax.set_ylabel('Exact Match Accuracy (%)', fontsize=12)
@@ -381,8 +411,11 @@ if __name__ == "__main__":
                         help="Base program length (number of operations)")
     parser.add_argument("--multipliers", type=int, nargs="+", default=[1, 2, 4, 8],
                         help="Length multipliers to test")
-    parser.add_argument("--samples", type=int, default=100,
+    parser.add_argument("--samples", type=int, default=1000,
                         help="Samples per length")
+    parser.add_argument("--difficulty", type=str, default="easy",
+                        choices=["easy", "medium", "hard"],
+                        help="Data difficulty level")
     parser.add_argument("--quick", action="store_true",
                         help="Quick test mode")
     args = parser.parse_args()
@@ -392,6 +425,7 @@ if __name__ == "__main__":
         base_length=args.base_length,
         multipliers=args.multipliers,
         samples_per_length=args.samples,
+        difficulty=args.difficulty,
         quick=args.quick
     )
 
