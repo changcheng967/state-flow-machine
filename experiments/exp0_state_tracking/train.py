@@ -108,7 +108,15 @@ class StateTrackingWrapper(nn.Module):
     ):
         super().__init__()
         self.execution = execution_system
-        self.embedding = nn.Embedding(vocab_size, execution_system.input_dim)
+
+        # CUBE ALIGNMENT: Pad vocab_size to multiple of 16 for optimal embedding table access
+        padded_vocab_size = ((vocab_size + 15) // 16) * 16
+        if padded_vocab_size != vocab_size:
+            print(f"[Cube] Padding vocab_size from {vocab_size} to {padded_vocab_size} for alignment")
+        self.vocab_size = vocab_size  # Original size for masking
+        self.padded_vocab_size = padded_vocab_size
+
+        self.embedding = nn.Embedding(padded_vocab_size, execution_system.input_dim)
         # REGRESSION: Output single scalar, apply sigmoid to constrain to [0, 1]
         self.regressor = nn.Sequential(
             nn.LayerNorm(execution_system.input_dim),
@@ -571,7 +579,7 @@ def run_experiment(
         learning_rate=sfm_config.learning_rate,
         model_name="execution",
         grad_accum_steps=grad_accum_steps,
-        use_amp=False,  # Disable AMP for State Slots (FP16 overflow in DeltaNet cumprod)
+        use_amp=use_amp,  # Re-enabled: DeltaNet now uses log-space cumprod (FP32-stable)
         rank=rank,
         warmup_steps=sfm_config.warmup_steps,
         num_epochs=config.num_epochs

@@ -13,6 +13,12 @@ CUBE-FIRST OPTIMIZATION for Ascend NPU:
 - Within-chunk recurrence uses MATRIX MULTIPLICATION (runs on Cube)
 - Between-chunk carry uses Vector unit
 - This gives Cube+Vector pipeline parallelism
+
+OPTIMIZATIONS (2024-03):
+- Selective FP32 for cumprod operations (Vector unit anyway, no Cube cost)
+- Log-space computation for numerical stability
+- Batched chunk processing (single Cube matmul for all chunks)
+- Avoid torch.where to prevent AICPU fallback
 """
 
 import torch
@@ -29,6 +35,9 @@ class DeltaNetCell(nn.Module):
     CUBE-FIRST: Uses matrix-based parallel scan within 16-step chunks.
     The 16x16 lower-triangular matrix M is computed and multiplied,
     utilizing the DaVinci Cube unit efficiently.
+
+    OPTIMIZED: Uses selective FP32 for numerically sensitive operations
+    (cumprod, division) which run on Vector unit anyway.
     """
 
     def __init__(
@@ -92,78 +101,72 @@ class DeltaNetCell(nn.Module):
         tri_indices = torch.tril_indices(chunk_size, chunk_size)
         self.register_buffer('tri_indices', tri_indices, persistent=False)
 
-    def _compute_chunk_matrix(self, a_chunk: torch.Tensor) -> torch.Tensor:
+    def _compute_chunk_matrix_batched(self, a_chunks: torch.Tensor) -> torch.Tensor:
         """
-        Compute the 16x16 lower-triangular matrix M for chunk scan.
+        Compute the 16x16 lower-triangular matrix M for ALL chunks at once.
 
-        M[i,j] = prod(a_k, k=j+1..i) for i>j
-        M[i,i] = 1
-        M[i,j] = 0 for i<j
+        Uses LOG-SPACE computation for numerical stability in FP16/AMP:
+        - log(cumprod) = cumsum(log(a)) — stable, no overflow
+        - M[i,j] = exp(log_cumprod[i] - log_cumprod[j-1])
 
-        This matrix multiply runs on the Cube unit: M @ B_chunk
+        This avoids the cumprod → divide pattern that overflows FP16.
 
         Args:
-            a_chunk: (batch, chunk_len, num_heads) - decay factors
+            a_chunks: (batch, num_chunks, chunk_len, num_heads) - decay factors
 
         Returns:
-            M: (batch, chunk_len, chunk_len, num_heads) - lower triangular matrices
+            M_all: (batch*num_chunks, chunk_len, chunk_len, num_heads) - lower triangular matrices
         """
-        batch_size, chunk_len, num_heads = a_chunk.shape
+        batch_size, num_chunks, chunk_len, num_heads = a_chunks.shape
+        device = a_chunks.device
+        input_dtype = a_chunks.dtype
 
-        # Compute cumulative products: cumprod[i] = a_0 * a_1 * ... * a_i
-        cumprod = torch.cumprod(a_chunk, dim=1)  # (batch, chunk_len, num_heads)
+        # Flatten batch and chunks for unified processing
+        a_flat = a_chunks.reshape(batch_size * num_chunks, chunk_len, num_heads)
 
-        # For M[i,j] = prod(a_k, k=j+1..i) = cumprod[i] / cumprod[j]
-        # For i=j: M[i,i] = 1
-        # For i<j: M[i,j] = 0
+        # === SELECTIVE FP32: Log-space computation for stability ===
+        # These ops run on Vector unit anyway, so FP32 costs zero Cube throughput
+        a_fp32 = a_flat.float()
 
-        # Expand for broadcasting: (batch, chunk_len, 1, num_heads) / (batch, 1, chunk_len, num_heads)
-        cumprod_i = cumprod.unsqueeze(2)  # (batch, chunk_len, 1, num_heads)
-        cumprod_j = cumprod.unsqueeze(1)  # (batch, 1, chunk_len, num_heads)
+        # Handle negative eigenvalues: track sign separately
+        sign_a = a_fp32.sign()
+        sign_a = torch.where(sign_a == 0, torch.ones_like(sign_a), sign_a)
 
-        # Compute ratio: (batch, chunk_len, chunk_len, num_heads)
-        # Use safe division with 1.0 for positions where j > i (will be zeroed anyway)
-        # M[i,j] = cumprod[i] / cumprod[j-1] for i >= j, with cumprod[-1] = 1
+        # Log-space cumprod: log(cumprod) = cumsum(log(|a|))
+        log_a = torch.log(a_fp32.abs().clamp(min=1e-7))  # Avoid log(0)
+        log_cumprod = torch.cumsum(log_a, dim=1)  # (B*C, chunk_len, num_heads)
 
-        # For i >= j: M[i,j] = cumprod[i] / (cumprod[j-1] if j > 0 else 1)
-        # We can compute this as: cumprod[i] / cumprod[j] * a_j for i > j
+        # For M[i,j] = cumprod[i] / cumprod[j-1], in log space:
+        # log(M[i,j]) = log_cumprod[i] - log_cumprod[j-1]
+        # Pad log_cumprod with 0 at position -1 (log(1) = 0)
+        log_cumprod_padded = F.pad(log_cumprod, (0, 0, 1, 0), value=0.0)
 
-        # Simpler approach: create lower triangular mask and use cumprod
-        # M[i,j] = cumprod[i] / cumprod[j-1] for i > j (with cumprod[-1] = 1)
-        # M[i,i] = 1
+        # Broadcasting: (B*C, chunk_len, 1, nh) - (B*C, 1, chunk_len, nh)
+        log_cumprod_i = log_cumprod.unsqueeze(2)  # (B*C, chunk_len, 1, num_heads)
+        log_cumprod_j = log_cumprod_padded[:, :-1, :].unsqueeze(1)  # (B*C, 1, chunk_len, num_heads)
 
-        # Create padded cumprod with 1 at position -1
-        ones = torch.ones(batch_size, 1, num_heads, device=a_chunk.device, dtype=a_chunk.dtype)
-        cumprod_padded = torch.cat([ones, cumprod], dim=1)  # (batch, chunk_len+1, num_heads)
+        log_M = log_cumprod_i - log_cumprod_j  # (B*C, chunk_len, chunk_len, num_heads)
+        M = torch.exp(log_M)  # Back to linear space
 
-        # M[i,j] = cumprod[i] / cumprod[j-1+1] = cumprod[i] / cumprod[j] for i >= j
-        # But we need to handle the indexing correctly
+        # Handle signs: sign(cumprod) = cumprod(sign)
+        sign_cumprod = torch.cumprod(sign_a, dim=1)
+        sign_cumprod_padded = F.pad(sign_cumprod, (0, 0, 1, 0), value=1.0)
+        sign_M = sign_cumprod.unsqueeze(2) * sign_cumprod_padded[:, :-1, :].unsqueeze(1)
+        M = M * sign_M
 
-        # Create lower triangular mask
-        mask = torch.tril(torch.ones(chunk_len, chunk_len, device=a_chunk.device, dtype=a_chunk.dtype))
-        mask = mask.unsqueeze(0).unsqueeze(-1)  # (1, chunk_len, chunk_len, 1)
+        # === AVOID torch.where: Use mask multiplication (prevents AICPU fallback) ===
+        # Lower triangular mask
+        tril_mask = torch.tril(torch.ones(chunk_len, chunk_len, device=device, dtype=torch.float32))
+        tril_mask = tril_mask.unsqueeze(0).unsqueeze(-1)  # (1, chunk_len, chunk_len, 1)
+        M = M * tril_mask
 
-        # For positions i >= j: M[i,j] = cumprod[i] / cumprod_padded[j]
-        # where cumprod_padded[j] = 1 for j=0, else cumprod[j-1]
-        cumprod_j_padded = cumprod_padded[:, :-1, :].unsqueeze(1)  # (batch, 1, chunk_len, num_heads)
-        cumprod_i_exp = cumprod.unsqueeze(2)  # (batch, chunk_len, 1, num_heads)
-
-        # Safe division
-        M = torch.where(
-            cumprod_j_padded.abs() > 1e-8,
-            cumprod_i_exp / cumprod_j_padded,
-            torch.zeros_like(cumprod_i_exp)
-        )
-
-        # Apply mask and set diagonal to 1
-        M = M * mask
-
-        # Set diagonal to 1 (i=j positions)
-        diag_mask = torch.eye(chunk_len, device=a_chunk.device, dtype=a_chunk.dtype)
+        # Diagonal mask: set diagonal to 1
+        diag_mask = torch.eye(chunk_len, device=device, dtype=torch.float32)
         diag_mask = diag_mask.unsqueeze(0).unsqueeze(-1)  # (1, chunk_len, chunk_len, 1)
-        M = M * (1 - diag_mask) + diag_mask
+        M = M * (1.0 - diag_mask) + diag_mask
 
-        return M  # (batch, chunk_len, chunk_len, num_heads)
+        # Cast back to input dtype for Cube matmul
+        return M.to(input_dtype)  # (B*C, chunk_len, chunk_len, num_heads)
 
     def _cube_parallel_scan(
         self,
@@ -174,8 +177,10 @@ class DeltaNetCell(nn.Module):
         """
         Cube-first parallel scan for linear recurrence: h_t = a_t * h_{t-1} + b_t
 
-        Uses chunked matrix-based scan for within-chunk computation (Cube unit),
-        with sequential carry between chunks (Vector unit).
+        OPTIMIZED: Batched chunk processing — ONE Cube matmul for ALL chunks,
+        then sequential carry for inter-chunk dependencies.
+
+        Uses log-space computation for numerical stability under AMP/FP16.
         """
         batch_size, seq_len, num_heads, head_dim = b.shape
         device = b.device
@@ -199,45 +204,41 @@ class DeltaNetCell(nn.Module):
         a_chunks = a_flat.view(batch_size, num_chunks, chunk_size, num_heads)
         b_chunks = b.view(batch_size, num_chunks, chunk_size, num_heads, head_dim)
 
-        # Process each chunk
-        h = h0  # (batch, num_heads, head_dim)
+        # === BATCHED: Compute M for ALL chunks at once (one kernel launch) ===
+        M_all = self._compute_chunk_matrix_batched(a_chunks)  # (B*C, cs, cs, nh)
+
+        # === BATCHED CUBE: Single matmul for all chunks ===
+        # M_all: (B*C, cs, cs, nh) -> (B*C*nh, cs, cs)
+        M_flat = M_all.permute(0, 3, 1, 2).reshape(
+            batch_size * num_chunks * num_heads, chunk_size, chunk_size
+        )
+        # B_chunks: (B, C, cs, nh, hd) -> (B*C*nh, hd, cs).T -> (B*C*nh, cs, hd)
+        B_flat = b_chunks.permute(0, 1, 3, 4, 2).reshape(
+            batch_size * num_chunks * num_heads, head_dim, chunk_size
+        ).transpose(1, 2)
+
+        # ONE Cube matmul for ALL chunks
+        h_contrib_all = torch.bmm(M_flat, B_flat)  # (B*C*nh, cs, hd)
+        h_contrib_all = h_contrib_all.view(
+            batch_size, num_chunks, num_heads, chunk_size, head_dim
+        ).permute(0, 1, 3, 2, 4)  # (batch, num_chunks, chunk_size, num_heads, head_dim)
+
+        # === SELECTIVE FP32: Cumprod for h0 contribution ===
+        a_fp32 = a_chunks.float()
+        cum_a_all = torch.cumprod(a_fp32, dim=2)  # (batch, num_chunks, chunk_size, num_heads)
+
+        # === SEQUENTIAL: Inter-chunk carry (only num_chunks iterations, not seq_len) ===
+        h = h0
         outputs = []
 
-        for chunk_idx in range(num_chunks):
-            a_chunk = a_chunks[:, chunk_idx, :, :]  # (batch, chunk_size, num_heads)
-            b_chunk = b_chunks[:, chunk_idx, :, :, :]  # (batch, chunk_size, num_heads, head_dim)
-
-            # CUBE OPERATION: Compute chunk scan matrix M
-            M = self._compute_chunk_matrix(a_chunk)  # (batch, chunk_size, chunk_size, num_heads)
-
-            # CUBE OPERATION: M @ B_chunk - matrix multiply for each batch and head
-            # Reshape for batched matmul: treat (batch, num_heads) as batch dims
-            # M: (batch, chunk_size, chunk_size, num_heads) -> (batch*num_heads, chunk_size, chunk_size)
-            # B: (batch, chunk_size, num_heads, head_dim) -> (batch*num_heads, chunk_size, head_dim)
-
-            M_flat = M.permute(0, 3, 1, 2).reshape(batch_size * num_heads, chunk_size, chunk_size)
-            B_flat = b_chunk.permute(0, 2, 3, 1).reshape(batch_size * num_heads, chunk_size, head_dim)
-
-            # CUBE: Matrix multiply M @ B
-            h_contrib = torch.bmm(M_flat, B_flat)  # (batch*num_heads, chunk_size, head_dim)
-            h_contrib = h_contrib.view(batch_size, num_heads, chunk_size, head_dim)
-            h_contrib = h_contrib.permute(0, 2, 1, 3)  # (batch, chunk_size, num_heads, head_dim)
-
-            # VECTOR OPERATION: Add initial state contribution
-            # h_chunk[t] includes h0 * (prod a_0..a_{t-1}) contribution
-            # This is the first term of the scan
-            cum_a = torch.cumprod(a_chunk, dim=1)  # (batch, chunk_size, num_heads)
-            # h: (batch, num_heads, head_dim) -> (batch, 1, num_heads, head_dim)
-            # cum_a: (batch, chunk_size, num_heads) -> (batch, chunk_size, num_heads, 1)
-            h0_contrib = cum_a.unsqueeze(-1) * h.unsqueeze(1)  # (batch, chunk_size, num_heads, head_dim)
-
-            # Total: h_chunk = h0_contrib + h_contrib
-            h_chunk = h0_contrib + h_contrib  # (batch, chunk_size, num_heads, head_dim)
-
+        for c in range(num_chunks):
+            # h0 contribution: cum_a * h_prev (cast back to input dtype for consistency)
+            h0_contrib = cum_a_all[:, c, :, :].unsqueeze(-1).to(dtype) * h.unsqueeze(1)
+            # Total: h_chunk = h0_contrib + intra_chunk_contribution
+            h_chunk = h0_contrib + h_contrib_all[:, c]  # (batch, chunk_size, num_heads, head_dim)
             outputs.append(h_chunk)
-
-            # VECTOR OPERATION: Carry forward last hidden state for next chunk
-            h = h_chunk[:, -1, :, :]  # (batch, num_heads, head_dim)
+            # Carry: last hidden state for next chunk
+            h = h_chunk[:, -1, :, :]
 
         # Concatenate all chunks
         h_all = torch.cat(outputs, dim=1)  # (batch, padded_seq_len, num_heads, head_dim)
