@@ -688,6 +688,7 @@ if __name__ == "__main__":
 
         if args.quick:
             exp_config = ExperimentConfig.quick()
+            exp_config.difficulty = args.difficulty
             sfm_config = SFMConfig.small()
             exp_config.num_epochs = 1
         else:
@@ -696,7 +697,8 @@ if __name__ == "__main__":
                 val_samples=args.samples // 10,
                 max_program_length=20,
                 batch_size=args.batch_size,
-                num_epochs=args.epochs
+                num_epochs=args.epochs,
+                difficulty=args.difficulty
             )
             sfm_config = SFMConfig.small()
 
@@ -718,6 +720,7 @@ if __name__ == "__main__":
 
         if args.quick:
             exp_config = ExperimentConfig.quick()
+            exp_config.difficulty = args.difficulty
             sfm_config = SFMConfig.small()
             exp_config.num_epochs = 1
         else:
@@ -726,7 +729,8 @@ if __name__ == "__main__":
                 val_samples=args.samples // 10,
                 max_program_length=20,
                 batch_size=args.batch_size,
-                num_epochs=args.epochs
+                num_epochs=args.epochs,
+                difficulty=args.difficulty
             )
             sfm_config = SFMConfig.small()
 

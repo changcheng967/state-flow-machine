@@ -210,6 +210,7 @@ class ExperimentConfig:
             eval_every=10,
             save_every=50,
             grad_accum_steps=1,
+            difficulty="easy"  # Default
         )
 
 
