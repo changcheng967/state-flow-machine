@@ -176,6 +176,23 @@ class SimpleTokenizer:
         """Get actual vocabulary size."""
         return len(self.token_to_id)
 
+    def save_vocab(self, path: str):
+        """Save vocabulary to JSON file."""
+        vocab_data = {
+            "token_to_id": self.token_to_id,
+            "id_to_token": {str(k): v for k, v in self.id_to_token.items()}
+        }
+        with open(path, 'w') as f:
+            json.dump(vocab_data, f, indent=2)
+
+    def load_vocab(self, path: str):
+        """Load vocabulary from JSON file."""
+        with open(path, 'r') as f:
+            data = json.load(f)
+        self.token_to_id = data["token_to_id"]
+        self.id_to_token = {int(k): v for k, v in data["id_to_token"].items()}
+        self._trained = True
+
     def save(self, path: str):
         """Save tokenizer to file."""
         data = {

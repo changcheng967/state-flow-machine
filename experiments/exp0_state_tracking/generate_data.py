@@ -97,13 +97,15 @@ class SimpleProgramGenerator:
 
     def generate_program(
         self,
-        target_variable: Optional[str] = None
+        target_variable: Optional[str] = None,
+        exact_length: Optional[int] = None
     ) -> Tuple[List[str], str, int]:
         """
         Generate a single program.
 
         Args:
             target_variable: Variable to track (random if None).
+            exact_length: If set, generate exactly this many operations (no random range).
 
         Returns:
             Tuple of (program_lines, target_variable, final_value).
@@ -121,7 +123,10 @@ class SimpleProgramGenerator:
             program.append(f"{var} = {value}")
 
         # Add operations
-        num_ops = random.randint(self.min_program_length, self.max_program_length)
+        if exact_length is not None:
+            num_ops = exact_length
+        else:
+            num_ops = random.randint(self.min_program_length, self.max_program_length)
 
         for _ in range(num_ops):
             op_type = random.choice(['assign', 'update', 'copy'])
@@ -173,9 +178,7 @@ class SimpleProgramGenerator:
                 state[var] = self._clamp(state.get(other, 0))
                 program.append(f"{var} = {other}")
 
-        final_value = state.get(target_variable, 0)
-        # Ensure final_value is in valid class range [0, 499]
-        final_value = max(0, min(499, final_value))
+        final_value = self._clamp(state.get(target_variable, 0))
 
         # Add target query at the end
         program.append(f"# What is {target_variable}?")

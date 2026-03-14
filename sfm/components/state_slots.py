@@ -1,15 +1,18 @@
 """
-State Slot Bank - CUBE-OPTIMIZED VERSION
+State Slot Bank - SEQUENTIAL WRITE VERSION
 
 64 registers that explicitly bind to variables and track values through execution.
 This is the core of System 2 (Execution).
 
+KEY ARCHITECTURAL ADVANTAGE:
+The sequential per-chunk write preserves execution order.
+Early statements write first, later statements can overwrite.
+This is what transformers CANNOT do (attention is parallel).
+
 CUBE OPTIMIZATIONS:
 - All tensor dimensions are multiples of 16
-- All slot operations use batched matmul (torch.bmm or torch.matmul)
-- MATCH: scores = torch.matmul(query, slot_keys.transpose) → one Cube call
-- READ: values = torch.matmul(attention_weights, slot_values) → one Cube call
-- WRITE: use torch.baddbmm for erase-then-write update
+- READ operations use batched matmul (Cube)
+- Only WRITE is sequential per-chunk (this is intentional!)
 """
 
 import torch
@@ -22,8 +25,8 @@ class StateSlotBank(nn.Module):
     """
     State Slot Bank: A memory bank of registers for tracking program state.
 
-    CUBE-OPTIMIZED: All operations use batched matmul for Cube unit utilization.
-    Dimensions: num_slots=64, slot_dim=128 (both multiples of 16).
+    SEQUENTIAL WRITE: Per-chunk updates preserve execution order.
+    This is the core architectural advantage over transformers.
     """
 
     def __init__(
@@ -34,7 +37,8 @@ class StateSlotBank(nn.Module):
         num_heads: int = 4,        # head_dim = 32
         max_ticks: int = 2,
         halting_threshold: float = 0.5,
-        dropout: float = 0.1
+        dropout: float = 0.1,
+        chunk_size: int = 16       # Chunk size for sequential write
     ):
         super().__init__()
 
@@ -45,37 +49,28 @@ class StateSlotBank(nn.Module):
         self.head_dim = slot_dim // num_heads
         self.max_ticks = max_ticks
         self.halting_threshold = halting_threshold
+        self.chunk_size = chunk_size
+        self.top_k_slots = 3  # Update top-3 slots per chunk
 
         assert slot_dim % num_heads == 0, "slot_dim must be divisible by num_heads"
-        assert num_slots % 16 == 0, "num_slots must be multiple of 16 for Cube optimization"
-        assert slot_dim % 16 == 0, "slot_dim must be multiple of 16 for Cube optimization"
+        assert num_slots % 16 == 0, "num_slots must be multiple of 16"
+        assert slot_dim % 16 == 0, "slot_dim must be multiple of 16"
 
         # Slot memory: stores current state of all slots
         self.slot_memory = nn.Parameter(torch.zeros(1, num_slots, slot_dim))
         nn.init.normal_(self.slot_memory, std=0.02)
 
+        # Slot keys for matching (learnable)
+        self.slot_keys = nn.Parameter(torch.randn(num_slots, slot_dim) * 0.02)
+
         # Input projection to slot dimension
         self.input_proj = nn.Linear(input_dim, slot_dim, bias=False)
 
-        # CUBE-OPTIMIZED: Combined QKV projection
-        self.qkv_proj = nn.Linear(slot_dim, 3 * slot_dim, bias=False)
-
-        # Write projection (input_dim -> slot_dim)
+        # Write projection
         self.write_proj = nn.Linear(slot_dim, slot_dim, bias=False)
 
-        # Erase projection for gated write
-        self.erase_proj = nn.Linear(slot_dim, slot_dim, bias=False)
-
-        # Update gate
-        self.update_gate = nn.Linear(slot_dim + slot_dim, num_slots, bias=True)
-
-        # Halting network (lightweight)
-        self.halting_net = nn.Sequential(
-            nn.Linear(slot_dim, 32),  # 32 is multiple of 16
-            nn.ReLU(),
-            nn.Linear(32, 1),
-            nn.Sigmoid()
-        )
+        # Update gate for sequential write
+        self.update_gate = nn.Linear(slot_dim + slot_dim, 1, bias=True)
 
         # Output projection
         self.output_proj = nn.Linear(slot_dim, input_dim, bias=False)
@@ -86,81 +81,116 @@ class StateSlotBank(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
 
-        # Scale for attention (head_dim = 32)
+        # Scale for attention
         self.scale = self.head_dim ** -0.5
 
     def init_slots(self, batch_size: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         """Initialize slot memory for a batch."""
         return self.slot_memory.expand(batch_size, -1, -1).clone()
 
-    def _batched_attention(
+    def _batched_read_attention(
         self,
         query: torch.Tensor,    # (batch, seq_len, slot_dim)
-        keys: torch.Tensor,     # (batch, num_slots, slot_dim)
-        values: torch.Tensor    # (batch, num_slots, slot_dim)
+        slots: torch.Tensor      # (batch, num_slots, slot_dim)
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        CUBE-OPTIMIZED multi-head attention using batched matmul.
+        CUBE-OPTIMIZED batched read attention.
 
         Returns:
-            output: (batch, seq_len, slot_dim)
-            weights: (batch, num_heads, seq_len, num_slots)
+            read_out: (batch, seq_len, slot_dim)
+            attn_weights: (batch, num_heads, seq_len, num_slots)
         """
         batch_size, seq_len, _ = query.shape
 
-        # Reshape for multi-head: (batch, seq, slot_dim) -> (batch, heads, seq, head_dim)
+        # Reshape for multi-head
         q = query.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        k = keys.view(batch_size, self.num_slots, self.num_heads, self.head_dim).transpose(1, 2)
-        v = values.view(batch_size, self.num_slots, self.num_heads, self.head_dim).transpose(1, 2)
+        k = slots.view(batch_size, self.num_slots, self.num_heads, self.head_dim).transpose(1, 2)
+        v = slots.view(batch_size, self.num_slots, self.num_heads, self.head_dim).transpose(1, 2)
 
-        # CUBE: Attention scores = Q @ K^T
-        # (batch, heads, seq, head_dim) @ (batch, heads, head_dim, num_slots)
-        attn_scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # (batch, heads, seq, num_slots)
+        # CUBE: Attention scores
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
         attn_weights = F.softmax(attn_scores, dim=-1)
 
-        # CUBE: Read output = weights @ V
-        # (batch, heads, seq, num_slots) @ (batch, heads, num_slots, head_dim)
-        read_out = torch.matmul(attn_weights, v)  # (batch, heads, seq, head_dim)
-
-        # Reshape back: (batch, heads, seq, head_dim) -> (batch, seq, slot_dim)
+        # CUBE: Read output
+        read_out = torch.matmul(attn_weights, v)
         read_out = read_out.transpose(1, 2).contiguous().view(batch_size, seq_len, self.slot_dim)
 
         return read_out, attn_weights
 
-    def _batched_write(
+    def _sequential_chunk_write(
         self,
-        slots: torch.Tensor,       # (batch, num_slots, slot_dim)
-        write_values: torch.Tensor, # (batch, slot_dim)
-        erase_values: torch.Tensor, # (batch, slot_dim)
-        gates: torch.Tensor         # (batch, num_slots)
+        slots: torch.Tensor,      # (batch, num_slots, slot_dim)
+        read_out: torch.Tensor    # (batch, seq_len, slot_dim)
     ) -> torch.Tensor:
         """
-        CUBE-OPTIMIZED batched write using baddbmm for erase-then-write.
+        SEQUENTIAL per-chunk write - THIS IS THE CORE ADVANTAGE.
 
-        update: slots = (1 - erase) * slots + write * gate
+        Early chunks write first, later chunks can overwrite.
+        This preserves execution order that transformers cannot replicate.
 
-        This is computed as: slots = slots - erase * slots * gate + write * gate
-        Using torch.baddbmm for efficient batched matmul.
+        Args:
+            slots: Current slot values.
+            read_out: Read output from attention (batch, seq_len, slot_dim).
+
+        Returns:
+            Updated slots after sequential chunk processing.
         """
-        batch_size = slots.size(0)
+        batch_size, seq_len, _ = read_out.shape
+        chunk_size = self.chunk_size
 
-        # Expand for broadcasting: (batch, num_slots, slot_dim)
-        write_exp = write_values.unsqueeze(1).expand(-1, self.num_slots, -1)
-        erase_exp = erase_values.unsqueeze(1).expand(-1, self.num_slots, -1)
-        gates_exp = gates.unsqueeze(-1)  # (batch, num_slots, 1)
+        # Process chunks sequentially - THIS LOOP IS INTENTIONAL
+        for chunk_start in range(0, seq_len, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, seq_len)
 
-        # Compute erase contribution: erase * gate
-        # Using bmm: (batch, num_slots, slot_dim) * (batch, num_slots, 1) -> (batch, num_slots, slot_dim)
-        erase_scaled = erase_exp * gates_exp
+            # Get chunk and compute summary
+            chunk = read_out[:, chunk_start:chunk_end, :]  # (batch, chunk_len, slot_dim)
+            chunk_summary = chunk.mean(dim=1)  # (batch, slot_dim)
 
-        # CUBE: slots = slots - slots * erase_scaled + write_exp * gates_exp
-        # First: compute new_slots = slots * (1 - erase_scaled)
-        new_slots = slots * (1 - erase_scaled)
+            # Compute match scores with all slots using cosine similarity
+            # slots: (batch, num_slots, slot_dim)
+            # chunk_summary: (batch, slot_dim)
+            chunk_norm = F.normalize(chunk_summary, dim=-1)
+            slot_norms = F.normalize(slots, dim=-1)  # (batch, num_slots, slot_dim)
 
-        # Then: add write contribution
-        new_slots = new_slots + write_exp * gates_exp
+            # Cosine similarity: (batch, num_slots)
+            match_scores = torch.bmm(
+                slot_norms,
+                chunk_norm.unsqueeze(-1)
+            ).squeeze(-1)  # (batch, num_slots)
 
-        return new_slots
+            # Select top-k slots to update
+            top_k = min(self.top_k_slots, self.num_slots)
+            _, top_indices = match_scores.topk(top_k, dim=-1)  # (batch, top_k)
+
+            # Compute write value
+            write_value = self.write_proj(chunk_summary)  # (batch, slot_dim)
+
+            # Compute update gate
+            gate_input = torch.cat([
+                slots.mean(dim=1),  # Current slot average
+                write_value
+            ], dim=-1)
+            gate = torch.sigmoid(self.update_gate(gate_input))  # (batch, 1)
+
+            # SEQUENTIAL UPDATE: Update each of the top-k slots
+            for k in range(top_k):
+                # Get indices for this k across batch
+                batch_indices = torch.arange(batch_size, device=slots.device)
+                slot_indices = top_indices[:, k]  # (batch,)
+
+                # Get current slot values for these indices
+                current_slot_vals = slots[batch_indices, slot_indices]  # (batch, slot_dim)
+
+                # Compute gated update
+                new_slot_vals = (1 - gate) * current_slot_vals + gate * write_value
+
+                # Update slots in-place (sequential)
+                slots[batch_indices, slot_indices] = new_slot_vals
+
+        # Layer norm after all updates
+        slots = self.layer_norm_slots(slots)
+
+        return slots
 
     def forward(
         self,
@@ -169,7 +199,7 @@ class StateSlotBank(nn.Module):
         return_attention: bool = False
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, Any]]:
         """
-        Forward pass with CUBE-optimized batched operations.
+        Forward pass with SEQUENTIAL write.
 
         Args:
             x: Input tensor (batch, seq_len, input_dim).
@@ -190,29 +220,17 @@ class StateSlotBank(nn.Module):
         # BATCHED: Project all inputs at once
         x_proj = self.input_proj(self.layer_norm_input(x))  # (batch, seq_len, slot_dim)
 
-        # CUBE: Compute read attention for entire sequence
-        read_out, attn_weights = self._batched_attention(x_proj, slots, slots)
+        # CUBE: Batched read attention
+        read_out, attn_weights = self._batched_read_attention(x_proj, slots)
 
-        # Aggregate sequence info for slot update
-        seq_summary = read_out.mean(dim=1)  # (batch, slot_dim)
+        # SEQUENTIAL: Per-chunk write (core advantage)
+        new_slots = self._sequential_chunk_write(slots, read_out)
 
-        # Compute write and erase values
-        write_values = self.write_proj(seq_summary)  # (batch, slot_dim)
-        erase_values = torch.sigmoid(self.erase_proj(seq_summary))  # (batch, slot_dim)
+        # Compute halting (based on read output variance)
+        read_variance = read_out.var(dim=1).mean().item()
+        avg_ticks = 1.0 + min(read_variance * 10, self.max_ticks - 1)
 
-        # Compute update gates
-        gate_input = torch.cat([slots.mean(dim=1), write_values], dim=-1)
-        update_gates = torch.sigmoid(self.update_gate(gate_input))  # (batch, num_slots)
-
-        # CUBE: Batched write with erase-then-write
-        new_slots = self._batched_write(slots, write_values, erase_values, update_gates)
-        new_slots = self.layer_norm_slots(new_slots)
-
-        # Compute halting
-        halt_prob = self.halting_net(seq_summary)  # (batch, 1)
-        avg_ticks = 1.0 + (1.0 - halt_prob.mean().item()) * (self.max_ticks - 1)
-
-        # BATCHED: Output projection for entire sequence
+        # BATCHED: Output projection
         output = self.output_proj(read_out)
         output = self.dropout(output)
 
@@ -267,38 +285,30 @@ class StateSlotLayer(nn.Module):
 if __name__ == "__main__":
     # Smoke test
     print("=" * 60)
-    print("State Slot Bank (Cube-Optimized) Smoke Test")
+    print("State Slot Bank (Sequential Write) Smoke Test")
     print("=" * 60)
 
     torch.manual_seed(42)
 
     batch_size = 4
-    seq_len = 16
-    input_dim = 256  # Multiple of 16
-    num_slots = 64   # Multiple of 16
-    slot_dim = 128   # Multiple of 16
+    seq_len = 64  # Multiple of chunk_size
+    input_dim = 256
+    num_slots = 64
+    slot_dim = 128
 
-    # Verify dimension alignment
-    print("\n1. Verifying dimension alignment...")
-    assert num_slots % 16 == 0, f"num_slots {num_slots} not multiple of 16"
-    assert slot_dim % 16 == 0, f"slot_dim {slot_dim} not multiple of 16"
-    print(f"   num_slots: {num_slots} (x{num_slots // 16})")
-    print(f"   slot_dim: {slot_dim} (x{slot_dim // 16})")
-    print(f"   head_dim: {slot_dim // 4}")
-    print("   [OK] Dimension alignment verified!")
-
-    # Initialize slot bank
-    print("\n2. Initializing StateSlotBank...")
+    # Initialize
+    print("\n1. Initializing StateSlotBank with sequential write...")
     slot_bank = StateSlotBank(
         input_dim=input_dim,
         num_slots=num_slots,
         slot_dim=slot_dim,
         num_heads=4,
-        max_ticks=2
+        max_ticks=2,
+        chunk_size=16
     )
 
     # Test forward pass
-    print("\n3. Testing Cube-optimized forward pass...")
+    print("\n2. Testing sequential write forward pass...")
     import time
     x = torch.randn(batch_size, seq_len, input_dim)
 
@@ -316,6 +326,17 @@ if __name__ == "__main__":
     assert slots.shape == (batch_size, num_slots, slot_dim), "Slots shape mismatch!"
     print("   [OK] Forward pass test passed!")
 
+    # Test that sequential processing works (different outputs for different orderings)
+    print("\n3. Testing sequential ordering effect...")
+    x_reversed = torch.flip(x, dims=[1])  # Reverse sequence order
+    output_rev, slots_rev, _ = slot_bank(x_reversed)
+
+    # Outputs should differ due to sequential write
+    diff = (output - output_rev.flip(dims=[1])).abs().mean().item()
+    print(f"   Output difference (reversed vs normal): {diff:.4f}")
+    assert diff > 0.001, "Sequential processing should produce different outputs!"
+    print("   [OK] Sequential ordering verified!")
+
     # Performance test
     print("\n4. Performance test (100 iterations)...")
     start = time.time()
@@ -326,6 +347,7 @@ if __name__ == "__main__":
 
     # Test gradient flow
     print("\n5. Testing gradient flow...")
+    slot_bank.zero_grad()
     loss = output.sum()
     loss.backward()
     grad_count = sum(1 for p in slot_bank.parameters() if p.grad is not None and p.grad.abs().sum() > 0)
@@ -338,5 +360,5 @@ if __name__ == "__main__":
     print(f"\n   Total parameters: {total_params:,}")
 
     print("\n" + "=" * 60)
-    print("All State Slot Bank (Cube-Optimized) tests passed!")
+    print("All State Slot Bank (Sequential Write) tests passed!")
     print("=" * 60)

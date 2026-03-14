@@ -486,6 +486,10 @@ def run_experiment(
     corpus = ["\n".join(s["program"]) for s in train_data]
     tokenizer = SimpleTokenizer()
     tokenizer.train(corpus, verbose=(rank == 0))
+    vocab_path = os.path.join(save_dir, "tokenizer_vocab.json")
+    if rank == 0:
+        tokenizer.save(vocab_path)
+        print(f"Saved tokenizer vocabulary to {vocab_path}")
     timings["tokenization"] = time.time() - t0
 
     # Create dataloaders

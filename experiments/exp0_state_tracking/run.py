@@ -44,7 +44,7 @@ def main():
                         help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=32,
                         help="Batch size")
-    parser.add_argument("--samples", type=int, default=5000,
+    parser.add_argument("--samples", type=int, default=10000,
                         help="Number of training samples")
     parser.add_argument("--base_length", type=int, default=10,
                         help="Base program length for generalization test")
