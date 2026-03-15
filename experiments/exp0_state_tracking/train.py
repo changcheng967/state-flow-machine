@@ -262,16 +262,8 @@ class Trainer:
             # Forward with AMP
             predictions = self._forward_with_amp(input_ids, mask)
 
-            # Compute MSE loss
-            if self.use_amp:
-                try:
-                    with torch.npu.amp.autocast():
-                        loss = self.criterion(predictions, labels_norm)
-                except AttributeError:
-                    with torch.cuda.amp.autocast():
-                        loss = self.criterion(predictions, labels_norm)
-            else:
-                loss = self.criterion(predictions, labels_norm)
+            # Compute MSE loss in FP32 outside autocast to avoid dtype mismatch
+            loss = self.criterion(predictions.float(), labels_norm.float())
 
             # Scale loss for gradient accumulation
             loss = loss / self.grad_accum_steps
@@ -343,7 +335,8 @@ class Trainer:
             else:
                 predictions = self.model(input_ids, attention_mask=mask)
 
-            loss = self.criterion(predictions, labels_norm)
+            # Loss in FP32 to avoid dtype mismatch
+            loss = self.criterion(predictions.float(), labels_norm.float())
 
             total_loss += loss.item()
             predicted_values = (predictions * 100).round().clamp(0, 100)
@@ -429,6 +422,15 @@ def setup_distributed(rank: int, world_size: int):
     torch.npu.set_device(rank)
 
 
+def reinit_process_group(rank: int, world_size: int):
+    """Reinitialize process group to get fresh HCCL state for next model."""
+    if dist.is_initialized():
+        dist.destroy_process_group()
+    # Small delay to ensure cleanup completes
+    time.sleep(0.5)
+    setup_distributed(rank, world_size)
+
+
 def cleanup_distributed():
     """Clean up distributed training."""
     dist.destroy_process_group()
@@ -470,8 +472,8 @@ def warmup_npu(model, train_loader, device, is_transformer: bool = False, use_am
         else:
             predictions = model(input_ids, attention_mask=attention_mask)
 
-    # Backward with MSE loss
-    loss = F.mse_loss(predictions, labels_norm)
+    # Backward with MSE loss in FP32 to avoid dtype mismatch
+    loss = F.mse_loss(predictions.float(), labels_norm.float())
     loss.backward()
     model.zero_grad(set_to_none=True)
 
@@ -612,121 +614,126 @@ def run_experiment(
     timings["execution_training"] = time.time() - t0
     results["execution"] = execution_history
 
-    # Clean up execution model to free DDP state before next model
-    if distributed:
-        del execution_wrapper
-        del execution_trainer
-        torch.npu.empty_cache()
-        synchronize()
-
-    # === Transformer training: rank 0 only (no DDP) ===
-    # DDP process group is corrupted after FP32 execution training (PyTorch/HCCL bug).
-    # Transformers are small (~600K-3M params) and train in <2 min on 1 NPU.
-
-    if distributed and rank != 0:
-        # Non-zero ranks wait for rank 0 to finish transformer training
-        dist.barrier()
-        # Skip to return - rank 0 handles everything
-    else:
-        # rank 0 (or non-distributed) trains transformers
-
-        # ========== Train Transformer-Fair Baseline (~670K params to match State Slots) ==========
+    # ========== Train Transformer-Fair Baseline (~670K params to match State Slots) ==========
+    if rank == 0:
         print("\n" + "=" * 60)
         print("Training Transformer-Fair Baseline (~670K params)")
         print("=" * 60)
 
-        t0 = time.time()
-        transformer_fair = TransformerEncoderOnly(
-            vocab_size=tokenizer.vocab_size_actual,
-            d_model=128,           # Reduced for parameter-matched comparison (~670K)
-            num_heads=4,
-            num_layers=3,
-            d_ff=512,              # d_model * 4
-            num_output_classes=1
-        ).to(device)
+    # Reinit process group to get fresh HCCL state (avoid DDP int overflow bug)
+    if distributed:
+        synchronize()
+        reinit_process_group(rank, world_size)
 
-        # NO DDP for transformers - rank 0 only
-        trans_fair_params = transformer_fair.count_parameters()
+    t0 = time.time()
+    transformer_fair = TransformerEncoderOnly(
+        vocab_size=tokenizer.vocab_size_actual,
+        d_model=128,           # Reduced for parameter-matched comparison (~670K)
+        num_heads=4,
+        num_layers=3,
+        d_ff=512,              # d_model * 4
+        num_output_classes=1
+    ).to(device)
+
+    if distributed:
+        transformer_fair = DDP(transformer_fair, device_ids=[rank], find_unused_parameters=True)
+
+    if rank == 0:
+        model_for_count = transformer_fair.module if hasattr(transformer_fair, 'module') else transformer_fair
+        trans_fair_params = model_for_count.count_parameters()
         print(f"Transformer-Fair parameters: {trans_fair_params:,}")
 
-        if "npu" in str(device):
-            warmup_npu(transformer_fair, train_loader, device, is_transformer=True, use_amp=use_amp)
-        timings["transformer_fair_creation_and_warmup"] = time.time() - t0
+    if "npu" in str(device):
+        model_to_warmup = transformer_fair.module if hasattr(transformer_fair, 'module') else transformer_fair
+        warmup_npu(model_to_warmup, train_loader, device, is_transformer=True, use_amp=use_amp)
+    timings["transformer_fair_creation_and_warmup"] = time.time() - t0
 
-        transformer_fair_trainer = Trainer(
-            transformer_fair,
-            train_loader,
-            val_loader,
-            device,
-            learning_rate=sfm_config.learning_rate,
-            model_name="transformer_fair",
-            is_transformer=True,
-            grad_accum_steps=1,  # No DDP, single GPU - no accumulation needed
-            use_amp=use_amp,
-            rank=0,  # Always rank 0 for transformers
-            warmup_steps=sfm_config.warmup_steps,
-            num_epochs=config.num_epochs
-        )
+    transformer_fair_trainer = Trainer(
+        transformer_fair,
+        train_loader,
+        val_loader,
+        device,
+        learning_rate=sfm_config.learning_rate,
+        model_name="transformer_fair",
+        is_transformer=True,
+        grad_accum_steps=grad_accum_steps,  # Same as execution for fair comparison
+        use_amp=use_amp,  # AMP enabled for transformers (loss computed in FP32)
+        rank=rank,
+        warmup_steps=sfm_config.warmup_steps,
+        num_epochs=config.num_epochs
+    )
 
-        t0 = time.time()
-        synchronize()
-        transformer_fair_history = transformer_fair_trainer.train(
-            num_epochs=config.num_epochs,
-            save_dir=save_dir
-        )
-        synchronize()
-        timings["transformer_fair_training"] = time.time() - t0
-        results["transformer_fair"] = transformer_fair_history
+    t0 = time.time()
+    synchronize()
+    transformer_fair_history = transformer_fair_trainer.train(
+        num_epochs=config.num_epochs,
+        save_dir=save_dir if rank == 0 else None
+    )
+    synchronize()
+    timings["transformer_fair_training"] = time.time() - t0
+    results["transformer_fair"] = transformer_fair_history
 
-        # ========== Train Transformer-Large Baseline (~3.26M params, for reference) ==========
+    # ========== Train Transformer-Large Baseline (~3.26M params, for reference) ==========
+    if rank == 0:
         print("\n" + "=" * 60)
         print("Training Transformer-Large Baseline (~3.26M params)")
         print("=" * 60)
 
-        t0 = time.time()
-        transformer_large = TransformerEncoderOnly(
-            vocab_size=tokenizer.vocab_size_actual,
-            d_model=sfm_config.d_model,  # Original 256
-            num_heads=4,
-            num_layers=4,
-            d_ff=sfm_config.d_model * 4,  # Original 1024
-            num_output_classes=1
-        ).to(device)
+    # Reinit process group to get fresh HCCL state
+    if distributed:
+        synchronize()
+        reinit_process_group(rank, world_size)
 
-        # NO DDP for transformers - rank 0 only
-        trans_large_params = transformer_large.count_parameters()
+    t0 = time.time()
+    transformer_large = TransformerEncoderOnly(
+        vocab_size=tokenizer.vocab_size_actual,
+        d_model=sfm_config.d_model,  # Original 256
+        num_heads=4,
+        num_layers=4,
+        d_ff=sfm_config.d_model * 4,  # Original 1024
+        num_output_classes=1
+    ).to(device)
+
+    if distributed:
+        transformer_large = DDP(transformer_large, device_ids=[rank], find_unused_parameters=True)
+
+    if rank == 0:
+        model_for_count = transformer_large.module if hasattr(transformer_large, 'module') else transformer_large
+        trans_large_params = model_for_count.count_parameters()
         print(f"Transformer-Large parameters: {trans_large_params:,}")
 
-        if "npu" in str(device):
-            warmup_npu(transformer_large, train_loader, device, is_transformer=True, use_amp=use_amp)
-        timings["transformer_large_creation_and_warmup"] = time.time() - t0
+    if "npu" in str(device):
+        model_to_warmup = transformer_large.module if hasattr(transformer_large, 'module') else transformer_large
+        warmup_npu(model_to_warmup, train_loader, device, is_transformer=True, use_amp=use_amp)
+    timings["transformer_large_creation_and_warmup"] = time.time() - t0
 
-        transformer_large_trainer = Trainer(
-            transformer_large,
-            train_loader,
-            val_loader,
-            device,
-            learning_rate=sfm_config.learning_rate,
-            model_name="transformer_large",
-            is_transformer=True,
-            grad_accum_steps=1,  # No DDP, single GPU - no accumulation needed
-            use_amp=use_amp,
-            rank=0,  # Always rank 0 for transformers
-            warmup_steps=sfm_config.warmup_steps,
-            num_epochs=config.num_epochs
-        )
+    transformer_large_trainer = Trainer(
+        transformer_large,
+        train_loader,
+        val_loader,
+        device,
+        learning_rate=sfm_config.learning_rate,
+        model_name="transformer_large",
+        is_transformer=True,
+        grad_accum_steps=grad_accum_steps,  # Same as execution for fair comparison
+        use_amp=use_amp,  # AMP enabled for transformers (loss computed in FP32)
+        rank=rank,
+        warmup_steps=sfm_config.warmup_steps,
+        num_epochs=config.num_epochs
+    )
 
-        t0 = time.time()
-        synchronize()
-        transformer_large_history = transformer_large_trainer.train(
-            num_epochs=config.num_epochs,
-            save_dir=save_dir
-        )
-        synchronize()
-        timings["transformer_large_training"] = time.time() - t0
-        results["transformer_large"] = transformer_large_history
+    t0 = time.time()
+    synchronize()
+    transformer_large_history = transformer_large_trainer.train(
+        num_epochs=config.num_epochs,
+        save_dir=save_dir if rank == 0 else None
+    )
+    synchronize()
+    timings["transformer_large_training"] = time.time() - t0
+    results["transformer_large"] = transformer_large_history
 
-        # Save results (rank 0 only)
+    # Save results (rank 0 only)
+    if rank == 0:
         results["timings"] = timings
         # Save parameter counts for baseline fairness verification
         results["parameter_counts"] = {
@@ -760,10 +767,6 @@ def run_experiment(
         for name, t in timings.items():
             print(f"  {name}: {t:.2f}s ({t/total_time*100:.1f}%)")
         print(f"  TOTAL: {total_time:.2f}s")
-
-        # Signal non-zero ranks that we're done
-        if distributed:
-            dist.barrier()
 
     return results
 
