@@ -194,18 +194,18 @@ def load_model(
     vocab_size: int,
     device: torch.device
 ) -> nn.Module:
-    """Load a trained model for REGRESSION."""
+    """Load a trained model."""
     if model_type == "execution":
         execution = ExecutionSystem(
             input_dim=config.d_model,
             hidden_dim=config.deltanet_hidden_dim,
             num_slots=16,
-            slot_dim=config.execution_slot_dim,
+            slot_dim=256,  # Must match training
             max_ticks=config.execution_max_ticks,
             num_heads=config.execution_num_heads,
             dropout=config.dropout
         )
-        model = StateTrackingWrapper(execution, vocab_size)
+        model = StateTrackingWrapper(execution, vocab_size, num_classes=101)
     elif model_type == "transformer_fair":
         # Transformer-Fair: ~670K params (parameter-matched with State Slots)
         model = TransformerEncoderOnly(

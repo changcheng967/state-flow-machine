@@ -410,20 +410,26 @@ class TransformerBaseline(nn.Module):
 
 
 class StateTrackingWrapper(nn.Module):
-    """Wraps ExecutionSystem for state tracking REGRESSION.
+    """Wraps ExecutionSystem for state tracking.
 
-    Defined here (not in train.py) so evaluate.py can import it
-    without pulling in torch_npu via train.py's top-level imports.
+    Supports two modes:
+    - Classification (num_classes=101): predict exact integer 0-100.
+      Returns (batch,) float tensor with argmax/100.0 for backward compat.
+    - Regression (num_classes=1): original sigmoid output [0,1].
+
+    When return_intermediate=True, returns (final_logits, intermediate_logits)
+    for auxiliary loss computation during training.
     """
 
     def __init__(
         self,
         execution_system: nn.Module,
         vocab_size: int,
-        num_classes: int = 1  # REGRESSION: single scalar output
+        num_classes: int = 101  # 101 classes for values 0-100
     ):
         super().__init__()
         self.execution = execution_system
+        self.num_classes = num_classes
 
         # Pad vocab_size to multiple of 16 for optimal embedding table access
         padded_vocab_size = ((vocab_size + 15) // 16) * 16
@@ -431,28 +437,61 @@ class StateTrackingWrapper(nn.Module):
         self.padded_vocab_size = padded_vocab_size
 
         self.embedding = nn.Embedding(padded_vocab_size, execution_system.input_dim)
-        # REGRESSION: Output single scalar, apply sigmoid to constrain to [0, 1]
-        self.regressor = nn.Sequential(
-            nn.LayerNorm(execution_system.input_dim),
-            nn.Linear(execution_system.input_dim, execution_system.input_dim),
-            nn.ReLU(),
-            nn.Linear(execution_system.input_dim, 1),
-            nn.Sigmoid()  # Output in [0, 1]
-        )
+
+        if num_classes > 1:
+            # Classification head: predict integer value 0-100
+            self.classifier = nn.Sequential(
+                nn.LayerNorm(execution_system.input_dim),
+                nn.Linear(execution_system.input_dim, execution_system.input_dim),
+                nn.ReLU(),
+                nn.Linear(execution_system.input_dim, num_classes),
+            )
+            # Intermediate head: predict value at each timestep (for aux loss)
+            self.intermediate_head = nn.Sequential(
+                nn.LayerNorm(execution_system.input_dim),
+                nn.Linear(execution_system.input_dim, num_classes),
+            )
+        else:
+            # Regression: original behavior
+            self.classifier = nn.Sequential(
+                nn.LayerNorm(execution_system.input_dim),
+                nn.Linear(execution_system.input_dim, execution_system.input_dim),
+                nn.ReLU(),
+                nn.Linear(execution_system.input_dim, 1),
+                nn.Sigmoid(),
+            )
+            self.intermediate_head = None
 
     def forward(
         self,
         input_ids: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None
+        attention_mask: Optional[torch.Tensor] = None,
+        return_intermediate: bool = False
     ) -> torch.Tensor:
         x = self.embedding(input_ids)
         x = self.execution(x)
+
+        # Intermediate predictions at every position
+        if self.intermediate_head is not None:
+            intermediate_logits = self.intermediate_head(x)  # (batch, seq_len, 101)
+
+        # Pool for final prediction
         if attention_mask is not None:
             mask_exp = attention_mask.unsqueeze(-1).float()
             pooled = (x * mask_exp).sum(dim=1) / mask_exp.sum(dim=1).clamp(min=1)
         else:
             pooled = x.mean(dim=1)
-        return self.regressor(pooled).squeeze(-1)  # (batch,)
+
+        final_logits = self.classifier(pooled)  # (batch, num_classes) or (batch, 1)
+
+        if return_intermediate and self.intermediate_head is not None:
+            return final_logits, intermediate_logits
+
+        # Eval mode: return backward-compatible (batch,) tensor
+        if self.num_classes > 1:
+            return final_logits.argmax(dim=-1).float() / 100.0  # (batch,) in [0,1]
+        else:
+            return final_logits.squeeze(-1)  # (batch,)
 
     def count_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters())

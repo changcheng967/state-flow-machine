@@ -67,35 +67,71 @@ class StateTrackingDataset(Dataset):
         program_lines = sample["program"]
         final_value = sample["final_value"]
 
-        # Create input text
-        input_text = "\n".join(program_lines)
+        # Tokenize each line separately to track per-line boundaries
+        line_token_ids = []
+        for line in program_lines:
+            line_token_ids.append(self.tokenizer.encode(line))
 
-        # Tokenize
-        input_ids = self.tokenizer.encode(input_text)
+        # Flatten: concatenate all line tokens
+        all_token_ids = []
+        for line_ids in line_token_ids:
+            all_token_ids.extend(line_ids)
 
-        # TRUNCATE to max_length (keep space for any special tokens)
-        input_ids = input_ids[:self.max_length]
+        # TRUNCATE to max_length
+        all_token_ids = all_token_ids[:self.max_length]
 
         # Get padding token
         pad_id = self.tokenizer.token_to_id.get("<pad>", 0)
 
         # Create attention mask BEFORE padding (1 for real tokens)
-        attention_mask = [1] * len(input_ids)
+        attention_mask = [1] * len(all_token_ids)
 
-        # PAD to EXACTLY max_length (ensures all batches have same shape)
-        padding_length = self.max_length - len(input_ids)
-        input_ids = input_ids + [pad_id] * padding_length
+        # PAD to EXACTLY max_length
+        padding_length = self.max_length - len(all_token_ids)
+        all_token_ids = all_token_ids + [pad_id] * padding_length
         attention_mask = attention_mask + [0] * padding_length
 
-        # REGRESSION: Clamp to [0, 100] and normalize to [0, 1]
-        final_value = max(0, min(100, final_value))  # Clamp to [0, 100]
-        final_value_normalized = final_value / 100.0  # Normalize to [0, 1]
+        # Build intermediate_targets: per-token target variable value
+        # -100 = ignore index for cross_entropy (padding and first-tokens)
+        intermediate_states = sample.get("intermediate_states", [])
+        intermediate_targets = torch.full((self.max_length,), -100, dtype=torch.long)
+
+        if len(intermediate_states) > 0 and len(line_token_ids) > 0:
+            # Map each token to its line, assign that line's intermediate state
+            # Comment lines (starting with #) have no trace entry, use last state
+            trace_idx = 0
+            last_state_value = intermediate_states[-1] if intermediate_states else 0
+            pos = 0
+            for line_idx, line_ids in enumerate(line_token_ids):
+                # Determine the state value for this line
+                if not program_lines[line_idx].strip().startswith("#"):
+                    # Non-comment line: use corresponding trace entry
+                    if trace_idx < len(intermediate_states):
+                        state_val = intermediate_states[trace_idx]
+                        trace_idx += 1
+                    else:
+                        state_val = last_state_value
+                    last_state_value = state_val
+                else:
+                    # Comment line: state doesn't change
+                    state_val = last_state_value
+
+                # Assign state value to all tokens in this line
+                for _ in line_ids:
+                    if pos < self.max_length:
+                        intermediate_targets[pos] = max(0, min(100, state_val))
+                        pos += 1
+
+        # Clamp final value
+        final_value = max(0, min(100, final_value))
+        final_value_normalized = final_value / 100.0
 
         return {
-            "input_ids": torch.tensor(input_ids, dtype=torch.long),
+            "input_ids": torch.tensor(all_token_ids, dtype=torch.long),
             "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
-            "final_value": torch.tensor(final_value, dtype=torch.long),  # Raw value [0, 100]
-            "final_value_normalized": torch.tensor(final_value_normalized, dtype=torch.float),  # Normalized [0, 1]
+            "final_value": torch.tensor(final_value, dtype=torch.long),
+            "final_value_normalized": torch.tensor(final_value_normalized, dtype=torch.float),
+            "intermediate_targets": intermediate_targets,
         }
 
 

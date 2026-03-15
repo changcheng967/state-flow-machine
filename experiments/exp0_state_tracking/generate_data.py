@@ -296,6 +296,11 @@ class SimpleProgramGenerator:
 
             if include_trace:
                 sample["trace"] = trace
+                # Extract target variable's value after each non-comment line
+                intermediate_states = []
+                for entry in trace:
+                    intermediate_states.append(entry["state"].get(target, 0))
+                sample["intermediate_states"] = intermediate_states
 
             dataset.append(sample)
 

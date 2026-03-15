@@ -1,18 +1,19 @@
 """
-finish_experiment.py - Single-NPU training + full evaluation
+finish_experiment.py - Single-NPU training + full evaluation (v2)
 
 Self-contained: trains all three models (execution + two transformers) on a
 single NPU (no DDP), then evaluates all three on length generalization at
 1x, 2x, 4x, 8x.
 
-Prerequisites:
-  - train.py must have already run and saved:
-      outputs/exp0/tokenizer_vocab.json
-      outputs/exp0/data/train.json, val.json
+v2 changes:
+- Execution model: 101-class classification instead of MSE regression
+- Intermediate state supervision (aux loss at every token position)
+- LR grid search for execution model (5 LRs, pick best, retrain)
+- Wider slot_dim=256 for more state capacity
 
 Usage:
     python experiments/exp0_state_tracking/finish_experiment.py
-    python experiments/exp0_state_tracking/finish_experiment.py --skip_training  # eval only
+    python experiments/exp0_state_tracking/finish_experiment.py --skip_training
 """
 
 import os
@@ -25,6 +26,7 @@ import argparse
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.data import Subset, DataLoader
 
 sys.path.insert(0, str(__file__).rsplit('experiments', 1)[0])
 
@@ -36,6 +38,9 @@ from baseline_transformer import TransformerEncoderOnly, StateTrackingWrapper
 from dataset import create_dataloaders
 from evaluate import Evaluator, generate_test_programs
 from generate_data import generate_and_save
+
+
+NUM_CLASSES = 101  # values 0-100
 
 
 # ---------------------------------------------------------------------------
@@ -69,7 +74,7 @@ class WarmupCosineScheduler:
 
 
 # ---------------------------------------------------------------------------
-# Training loop for a single transformer on one NPU
+# Training loop for a single transformer on one NPU (UNCHANGED)
 # ---------------------------------------------------------------------------
 
 def train_transformer(
@@ -224,7 +229,29 @@ def train_transformer(
 
 
 # ---------------------------------------------------------------------------
-# Training loop for execution model (FP32, no AMP)
+# Execution model factory
+# ---------------------------------------------------------------------------
+
+def make_execution_model(vocab_size: int, device: torch.device) -> nn.Module:
+    """Create execution model with v2 settings."""
+    config = SFMConfig.small()
+    execution_sys = ExecutionSystem(
+        input_dim=config.d_model,          # 256
+        hidden_dim=config.deltanet_hidden_dim,  # 256
+        num_slots=16,
+        slot_dim=256,                      # Increased from 128
+        max_ticks=config.execution_max_ticks,
+        num_heads=config.execution_num_heads,
+        dropout=config.dropout
+    )
+    model = StateTrackingWrapper(
+        execution_sys, vocab_size, num_classes=NUM_CLASSES
+    )
+    return model
+
+
+# ---------------------------------------------------------------------------
+# Training loop for execution model (v2: classification + aux loss)
 # ---------------------------------------------------------------------------
 
 def train_execution(
@@ -238,27 +265,29 @@ def train_execution(
     weight_decay=0.01,
     max_grad_norm=1.0,
     warmup_steps=200,
+    aux_weight=0.5,
 ):
-    """Train execution model on single NPU, no AMP (FP32 only).
+    """Train execution model with classification + intermediate state supervision.
 
-    DeltaNet backward through exp() overflows FP16, so AMP is disabled.
-    Uses higher LR and shorter warmup to compensate.
+    FP32 only (no AMP) — DeltaNet backward through exp() overflows FP16.
+    Classification (101 classes) gives sharper gradients than MSE regression.
+    Auxiliary loss at every token position provides intermediate state supervision.
     """
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     total_steps = len(train_loader) * num_epochs
     scheduler = WarmupCosineScheduler(optimizer, warmup_steps, total_steps)
-    criterion = nn.MSELoss()
 
-    best_val_loss = float('inf')
+    best_val_acc = 0.0
     param_count = sum(p.numel() for p in model.parameters())
 
     print(f"\n{'=' * 60}")
-    print(f"Training Execution Model (State Slots)")
+    print(f"Training Execution Model (State Slots v2)")
     print(f"{'=' * 60}")
     print(f"  Parameters: {param_count:,}")
-    print(f"  AMP: False (FP32 only)  Device: {device}")
+    print(f"  AMP: False (FP32)  Device: {device}")
     print(f"  LR: {lr}  Warmup: {warmup_steps} steps")
+    print(f"  Loss: CE + {aux_weight} * aux_CE  Classes: {NUM_CLASSES}")
     print(f"  Batch size: {train_loader.batch_size}  Steps/epoch: {len(train_loader)}")
     print("-" * 60)
 
@@ -266,6 +295,8 @@ def train_execution(
         # ---- Train ----
         model.train()
         total_loss = 0.0
+        total_final_loss = 0.0
+        total_aux_loss = 0.0
         total_correct = 0
         total_samples = 0
         epoch_start = time.time()
@@ -275,14 +306,26 @@ def train_execution(
         for batch_idx, batch in enumerate(train_loader):
             input_ids = batch["input_ids"].to(device, non_blocking=True)
             attention_mask = batch["attention_mask"].to(device, non_blocking=True)
-            labels_norm = batch["final_value_normalized"].to(device, non_blocking=True).float()
-            labels_raw = batch["final_value"].to(device, non_blocking=True)
+            labels_raw = batch["final_value"].to(device, non_blocking=True).long()
+            inter_targets = batch["intermediate_targets"].to(device, non_blocking=True).long()
 
-            # Forward (FP32, no AMP)
-            predictions = model(input_ids, attention_mask=attention_mask)
+            # Forward with intermediate predictions
+            final_logits, inter_logits = model(
+                input_ids, attention_mask=attention_mask, return_intermediate=True
+            )
 
-            # MSE loss
-            loss = criterion(predictions.float(), labels_norm.float())
+            # Final classification loss: (batch, 101) vs (batch,)
+            final_loss = F.cross_entropy(final_logits, labels_raw)
+
+            # Auxiliary intermediate loss at every token position
+            # inter_logits: (batch, seq_len, 101), inter_targets: (batch, seq_len)
+            aux_loss = F.cross_entropy(
+                inter_logits.reshape(-1, NUM_CLASSES),
+                inter_targets.reshape(-1),
+                ignore_index=-100
+            )
+
+            loss = final_loss + aux_weight * aux_loss
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
@@ -292,17 +335,19 @@ def train_execution(
             optimizer.zero_grad()
 
             total_loss += loss.item()
-            predicted_values = (predictions * 100).round().clamp(0, 100)
-            total_correct += (predicted_values == labels_raw).sum().item()
+            total_final_loss += final_loss.item()
+            total_aux_loss += aux_loss.item()
+            predicted = final_logits.argmax(dim=-1)
+            total_correct += (predicted == labels_raw).sum().item()
             total_samples += labels_raw.size(0)
 
         synchronize()
-        train_loss = total_loss / len(train_loader)
+        n_batches = len(train_loader)
+        train_loss = total_loss / n_batches
         train_acc = total_correct / total_samples
 
         # ---- Validate ----
         model.eval()
-        val_loss = 0.0
         val_correct = 0
         val_samples = 0
 
@@ -310,41 +355,38 @@ def train_execution(
             for batch in val_loader:
                 input_ids = batch["input_ids"].to(device, non_blocking=True)
                 attention_mask = batch["attention_mask"].to(device, non_blocking=True)
-                labels_norm = batch["final_value_normalized"].to(device, non_blocking=True).float()
-                labels_raw = batch["final_value"].to(device, non_blocking=True)
+                labels_raw = batch["final_value"].to(device, non_blocking=True).long()
 
                 predictions = model(input_ids, attention_mask=attention_mask)
-                loss = criterion(predictions.float(), labels_norm.float())
-
-                val_loss += loss.item()
-                predicted_values = (predictions * 100).round().clamp(0, 100)
-                val_correct += (predicted_values == labels_raw).sum().item()
+                predicted_classes = (predictions * 100).round().long()
+                val_correct += (predicted_classes == labels_raw).sum().item()
                 val_samples += labels_raw.size(0)
 
-        val_loss_avg = val_loss / len(val_loader)
         val_acc = val_correct / val_samples
         epoch_time = time.time() - epoch_start
 
-        if (epoch + 1) % 5 == 0 or epoch == 0 or val_loss_avg < best_val_loss:
+        if (epoch + 1) % 5 == 0 or epoch == 0 or val_acc > best_val_acc:
             print(f"  Epoch {epoch+1:3d}/{num_epochs}: "
-                  f"train={train_loss:.4f}/{train_acc:.4f}  "
-                  f"val={val_loss_avg:.4f}/{val_acc:.4f}  [{epoch_time:.1f}s]")
+                  f"loss={train_loss:.4f} (f={total_final_loss/n_batches:.3f} "
+                  f"a={total_aux_loss/n_batches:.3f})  "
+                  f"train_acc={train_acc:.4f}  val_acc={val_acc:.4f}  "
+                  f"[{epoch_time:.1f}s]")
 
-        # Save best
-        if val_loss_avg < best_val_loss:
-            best_val_loss = val_loss_avg
+        # Save best by val accuracy
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
             save_path = os.path.join(save_dir, "execution_best.pt")
             torch.save({
                 "model_state_dict": model.state_dict(),
-                "val_loss": val_loss_avg,
                 "val_accuracy": val_acc,
                 "epoch": epoch,
                 "param_count": param_count,
+                "lr": lr,
             }, save_path)
-            print(f"  -> Saved best (val_loss={val_loss_avg:.4f})")
+            print(f"  -> Saved best (val_acc={val_acc:.4f})")
 
-    print(f"\n  Execution done. Best val_loss: {best_val_loss:.4f}")
-    return best_val_loss
+    print(f"\n  Execution done. Best val_acc: {best_val_acc:.4f}")
+    return best_val_acc
 
 
 # ---------------------------------------------------------------------------
@@ -382,13 +424,14 @@ def run_full_evaluation(save_dir, device, tokenizer,
             execution = ExecutionSystem(
                 input_dim=config.d_model,
                 hidden_dim=config.deltanet_hidden_dim,
-                num_slots=16,  # Reduced from 64 for less routing interference
-                slot_dim=config.execution_slot_dim,
+                num_slots=16,
+                slot_dim=256,  # Must match training
                 max_ticks=config.execution_max_ticks,
                 num_heads=config.execution_num_heads,
                 dropout=config.dropout
             )
-            model = StateTrackingWrapper(execution, tokenizer.vocab_size_actual)
+            model = StateTrackingWrapper(execution, tokenizer.vocab_size_actual,
+                                         num_classes=NUM_CLASSES)
         else:
             model = TransformerEncoderOnly(
                 vocab_size=tokenizer.vocab_size_actual, **extra_kwargs
@@ -399,7 +442,7 @@ def run_full_evaluation(save_dir, device, tokenizer,
             ckpt = torch.load(model_path, map_location=device)
             model.load_state_dict(ckpt["model_state_dict"])
             print(f"  Loaded {model_path} (epoch {ckpt.get('epoch', '?')}, "
-                  f"val_loss={ckpt.get('val_loss', '?')})")
+                  f"val_acc={ckpt.get('val_accuracy', '?')})")
         else:
             print(f"  WARNING: {model_path} not found, using random weights!")
 
@@ -498,7 +541,7 @@ def run_full_evaluation(save_dir, device, tokenizer,
                 'g:^', lw=2, ms=8, label='Transformer-Large')
         ax.set_xlabel('Length Multiplier', fontsize=12)
         ax.set_ylabel('Exact Match Accuracy (%)', fontsize=12)
-        ax.set_title('Experiment 0: Length Generalization', fontsize=14)
+        ax.set_title('Experiment 0 v2: Classification + Intermediate Supervision', fontsize=14)
         ax.legend(fontsize=11)
         ax.grid(True, alpha=0.3)
         ax.set_ylim(0, 100)
@@ -519,7 +562,7 @@ def run_full_evaluation(save_dir, device, tokenizer,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Single-NPU transformer training + full evaluation"
+        description="Single-NPU training + full evaluation (v2)"
     )
     parser.add_argument("--save_dir", type=str, default="outputs/exp0")
     parser.add_argument("--epochs", type=int, default=50)
@@ -531,6 +574,8 @@ def main():
     parser.add_argument("--eval_samples", type=int, default=1000)
     parser.add_argument("--skip_training", action="store_true",
                         help="Skip training, run evaluation only")
+    parser.add_argument("--skip_lr_search", action="store_true",
+                        help="Skip LR grid search, use default lr=1e-3")
     args = parser.parse_args()
 
     set_seed(42)
@@ -601,41 +646,74 @@ def main():
 
     # ---- Train all models ----
     if not args.skip_training:
-        # ---- Train Execution Model first ----
-        config = SFMConfig.small()
-        execution_sys = ExecutionSystem(
-            input_dim=config.d_model,
-            hidden_dim=config.deltanet_hidden_dim,
-            num_slots=16,
-            slot_dim=config.execution_slot_dim,
-            max_ticks=config.execution_max_ticks,
-            num_heads=config.execution_num_heads,
-            dropout=config.dropout
-        )
-        execution_model = StateTrackingWrapper(
-            execution_sys, tokenizer.vocab_size_actual
-        ).to(device)
+        # ======== LR Grid Search for Execution Model ========
+        if not args.skip_lr_search:
+            learning_rates = [3e-4, 5e-4, 1e-3, 2e-3, 5e-3]
+            grid_search_epochs = 10
+            subset_size = 2000
 
-        print(f"\nExecution model parameters: {sum(p.numel() for p in execution_model.parameters()):,}")
+            print(f"\n{'=' * 60}")
+            print(f"LR Grid Search: {len(learning_rates)} LRs, "
+                  f"{grid_search_epochs} epochs each, {subset_size} samples")
+            print(f"{'=' * 60}")
 
-        # NPU warmup for execution model
+            # Create subset dataloader
+            actual_subset = min(subset_size, len(train_loader.dataset))
+            indices = list(range(actual_subset))
+            subset_dataset = Subset(train_loader.dataset, indices)
+            subset_loader = DataLoader(
+                subset_dataset, batch_size=args.batch_size,
+                shuffle=True, drop_last=True
+            )
+
+            grid_results = {}
+            for lr in learning_rates:
+                set_seed(42)
+                model = make_execution_model(tokenizer.vocab_size_actual, device)
+                best_val_acc = train_execution(
+                    model, subset_loader, val_loader, device,
+                    save_dir=args.save_dir,
+                    num_epochs=grid_search_epochs,
+                    lr=lr, warmup_steps=max(50, 200 // grid_search_epochs * 2),
+                )
+                grid_results[lr] = best_val_acc
+                del model
+                if "npu" in str(device):
+                    torch.npu.empty_cache()
+
+            print(f"\n{'=' * 60}")
+            print("LR Grid Search Results")
+            print(f"{'=' * 60}")
+            for lr, acc in sorted(grid_results.items()):
+                marker = " <-- BEST" if acc == max(grid_results.values()) else ""
+                print(f"  lr={lr:<8}  val_acc={acc:.4f}{marker}")
+
+            best_lr = max(grid_results, key=grid_results.get)
+            print(f"\n  Selected LR: {best_lr} (val_acc={grid_results[best_lr]:.4f})")
+        else:
+            best_lr = 1e-3
+            print(f"\nSkipping LR grid search, using lr={best_lr}")
+
+        # ======== Train Execution Model (full) ========
+        set_seed(42)
+        execution_model = make_execution_model(tokenizer.vocab_size_actual, device).to(device)
+        print(f"\nExecution model parameters: "
+              f"{sum(p.numel() for p in execution_model.parameters()):,}")
+
+        # NPU warmup
         if "npu" in str(device):
             print("\nWarming up NPU (execution model)...")
-            warmup_exec = execution_model
-            warmup_exec.train()
-            warmup_opt = torch.optim.SGD(warmup_exec.parameters(), lr=0.0)
+            execution_model.train()
+            warmup_opt = torch.optim.SGD(execution_model.parameters(), lr=0.0)
             warmup_batch = next(iter(train_loader))
-
             for _ in range(3):
                 warmup_opt.zero_grad()
                 ids = warmup_batch["input_ids"].to(device, non_blocking=True)
-                attn_mask = warmup_batch["attention_mask"].to(device, non_blocking=True)
-                out = warmup_exec(ids, attention_mask=attn_mask)
-                loss = F.mse_loss(out.float(),
-                                  warmup_batch["final_value_normalized"].to(device).float())
+                attn = warmup_batch["attention_mask"].to(device, non_blocking=True)
+                out, _ = execution_model(ids, attention_mask=attn, return_intermediate=True)
+                loss = out.sum()
                 loss.backward()
                 warmup_opt.step()
-
             synchronize()
             print("NPU warmup complete (execution)")
             del warmup_opt
@@ -644,16 +722,15 @@ def main():
         train_execution(
             execution_model, train_loader, val_loader, device,
             save_dir=args.save_dir,
-            num_epochs=args.epochs, lr=1e-3, warmup_steps=200,
+            num_epochs=args.epochs, lr=best_lr, warmup_steps=200,
         )
         del execution_model
         if "npu" in str(device):
             torch.npu.empty_cache()
 
-        # ---- Train Transformers ----
-        # NPU warmup (3 iterations with real batch shape)
+        # ======== Train Transformers ========
         if "npu" in str(device):
-            print("\nWarming up NPU...")
+            print("\nWarming up NPU (transformer)...")
             warmup_model = TransformerEncoderOnly(
                 tokenizer.vocab_size_actual, d_model=128, num_heads=4,
                 num_layers=1, d_ff=256, num_output_classes=1
@@ -661,7 +738,6 @@ def main():
             warmup_model.train()
             warmup_opt = torch.optim.SGD(warmup_model.parameters(), lr=0.0)
             warmup_batch = next(iter(train_loader))
-
             for _ in range(3):
                 warmup_opt.zero_grad()
                 ids = warmup_batch["input_ids"].to(device, non_blocking=True)
@@ -680,13 +756,11 @@ def main():
                                   warmup_batch["final_value_normalized"].to(device).float())
                 loss.backward()
                 warmup_opt.step()
-
             synchronize()
             print("NPU warmup complete")
             del warmup_model, warmup_opt
             torch.npu.empty_cache()
 
-        # Train Transformer-Fair
         tf_fair = TransformerEncoderOnly(
             vocab_size=tokenizer.vocab_size_actual,
             d_model=128, num_heads=4, num_layers=3, d_ff=256,
@@ -703,7 +777,6 @@ def main():
         if "npu" in str(device):
             torch.npu.empty_cache()
 
-        # Train Transformer-Large
         tf_large = TransformerEncoderOnly(
             vocab_size=tokenizer.vocab_size_actual,
             d_model=256, num_heads=8, num_layers=4, d_ff=512,
