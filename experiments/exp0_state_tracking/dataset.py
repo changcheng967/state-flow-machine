@@ -163,14 +163,18 @@ def create_dataloaders(
     # pin_memory=False for NPU (only works for CUDA)
     pin_memory = False
 
+    # Ascend optimization: num_workers=4 with persistent_workers
+    effective_num_workers = num_workers if num_workers > 0 else 4
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=shuffle if not distributed else False,
         sampler=train_sampler if distributed else None,
-        num_workers=num_workers,
+        num_workers=effective_num_workers,
         pin_memory=pin_memory,
-        drop_last=True  # Ensure consistent batch sizes
+        drop_last=True,  # Ensure consistent batch sizes
+        persistent_workers=True if effective_num_workers > 0 else False
     )
 
     val_loader = DataLoader(
@@ -178,9 +182,10 @@ def create_dataloaders(
         batch_size=batch_size,
         shuffle=False,
         sampler=val_sampler if distributed else None,
-        num_workers=num_workers,
+        num_workers=effective_num_workers,
         pin_memory=pin_memory,
-        drop_last=False
+        drop_last=False,
+        persistent_workers=True if effective_num_workers > 0 else False
     )
 
     return train_loader, val_loader

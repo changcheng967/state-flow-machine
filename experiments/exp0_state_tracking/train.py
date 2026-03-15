@@ -13,22 +13,29 @@ CUBE-OPTIMIZED for Ascend NPU:
 - torch.npu.synchronize() before timing measurements
 - Warmup with REAL batch shape
 
-LEARNING FIXES:
-- REGRESSION with MSE loss (not 500-class classification)
-- Output head: nn.Linear(d_model, 1) with sigmoid
-- Labels: float values normalized to [0, 1]
-- Accuracy = (prediction * 100).round() == target
-- Learning rate: 3e-4
-- Epochs: 50
+ASCEND 910 OPTIMIZATIONS:
+- TASK_QUEUE_ENABLE=2: async operator dispatch
+- CPU_AFFINITY_CONF=1: CPU-NPU affinity binding
+- HCCL_OP_EXPANSION_MODE=AIV: use AI Vector core for comm
+- pin_memory=False: required for Ascend
+- num_workers=4, persistent_workers=True: overlap data prep
+- non_blocking=True: async tensor transfers
+- gc.disable() during training: prevent GC pauses
+- Single process group: delete DDP wrapper between models, no reinit
 """
+
+import os
+
+# === ASCEND 910 OPTIMIZATION ENV VARS (must be set before torch imports) ===
+os.environ.setdefault('HCCL_CONNECT_TIMEOUT', '1200')
+os.environ.setdefault('HCCL_EXEC_TIMEOUT', '1200')
+os.environ.setdefault('TASK_QUEUE_ENABLE', '2')      # async operator dispatch
+os.environ.setdefault('CPU_AFFINITY_CONF', '1')       # CPU-NPU affinity binding
+os.environ.setdefault('HCCL_OP_EXPANSION_MODE', 'AIV')  # AI Vector core for comm
+os.environ.setdefault('PYTORCH_NPU_ALLOC_CONF', 'expandable_segments:True')
 
 # IMPORTANT: Import torch_npu FIRST before any torch.npu calls
 import torch_npu
-
-# Apply NPU optimizations
-import os
-os.environ.setdefault('HCCL_CONNECT_TIMEOUT', '1200')
-os.environ.setdefault('HCCL_EXEC_TIMEOUT', '1200')
 
 import torch
 import torch.nn as nn
@@ -42,6 +49,7 @@ import sys
 import json
 import argparse
 import math
+import gc
 
 sys.path.insert(0, str(__file__).rsplit('experiments', 1)[0])
 
@@ -252,10 +260,10 @@ class Trainer:
         self.optimizer.zero_grad()
 
         for batch_idx, batch in enumerate(self.train_loader):
-            input_ids = batch["input_ids"].to(self.device)
-            attention_mask = batch["attention_mask"].to(self.device)
-            labels_norm = batch["final_value_normalized"].to(self.device).float()
-            labels_raw = batch["final_value"].to(self.device)
+            input_ids = batch["input_ids"].to(self.device, non_blocking=True)
+            attention_mask = batch["attention_mask"].to(self.device, non_blocking=True)
+            labels_norm = batch["final_value_normalized"].to(self.device, non_blocking=True).float()
+            labels_raw = batch["final_value"].to(self.device, non_blocking=True)
 
             mask = self._get_mask(attention_mask)
 
@@ -323,10 +331,10 @@ class Trainer:
         total_samples = 0
 
         for batch in dataloader:
-            input_ids = batch["input_ids"].to(self.device)
-            attention_mask = batch["attention_mask"].to(self.device)
-            labels_norm = batch["final_value_normalized"].to(self.device).float()
-            labels_raw = batch["final_value"].to(self.device)
+            input_ids = batch["input_ids"].to(self.device, non_blocking=True)
+            attention_mask = batch["attention_mask"].to(self.device, non_blocking=True)
+            labels_norm = batch["final_value_normalized"].to(self.device, non_blocking=True).float()
+            labels_raw = batch["final_value"].to(self.device, non_blocking=True)
 
             mask = self._get_mask(attention_mask)
 
@@ -422,64 +430,64 @@ def setup_distributed(rank: int, world_size: int):
     torch.npu.set_device(rank)
 
 
-def reinit_process_group(rank: int, world_size: int):
-    """Reinitialize process group to get fresh HCCL state for next model."""
-    if dist.is_initialized():
-        dist.barrier()  # Sync all ranks before teardown to avoid deadlock
-        dist.destroy_process_group()
-    # Small delay to ensure cleanup completes
-    time.sleep(0.5)
-    setup_distributed(rank, world_size)
-
-
 def cleanup_distributed():
-    """Clean up distributed training."""
-    dist.destroy_process_group()
+    """Clean up distributed training. Only call at script exit."""
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
-def warmup_npu(model, train_loader, device, is_transformer: bool = False, use_amp: bool = True):
-    """Warmup NPU with real batch to compile graphs (REGRESSION)."""
-    print("Warming up NPU with real batch shape...")
+def warmup_npu(model, train_loader, device, is_transformer: bool = False, use_amp: bool = True, num_iters: int = 3):
+    """
+    Warmup NPU with real batch to compile graphs.
+
+    Args:
+        num_iters: Number of warmup iterations (default 3 to pre-compile all operator shapes)
+    """
+    print(f"Warming up NPU with {num_iters} iterations...")
     synchronize()
-
-    warmup_batch = next(iter(train_loader))
-    input_ids = warmup_batch["input_ids"].to(device)
-    attention_mask = warmup_batch["attention_mask"].to(device)
-    labels_norm = warmup_batch["final_value_normalized"].to(device).float()
 
     model.train()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.0)  # Dummy optimizer for warmup
 
-    # Forward with optional autocast
-    if use_amp:
-        try:
-            with torch.npu.amp.autocast():
-                if is_transformer:
-                    mask = (attention_mask == 0)
-                    predictions = model(input_ids, mask=mask)
-                else:
-                    predictions = model(input_ids, attention_mask=attention_mask)
-        except AttributeError:
-            with torch.cuda.amp.autocast():
-                if is_transformer:
-                    mask = (attention_mask == 0)
-                    predictions = model(input_ids, mask=mask)
-                else:
-                    predictions = model(input_ids, attention_mask=attention_mask)
-    else:
-        # No autocast - run directly in FP32
-        if is_transformer:
-            mask = (attention_mask == 0)
-            predictions = model(input_ids, mask=mask)
+    for i in range(num_iters):
+        warmup_batch = next(iter(train_loader))
+        input_ids = warmup_batch["input_ids"].to(device, non_blocking=True)
+        attention_mask = warmup_batch["attention_mask"].to(device, non_blocking=True)
+        labels_norm = warmup_batch["final_value_normalized"].to(device, non_blocking=True).float()
+
+        optimizer.zero_grad()
+
+        # Forward with optional autocast
+        if use_amp:
+            try:
+                with torch.npu.amp.autocast():
+                    if is_transformer:
+                        mask = (attention_mask == 0)
+                        predictions = model(input_ids, mask=mask)
+                    else:
+                        predictions = model(input_ids, attention_mask=attention_mask)
+            except AttributeError:
+                with torch.cuda.amp.autocast():
+                    if is_transformer:
+                        mask = (attention_mask == 0)
+                        predictions = model(input_ids, mask=mask)
+                    else:
+                        predictions = model(input_ids, attention_mask=attention_mask)
         else:
-            predictions = model(input_ids, attention_mask=attention_mask)
+            # No autocast - run directly in FP32
+            if is_transformer:
+                mask = (attention_mask == 0)
+                predictions = model(input_ids, mask=mask)
+            else:
+                predictions = model(input_ids, attention_mask=attention_mask)
 
-    # Backward with MSE loss in FP32 to avoid dtype mismatch
-    loss = F.mse_loss(predictions.float(), labels_norm.float())
-    loss.backward()
-    model.zero_grad(set_to_none=True)
+        # Backward with MSE loss in FP32 to avoid dtype mismatch
+        loss = F.mse_loss(predictions.float(), labels_norm.float())
+        loss.backward()
+        optimizer.step()
 
     synchronize()
-    print("NPU warmup complete (graph compiled).")
+    print(f"NPU warmup complete ({num_iters} iterations, all shapes compiled).")
 
 
 def run_experiment(
@@ -553,6 +561,11 @@ def run_experiment(
     # Gradient accumulation: effective_batch = batch_size * world_size * grad_accum_steps
     # For 32 * 4 * 2 = 256
     grad_accum_steps = config.grad_accum_steps if distributed else 1
+
+    # Disable GC during training to prevent pauses
+    gc.disable()
+    if rank == 0:
+        print("[Performance] Garbage collection disabled during training")
     use_amp = "npu" in str(device)
 
     # ========== Train Execution System ==========
@@ -621,10 +634,13 @@ def run_experiment(
         print("Training Transformer-Fair Baseline (~670K params)")
         print("=" * 60)
 
-    # Reinit process group to get fresh HCCL state (avoid DDP int overflow bug)
+    # Clean up previous model's DDP wrapper (single process group, no reinit)
     if distributed:
+        del execution_wrapper
+        del execution_trainer
+        torch.npu.empty_cache()
+        dist.barrier()  # All ranks sync before next model
         synchronize()
-        reinit_process_group(rank, world_size)
 
     t0 = time.time()
     transformer_fair = TransformerEncoderOnly(
@@ -680,10 +696,13 @@ def run_experiment(
         print("Training Transformer-Large Baseline (~3.26M params)")
         print("=" * 60)
 
-    # Reinit process group to get fresh HCCL state
+    # Clean up previous model's DDP wrapper (single process group, no reinit)
     if distributed:
+        del transformer_fair
+        del transformer_fair_trainer
+        torch.npu.empty_cache()
+        dist.barrier()  # All ranks sync before next model
         synchronize()
-        reinit_process_group(rank, world_size)
 
     t0 = time.time()
     transformer_large = TransformerEncoderOnly(
@@ -768,6 +787,11 @@ def run_experiment(
         for name, t in timings.items():
             print(f"  {name}: {t:.2f}s ({t/total_time*100:.1f}%)")
         print(f"  TOTAL: {total_time:.2f}s")
+
+    # Re-enable GC after training
+    gc.enable()
+    if rank == 0:
+        print("[Performance] Garbage collection re-enabled")
 
     return results
 
