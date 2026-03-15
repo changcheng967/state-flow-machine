@@ -78,9 +78,6 @@ class DeltaNetCell(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
 
-        # Pre-compute chunk scan matrices for chunk_size=16
-        self._register_chunk_matrices()
-
     def _init_eigenvalues(self, init_value: float):
         """Initialize eigenvalue parameters."""
         if abs(init_value) >= 1:
@@ -91,15 +88,6 @@ class DeltaNetCell(nn.Module):
     def get_eigenvalues(self) -> torch.Tensor:
         """Get eigenvalues constrained to [-1, 1]."""
         return torch.tanh(self.eigenvalue_raw)
-
-    def _register_chunk_matrices(self):
-        """Pre-compute indices for chunk-based parallel scan."""
-        # For chunk_size=16, we create a lower triangular matrix pattern
-        # This is used to compute the prefix products/sums efficiently
-        chunk_size = self.chunk_size
-        # Register indices for lower triangular construction
-        tri_indices = torch.tril_indices(chunk_size, chunk_size)
-        self.register_buffer('tri_indices', tri_indices, persistent=False)
 
     def _compute_chunk_matrix_batched(self, a_chunks: torch.Tensor) -> torch.Tensor:
         """
@@ -129,8 +117,10 @@ class DeltaNetCell(nn.Module):
         a_fp32 = a_flat.float()
 
         # Handle negative eigenvalues: track sign separately
+        # Use mask multiplication instead of torch.where (prevents AICPU fallback)
         sign_a = a_fp32.sign()
-        sign_a = torch.where(sign_a == 0, torch.ones_like(sign_a), sign_a)
+        zero_mask = (sign_a == 0).float()
+        sign_a = sign_a + zero_mask  # Replace zeros with 1.0
 
         # Log-space cumprod: log(cumprod) = cumsum(log(|a|))
         log_a = torch.log(a_fp32.abs().clamp(min=1e-7))  # Avoid log(0)

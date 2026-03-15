@@ -6,13 +6,16 @@ This baseline should fail to generalize to longer sequences (TC0 limit).
 
 CUSTOM IMPLEMENTATION - No nn.TransformerEncoder/nn.TransformerEncoderLayer
 to ensure compatibility with Ascend NPU (which doesn't support nested tensors).
+
+Also contains StateTrackingWrapper (execution system wrapper for regression)
+so both train.py and evaluate.py can import it without pulling in torch_npu.
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from typing import Optional
+from typing import Optional, Dict
 
 
 class PositionalEncoding(nn.Module):
@@ -401,6 +404,55 @@ class TransformerBaseline(nn.Module):
             logits = self.classification_head(pooled)
 
         return logits
+
+    def count_parameters(self) -> int:
+        return sum(p.numel() for p in self.parameters())
+
+
+class StateTrackingWrapper(nn.Module):
+    """Wraps ExecutionSystem for state tracking REGRESSION.
+
+    Defined here (not in train.py) so evaluate.py can import it
+    without pulling in torch_npu via train.py's top-level imports.
+    """
+
+    def __init__(
+        self,
+        execution_system: nn.Module,
+        vocab_size: int,
+        num_classes: int = 1  # REGRESSION: single scalar output
+    ):
+        super().__init__()
+        self.execution = execution_system
+
+        # Pad vocab_size to multiple of 16 for optimal embedding table access
+        padded_vocab_size = ((vocab_size + 15) // 16) * 16
+        self.vocab_size = vocab_size
+        self.padded_vocab_size = padded_vocab_size
+
+        self.embedding = nn.Embedding(padded_vocab_size, execution_system.input_dim)
+        # REGRESSION: Output single scalar, apply sigmoid to constrain to [0, 1]
+        self.regressor = nn.Sequential(
+            nn.LayerNorm(execution_system.input_dim),
+            nn.Linear(execution_system.input_dim, execution_system.input_dim),
+            nn.ReLU(),
+            nn.Linear(execution_system.input_dim, 1),
+            nn.Sigmoid()  # Output in [0, 1]
+        )
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        x = self.embedding(input_ids)
+        x = self.execution(x)
+        if attention_mask is not None:
+            mask_exp = attention_mask.unsqueeze(-1).float()
+            pooled = (x * mask_exp).sum(dim=1) / mask_exp.sum(dim=1).clamp(min=1)
+        else:
+            pooled = x.mean(dim=1)
+        return self.regressor(pooled).squeeze(-1)  # (batch,)
 
     def count_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters())

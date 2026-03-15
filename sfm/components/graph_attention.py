@@ -165,9 +165,23 @@ class GraphAttentionLayer(nn.Module):
         attn_scores = (q_edge * attn_input).sum(dim=-1) / math.sqrt(self.head_dim)
         # (batch, heads, edges)
 
-        # Softmax over edges pointing to same target (scatter softmax)
-        # For simplicity, use regular softmax (approximate for sparse graphs)
-        attn_weights = F.softmax(attn_scores, dim=-1)
+        # Softmax over edges pointing to same target node (scatter-based softmax)
+        # Without this, all edges share one softmax — edges to popular nodes get crushed
+        # by edges to unpopular nodes, breaking per-node attention semantics.
+        num_inf = float('-inf')
+        # Step 1: Find max score per target node (for numerical stability)
+        max_per_target = torch.full((batch_size, self.num_heads, num_nodes), num_inf,
+                                     device=device, dtype=attn_scores.dtype)
+        max_per_target.scatter_reduce_(2, target_idx_exp.unsqueeze(-1), attn_scores, reduce='amax', include_self=False)
+        # Step 2: Subtract max (numerical stability)
+        attn_stable = attn_scores - max_per_target.gather(2, target_idx_exp.unsqueeze(-1))
+        # Step 3: Exp
+        exp_scores = torch.exp(attn_stable)
+        # Step 4: Sum exponentials per target node
+        sum_per_target = torch.zeros(batch_size, self.num_heads, num_nodes, device=device, dtype=exp_scores.dtype)
+        sum_per_target.scatter_add_(2, target_idx_exp.unsqueeze(-1), exp_scores)
+        # Step 5: Normalize
+        attn_weights = exp_scores / sum_per_target.gather(2, target_idx_exp.unsqueeze(-1)).clamp(min=1e-7)
         attn_weights = self.dropout(attn_weights)
 
         # Aggregate messages

@@ -21,13 +21,10 @@ os.environ.setdefault('HCCL_EXEC_TIMEOUT', '1200')
 
 def get_device() -> torch.device:
     """
-    Get Ascend NPU device.
+    Get best available device: NPU > CUDA > CPU.
 
     Returns:
-        torch.device: Ascend NPU device.
-
-    Raises:
-        RuntimeError: If torch_npu is not available.
+        torch.device: Best available device.
     """
     try:
         import torch_npu
@@ -42,14 +39,17 @@ def get_device() -> torch.device:
             device = torch.device("npu:0")
             print(f"[Device] Using Ascend NPU: {torch.npu.get_device_name(0)}")
             return device
-        else:
-            raise RuntimeError("Ascend NPU is not available")
     except ImportError:
-        raise RuntimeError(
-            "torch_npu is required for State-Flow Machine.\n"
-            "Install it with: pip install torch-npu\n"
-            "This architecture is designed for Huawei Ascend NPUs."
-        )
+        pass  # torch_npu not available, try CUDA
+
+    if torch.cuda.is_available():
+        device = torch.device("cuda:0")
+        print(f"[Device] Using CUDA: {torch.cuda.get_device_name(0)}")
+        return device
+
+    device = torch.device("cpu")
+    print("[Device] Using CPU (no NPU/CUDA available)")
+    return device
 
 
 def get_device_info() -> Tuple[str, int, str]:
@@ -80,8 +80,14 @@ def set_seed(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
 
-    import torch_npu
-    torch.npu.manual_seed_all(seed)
+    try:
+        import torch_npu
+        torch.npu.manual_seed_all(seed)
+    except ImportError:
+        pass
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def to_device(data, device: torch.device):

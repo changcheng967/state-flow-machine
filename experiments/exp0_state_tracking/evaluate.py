@@ -31,9 +31,8 @@ from sfm.systems.execution import ExecutionSystem
 from sfm.utils.device import get_device, set_seed
 from sfm.tokenizer.code_tokenizer import SimpleTokenizer
 
-# Import NPU-compatible model classes
-from train import StateTrackingWrapper
-from baseline_transformer import TransformerEncoderOnly
+# Import model classes (no torch_npu dependency)
+from baseline_transformer import StateTrackingWrapper, TransformerEncoderOnly
 
 
 class Evaluator:

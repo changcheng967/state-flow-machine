@@ -57,7 +57,7 @@ from sfm.config import SFMConfig, ExperimentConfig
 from sfm.systems.execution import ExecutionSystem
 from sfm.utils.device import get_device, set_seed, synchronize
 from sfm.tokenizer.code_tokenizer import SimpleTokenizer
-from baseline_transformer import TransformerEncoderOnly
+from baseline_transformer import TransformerEncoderOnly, StateTrackingWrapper
 from dataset import create_dataloaders
 from generate_data import generate_and_save
 
@@ -103,53 +103,6 @@ class WarmupCosineScheduler:
 
     def get_lr(self) -> float:
         return self.optimizer.param_groups[0]['lr']
-
-
-class StateTrackingWrapper(nn.Module):
-    """Wraps ExecutionSystem for state tracking REGRESSION."""
-
-    def __init__(
-        self,
-        execution_system: ExecutionSystem,
-        vocab_size: int,
-        num_classes: int = 1  # REGRESSION: single scalar output
-    ):
-        super().__init__()
-        self.execution = execution_system
-
-        # CUBE ALIGNMENT: Pad vocab_size to multiple of 16 for optimal embedding table access
-        padded_vocab_size = ((vocab_size + 15) // 16) * 16
-        if padded_vocab_size != vocab_size:
-            print(f"[Cube] Padding vocab_size from {vocab_size} to {padded_vocab_size} for alignment")
-        self.vocab_size = vocab_size  # Original size for masking
-        self.padded_vocab_size = padded_vocab_size
-
-        self.embedding = nn.Embedding(padded_vocab_size, execution_system.input_dim)
-        # REGRESSION: Output single scalar, apply sigmoid to constrain to [0, 1]
-        self.regressor = nn.Sequential(
-            nn.LayerNorm(execution_system.input_dim),
-            nn.Linear(execution_system.input_dim, execution_system.input_dim),
-            nn.ReLU(),
-            nn.Linear(execution_system.input_dim, 1),
-            nn.Sigmoid()  # Output in [0, 1]
-        )
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-        x = self.embedding(input_ids)
-        x = self.execution(x)
-        if attention_mask is not None:
-            mask_exp = attention_mask.unsqueeze(-1).float()
-            pooled = (x * mask_exp).sum(dim=1) / mask_exp.sum(dim=1).clamp(min=1)
-        else:
-            pooled = x.mean(dim=1)
-        return self.regressor(pooled).squeeze(-1)  # (batch,)
-
-    def count_parameters(self) -> int:
-        return sum(p.numel() for p in self.parameters())
 
 
 class Trainer:
@@ -502,7 +455,8 @@ def run_experiment(
     """Run the full state tracking experiment."""
     timings = {}
     exec_params = 0
-    trans_params = 0
+    trans_fair_params = 0
+    trans_large_params = 0
 
     # Rank 0 creates directories and generates data
     if rank == 0:

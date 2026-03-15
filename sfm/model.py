@@ -23,7 +23,7 @@ from sfm.systems.perception import PerceptionSystem
 from sfm.systems.execution import ExecutionSystem
 from sfm.systems.structure import StructureSystem, CodeGraph
 from sfm.systems.meta import MetaSystem
-from sfm.components.cross_system_bridge import CrossSystemBridge, BridgeSynchronizer
+from sfm.components.cross_system_bridge import CrossSystemBridge
 from sfm.utils.device import get_device, set_seed, to_device
 
 
@@ -104,12 +104,6 @@ class StateFlowMachine(nn.Module):
             meta_dim=self.config.d_model,       # Meta outputs d_model
             bridge_dim=self.config.d_bridge,
             dropout=self.config.dropout
-        )
-
-        # Bridge synchronizer
-        self.bridge_sync = BridgeSynchronizer(
-            sync_interval=self.config.bridge_sync_interval,
-            total_perception_layers=self.config.perception_num_layers
         )
 
         # Output projections for each system to vocabulary
