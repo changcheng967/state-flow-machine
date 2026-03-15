@@ -612,6 +612,14 @@ def run_experiment(
     timings["execution_training"] = time.time() - t0
     results["execution"] = execution_history
 
+    # Clean up execution model to free DDP state before next model
+    if distributed:
+        del execution_wrapper
+        del execution_trainer
+        torch.npu.empty_cache()
+        dist.barrier()
+        synchronize()
+
     # ========== Train Transformer-Fair Baseline (~660K params to match State Slots) ==========
     if rank == 0:
         print("\n" + "=" * 60)
@@ -667,6 +675,14 @@ def run_experiment(
     results["transformer_fair"] = transformer_fair_history
 
     trans_fair_params = trans_fair_params  # Store for later
+
+    # Clean up transformer_fair model to free DDP state before next model
+    if distributed:
+        del transformer_fair
+        del transformer_fair_trainer
+        torch.npu.empty_cache()
+        dist.barrier()
+        synchronize()
 
     # ========== Train Transformer-Large Baseline (~3.26M params, for reference) ==========
     if rank == 0:
