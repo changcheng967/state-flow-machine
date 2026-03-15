@@ -525,7 +525,7 @@ def main():
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--warmup_steps", type=int, default=500)
-    parser.add_argument("--difficulty", type=str, default="easy",
+    parser.add_argument("--difficulty", type=str, default="hard",
                         choices=["easy", "medium", "hard"])
     parser.add_argument("--eval_samples", type=int, default=1000)
     parser.add_argument("--skip_training", action="store_true",

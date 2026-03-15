@@ -199,7 +199,7 @@ def load_model(
         execution = ExecutionSystem(
             input_dim=config.d_model,
             hidden_dim=config.deltanet_hidden_dim,
-            num_slots=config.execution_num_slots,
+            num_slots=16,
             slot_dim=config.execution_slot_dim,
             max_ticks=config.execution_max_ticks,
             num_heads=config.execution_num_heads,
