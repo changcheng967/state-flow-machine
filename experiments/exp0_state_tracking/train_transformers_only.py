@@ -176,15 +176,8 @@ class Trainer:
 
             predictions = self._forward_with_amp(input_ids, mask)
 
-            if self.use_amp:
-                try:
-                    with torch.npu.amp.autocast():
-                        loss = self.criterion(predictions, labels_norm)
-                except AttributeError:
-                    with torch.cuda.amp.autocast():
-                        loss = self.criterion(predictions, labels_norm)
-            else:
-                loss = self.criterion(predictions, labels_norm)
+            # Loss in FP32 outside autocast to avoid dtype mismatch
+            loss = self.criterion(predictions.float(), labels_norm.float())
 
             loss = loss / self.grad_accum_steps
 
@@ -246,7 +239,8 @@ class Trainer:
             else:
                 predictions = self.model(input_ids, attention_mask=mask)
 
-            loss = self.criterion(predictions, labels_norm)
+            # Loss in FP32 to avoid dtype mismatch
+            loss = self.criterion(predictions.float(), labels_norm.float())
 
             total_loss += loss.item()
             predicted_values = (predictions * 100).round().clamp(0, 100)
@@ -329,7 +323,8 @@ def warmup_npu(model, train_loader, device, is_transformer: bool = False, use_am
         else:
             predictions = model(input_ids, attention_mask=attention_mask)
 
-    loss = F.mse_loss(predictions, labels_norm)
+    # Loss in FP32 outside autocast to avoid dtype mismatch
+    loss = F.mse_loss(predictions.float(), labels_norm.float())
     loss.backward()
     model.zero_grad(set_to_none=True)
 
