@@ -35,6 +35,7 @@ from sfm.utils.device import get_device, set_seed, synchronize
 from baseline_transformer import TransformerEncoderOnly, StateTrackingWrapper
 from dataset import create_dataloaders
 from evaluate import Evaluator, generate_test_programs
+from generate_data import generate_and_save
 
 
 # ---------------------------------------------------------------------------
@@ -534,21 +535,60 @@ def main():
 
     set_seed(42)
     device = get_device()
-
-    # ---- Load tokenizer ----
-    vocab_path = os.path.join(args.save_dir, "tokenizer_vocab.json")
-    if not os.path.exists(vocab_path):
-        print(f"ERROR: {vocab_path} not found. Run train.py first.")
-        sys.exit(1)
-    tokenizer = SimpleTokenizer.load(vocab_path)
-    print(f"Tokenizer: {tokenizer.vocab_size_actual} tokens")
-
-    # ---- Load data ----
     data_dir = os.path.join(args.save_dir, "data")
-    if not os.path.exists(data_dir):
-        print(f"ERROR: {data_dir} not found. Run train.py first.")
-        sys.exit(1)
+    train_path = os.path.join(data_dir, "train.json")
+    vocab_path = os.path.join(args.save_dir, "tokenizer_vocab.json")
 
+    # ---- Clean stale checkpoints ----
+    stale_ckpts = [
+        os.path.join(args.save_dir, "execution_best.pt"),
+        os.path.join(args.save_dir, "transformer_fair_best.pt"),
+        os.path.join(args.save_dir, "transformer_large_best.pt"),
+    ]
+    existing_stale = [p for p in stale_ckpts if os.path.exists(p)]
+    if existing_stale:
+        print("Cleaning stale checkpoints...")
+        for p in existing_stale:
+            os.remove(p)
+            print(f"  Deleted {p}")
+
+    # ---- Ensure data is large enough ----
+    min_train_samples = 10000
+    need_regen = False
+
+    if os.path.exists(train_path):
+        with open(train_path, 'r') as f:
+            existing_train = json.load(f)
+        if len(existing_train) < min_train_samples:
+            print(f"Existing data has only {len(existing_train)} samples, "
+                  f"regenerating with {min_train_samples}...")
+            need_regen = True
+    else:
+        need_regen = True
+
+    if need_regen:
+        os.makedirs(data_dir, exist_ok=True)
+        print(f"Generating data: {min_train_samples} train / 1000 val, "
+              f"difficulty={args.difficulty}, seed=42...")
+        generate_and_save(
+            output_dir=data_dir,
+            train_samples=min_train_samples,
+            val_samples=1000,
+            max_program_length=20,
+            seed=42,
+            difficulty=args.difficulty
+        )
+
+    # ---- Build / load tokenizer ----
+    with open(train_path, 'r') as f:
+        train_data = json.load(f)
+    corpus = ["\n".join(s["program"]) for s in train_data]
+    tokenizer = SimpleTokenizer()
+    tokenizer.train(corpus, verbose=True)
+    tokenizer.save(vocab_path)
+    print(f"Tokenizer: {tokenizer.vocab_size_actual} tokens (saved to {vocab_path})")
+
+    # ---- Create dataloaders ----
     train_loader, val_loader = create_dataloaders(
         data_dir, tokenizer,
         batch_size=args.batch_size,
