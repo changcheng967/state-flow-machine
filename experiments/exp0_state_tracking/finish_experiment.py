@@ -452,7 +452,8 @@ def main():
             for _ in range(3):
                 warmup_opt.zero_grad()
                 ids = warmup_batch["input_ids"].to(device, non_blocking=True)
-                mask = (warmup_batch["attention_mask"] == 0)
+                attn_mask = warmup_batch["attention_mask"].to(device, non_blocking=True)
+                mask = (attn_mask == 0)
                 if use_amp:
                     try:
                         with torch.npu.amp.autocast():
