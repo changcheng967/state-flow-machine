@@ -425,6 +425,7 @@ def setup_distributed(rank: int, world_size: int):
 def reinit_process_group(rank: int, world_size: int):
     """Reinitialize process group to get fresh HCCL state for next model."""
     if dist.is_initialized():
+        dist.barrier()  # Sync all ranks before teardown to avoid deadlock
         dist.destroy_process_group()
     # Small delay to ensure cleanup completes
     time.sleep(0.5)
