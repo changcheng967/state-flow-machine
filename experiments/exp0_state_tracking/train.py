@@ -617,7 +617,6 @@ def run_experiment(
         del execution_wrapper
         del execution_trainer
         torch.npu.empty_cache()
-        dist.barrier()
         synchronize()
 
     # ========== Train Transformer-Fair Baseline (~660K params to match State Slots) ==========
@@ -681,7 +680,6 @@ def run_experiment(
         del transformer_fair
         del transformer_fair_trainer
         torch.npu.empty_cache()
-        dist.barrier()
         synchronize()
 
     # ========== Train Transformer-Large Baseline (~3.26M params, for reference) ==========
