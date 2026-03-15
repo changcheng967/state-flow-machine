@@ -258,7 +258,7 @@ def run_full_evaluation(save_dir, device, tokenizer,
             execution = ExecutionSystem(
                 input_dim=config.d_model,
                 hidden_dim=config.deltanet_hidden_dim,
-                num_slots=config.execution_num_slots,
+                num_slots=16,  # Reduced from 64 for less routing interference
                 slot_dim=config.execution_slot_dim,
                 max_ticks=config.execution_max_ticks,
                 num_heads=config.execution_num_heads,

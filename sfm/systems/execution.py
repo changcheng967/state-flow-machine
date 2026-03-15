@@ -43,7 +43,7 @@ class ExecutionSystem(nn.Module):
         self,
         input_dim: int,
         hidden_dim: int = 256,      # Multiple of 16
-        num_slots: int = 64,         # Multiple of 16
+        num_slots: int = 16,         # Default 16 for exp0 (multiple of 16)
         slot_dim: int = 128,         # Multiple of 16
         max_ticks: int = 2,
         num_heads: int = 4,          # head_dim = 32
@@ -92,6 +92,9 @@ class ExecutionSystem(nn.Module):
 
         # Project deltanet output back to input_dim
         self.deltanet_proj = nn.Linear(hidden_dim, input_dim) if hidden_dim != input_dim else nn.Identity()
+
+        # Skip connection: direct path for simple patterns
+        self.input_skip = nn.Linear(input_dim, input_dim, bias=False)
 
         # Output projection
         self.output_proj = nn.Sequential(
@@ -172,8 +175,8 @@ class ExecutionSystem(nn.Module):
         combined = torch.cat([slot_out, bindings], dim=-1)
         output = self.combine_proj(combined)
 
-        # Add deltanet output (residual)
-        output = output + deltanet_out
+        # Add deltanet output (residual) and input skip connection
+        output = output + deltanet_out + self.input_skip(x)
 
         # Final projection
         output = self.output_proj(output)
@@ -213,7 +216,7 @@ if __name__ == "__main__":
     seq_len = 16
     input_dim = 256   # Multiple of 16
     hidden_dim = 256  # Multiple of 16
-    num_slots = 64    # Multiple of 16
+    num_slots = 16    # Multiple of 16
     slot_dim = 128    # Multiple of 16
     max_ticks = 2
 

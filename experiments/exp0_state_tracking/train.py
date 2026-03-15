@@ -532,7 +532,7 @@ def run_experiment(
     execution = ExecutionSystem(
         input_dim=sfm_config.d_model,
         hidden_dim=sfm_config.deltanet_hidden_dim,
-        num_slots=sfm_config.execution_num_slots,
+        num_slots=16,  # Reduced from 64 for less routing interference
         slot_dim=sfm_config.execution_slot_dim,
         max_ticks=sfm_config.execution_max_ticks,
         num_heads=sfm_config.execution_num_heads,
@@ -563,12 +563,12 @@ def run_experiment(
         train_loader,
         val_loader,
         device,
-        learning_rate=sfm_config.learning_rate,
+        learning_rate=1e-3,  # Higher LR compensates for FP32-only training
         model_name="execution",
         grad_accum_steps=grad_accum_steps,
         use_amp=False,  # Disable AMP - DeltaNet backward through exp() overflows FP16
         rank=rank,
-        warmup_steps=sfm_config.warmup_steps,
+        warmup_steps=200,  # Shorter warmup for higher LR
         num_epochs=config.num_epochs
     )
 

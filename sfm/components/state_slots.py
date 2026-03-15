@@ -1,8 +1,12 @@
 """
 State Slot Bank - SEQUENTIAL WRITE VERSION
 
-64 registers that explicitly bind to variables and track values through execution.
+Registers that explicitly bind to variables and track values through execution.
 This is the core of System 2 (Execution).
+
+Default 16 slots: hard-mode programs have ~10 variables, 16 is sufficient
+while reducing routing interference. 16 is also a multiple of 16 for Cube
+optimization.
 
 KEY ARCHITECTURAL ADVANTAGE:
 The sequential per-chunk write preserves execution order.
@@ -32,7 +36,7 @@ class StateSlotBank(nn.Module):
     def __init__(
         self,
         input_dim: int,
-        num_slots: int = 64,      # Multiple of 16
+        num_slots: int = 16,       # Default 16 (multiple of 16, ~10 vars in hard mode)
         slot_dim: int = 128,       # Multiple of 16
         num_heads: int = 4,        # head_dim = 32
         max_ticks: int = 2,
@@ -258,7 +262,7 @@ class StateSlotLayer(nn.Module):
     def __init__(
         self,
         input_dim: int,
-        num_slots: int = 64,
+        num_slots: int = 16,
         slot_dim: int = 128,
         num_heads: int = 4,
         max_ticks: int = 2,
@@ -303,7 +307,7 @@ if __name__ == "__main__":
     batch_size = 4
     seq_len = 64  # Multiple of chunk_size
     input_dim = 256
-    num_slots = 64
+    num_slots = 16
     slot_dim = 128
 
     # Initialize

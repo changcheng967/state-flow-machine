@@ -1,5 +1,5 @@
 """
-DeltaNet Recurrent Cell - CUBE-FIRST PARALLEL SCAN
+DeltaNet Recurrent Cell - GATED DELTANET with CUBE-FIRST PARALLEL SCAN
 
 The core component enabling state tracking. Uses eigenvalues in [-1, 1]
 (not [0, 1] like standard RNNs) which enables tracking state transformations
@@ -7,6 +7,12 @@ that transformers cannot do (TC0 circuit complexity limit).
 
 Key insight: Negative eigenvalues allow the cell to "subtract" state,
 enabling reversible computations and proper tracking of variable mutations.
+
+GATED DELTANET (ICLR 2025):
+- Forget gate controls how much old state to retain vs new input to inject
+- forget≈1: retains old state (normal tracking)
+- forget≈0: replaces state with new value (variable reassignment)
+- Boosts accuracy by enabling proper state overwrite on reassignment
 
 CUBE-FIRST OPTIMIZATION for Ascend NPU:
 - Reshape sequence into chunks of size 16 (matches Cube unit width)
@@ -30,11 +36,14 @@ import math
 
 class DeltaNetCell(nn.Module):
     """
-    DeltaNet recurrent cell with learnable eigenvalues in [-1, 1].
+    Gated DeltaNet recurrent cell with learnable eigenvalues in [-1, 1].
 
     CUBE-FIRST: Uses matrix-based parallel scan within 16-step chunks.
     The 16x16 lower-triangular matrix M is computed and multiplied,
     utilizing the DaVinci Cube unit efficiently.
+
+    GATED: Forget gate (per-head) controls state retention vs injection,
+    enabling proper variable reassignment tracking.
 
     OPTIMIZED: Uses selective FP32 for numerically sensitive operations
     (cumprod, division) which run on Vector unit anyway.
@@ -65,6 +74,9 @@ class DeltaNetCell(nn.Module):
         # Combined projections for efficiency
         self.input_proj = nn.Linear(input_dim, hidden_dim, bias=False)
         self.gate_proj = nn.Linear(hidden_dim, num_heads * 2, bias=True)
+
+        # Forget gate: controls state retention (1=keep old, 0=replace)
+        self.forget_gate_proj = nn.Linear(input_dim, num_heads, bias=False)
 
         # Output projection
         self.output_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
@@ -278,16 +290,22 @@ class DeltaNetCell(nn.Module):
         alpha_gate = torch.sigmoid(alpha_gate)
         beta_gate = torch.sigmoid(beta_gate)
 
-        # Compute decay factors: a_t = eigenvalue * alpha_t
+        # GATED: Forget gate controls state retention vs injection
+        # forget≈1: retain old state (normal tracking)
+        # forget≈0: replace with new value (variable reassignment)
+        forget = torch.sigmoid(self.forget_gate_proj(x))  # (batch, seq_len, num_heads)
+
+        # Compute decay factors: a_t = forget * eigenvalue * alpha_t
         eigenvalues_exp = eigenvalues.view(1, 1, self.num_heads, 1)  # (1, 1, num_heads, 1)
         alpha_exp = alpha_gate.unsqueeze(-1)  # (batch, seq_len, num_heads, 1)
         beta_exp = beta_gate.unsqueeze(-1)  # (batch, seq_len, num_heads, 1)
+        forget_exp = forget.unsqueeze(-1)  # (batch, seq_len, num_heads, 1)
 
-        a = eigenvalues_exp * alpha_exp  # (batch, seq_len, num_heads, 1)
+        a = forget_exp * eigenvalues_exp * alpha_exp  # (batch, seq_len, num_heads, 1)
 
-        # Compute inputs: b_t = beta_t * x_t
+        # Compute inputs: b_t = (1 - forget) * beta_t * x_t
         x_heads = x_proj.view(batch_size, seq_len, self.num_heads, self.head_dim)
-        b = beta_exp * x_heads  # (batch, seq_len, num_heads, head_dim)
+        b = (1 - forget_exp) * beta_exp * x_heads  # (batch, seq_len, num_heads, head_dim)
 
         # Initial hidden state as heads
         h0 = h.view(batch_size, self.num_heads, self.head_dim)  # (batch, num_heads, head_dim)
