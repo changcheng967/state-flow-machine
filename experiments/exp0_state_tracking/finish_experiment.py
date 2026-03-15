@@ -669,7 +669,7 @@ def main():
             grid_results = {}
             for lr in learning_rates:
                 set_seed(42)
-                model = make_execution_model(tokenizer.vocab_size_actual, device)
+                model = make_execution_model(tokenizer.vocab_size_actual, device).to(device)
                 best_val_acc = train_execution(
                     model, subset_loader, val_loader, device,
                     save_dir=args.save_dir,
