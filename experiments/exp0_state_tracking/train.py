@@ -434,7 +434,7 @@ def cleanup_distributed():
     dist.destroy_process_group()
 
 
-def warmup_npu(model, train_loader, device, is_transformer: bool = False):
+def warmup_npu(model, train_loader, device, is_transformer: bool = False, use_amp: bool = True):
     """Warmup NPU with real batch to compile graphs (REGRESSION)."""
     print("Warming up NPU with real batch shape...")
     synchronize()
@@ -446,12 +446,29 @@ def warmup_npu(model, train_loader, device, is_transformer: bool = False):
 
     model.train()
 
-    # Forward
-    if is_transformer:
-        mask = (attention_mask == 0)
-        predictions = model(input_ids, mask=mask)
+    # Forward with optional autocast
+    if use_amp:
+        try:
+            with torch.npu.amp.autocast():
+                if is_transformer:
+                    mask = (attention_mask == 0)
+                    predictions = model(input_ids, mask=mask)
+                else:
+                    predictions = model(input_ids, attention_mask=attention_mask)
+        except AttributeError:
+            with torch.cuda.amp.autocast():
+                if is_transformer:
+                    mask = (attention_mask == 0)
+                    predictions = model(input_ids, mask=mask)
+                else:
+                    predictions = model(input_ids, attention_mask=attention_mask)
     else:
-        predictions = model(input_ids, attention_mask=attention_mask)
+        # No autocast - run directly in FP32
+        if is_transformer:
+            mask = (attention_mask == 0)
+            predictions = model(input_ids, mask=mask)
+        else:
+            predictions = model(input_ids, attention_mask=attention_mask)
 
     # Backward with MSE loss
     loss = F.mse_loss(predictions, labels_norm)
@@ -568,7 +585,7 @@ def run_experiment(
 
     if "npu" in str(device):
         model_to_warmup = execution_wrapper.module if hasattr(execution_wrapper, 'module') else execution_wrapper
-        warmup_npu(model_to_warmup, train_loader, device, is_transformer=False)
+        warmup_npu(model_to_warmup, train_loader, device, is_transformer=False, use_amp=False)
     timings["model_creation_and_warmup"] = time.time() - t0
 
     execution_trainer = Trainer(
@@ -579,7 +596,7 @@ def run_experiment(
         learning_rate=sfm_config.learning_rate,
         model_name="execution",
         grad_accum_steps=grad_accum_steps,
-        use_amp=use_amp,  # Re-enabled: DeltaNet now uses log-space cumprod (FP32-stable)
+        use_amp=False,  # Disable AMP - DeltaNet backward through exp() overflows FP16
         rank=rank,
         warmup_steps=sfm_config.warmup_steps,
         num_epochs=config.num_epochs
@@ -621,7 +638,7 @@ def run_experiment(
 
     if "npu" in str(device):
         model_to_warmup = transformer_fair.module if hasattr(transformer_fair, 'module') else transformer_fair
-        warmup_npu(model_to_warmup, train_loader, device, is_transformer=True)
+        warmup_npu(model_to_warmup, train_loader, device, is_transformer=True, use_amp=use_amp)
     timings["transformer_fair_creation_and_warmup"] = time.time() - t0
 
     transformer_fair_trainer = Trainer(
@@ -677,7 +694,7 @@ def run_experiment(
 
     if "npu" in str(device):
         model_to_warmup = transformer_large.module if hasattr(transformer_large, 'module') else transformer_large
-        warmup_npu(model_to_warmup, train_loader, device, is_transformer=True)
+        warmup_npu(model_to_warmup, train_loader, device, is_transformer=True, use_amp=use_amp)
     timings["transformer_large_creation_and_warmup"] = time.time() - t0
 
     transformer_large_trainer = Trainer(
