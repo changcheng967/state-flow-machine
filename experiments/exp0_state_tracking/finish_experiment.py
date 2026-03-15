@@ -1,15 +1,17 @@
 """
-finish_experiment.py - Single-NPU training + full evaluation (v2)
+finish_experiment.py - Single-NPU training + full evaluation (v3)
 
 Self-contained: trains all three models (execution + two transformers) on a
 single NPU (no DDP), then evaluates all three on length generalization at
-1x, 2x, 4x, 8x.
+1x, 2x, 4x, 8x, 16x, 32x.
 
-v2 changes:
-- Execution model: 101-class classification instead of MSE regression
-- Intermediate state supervision (aux loss at every token position)
-- LR grid search for execution model (5 LRs, pick best, retrain)
-- Wider slot_dim=256 for more state capacity
+v3 changes:
+- Fair comparison: transformers use 101-class CE (same as execution model)
+- Mixed-length training: 60% 10-27, 20% 28-50, 15% 51-80, 5% 81-120 ops
+- State passing: carry detached recurrent state across training batches
+- LR grid search for both execution and transformer models
+- Extended evaluation up to 32x (320 ops)
+- max_length=512 for longer programs
 
 Usage:
     python experiments/exp0_state_tracking/finish_experiment.py
@@ -37,7 +39,7 @@ from sfm.utils.device import get_device, set_seed, synchronize
 from baseline_transformer import TransformerEncoderOnly, StateTrackingWrapper
 from dataset import create_dataloaders
 from evaluate import Evaluator, generate_test_programs
-from generate_data import generate_and_save
+from generate_data import generate_mixed_length_dataset, SimpleProgramGenerator
 
 
 NUM_CLASSES = 101  # values 0-100
@@ -90,13 +92,13 @@ def train_transformer(
     max_grad_norm=1.0,
     warmup_steps=500,
     use_amp=True,
+    num_classes=101,
 ):
-    """Train a transformer model on single NPU, no DDP."""
+    """Train a transformer model on single NPU, no DDP (v3: 101-class classification)."""
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     total_steps = len(train_loader) * num_epochs
     scheduler = WarmupCosineScheduler(optimizer, warmup_steps, total_steps)
-    criterion = nn.MSELoss()
 
     # AMP scaler (conservative settings matching train.py)
     if use_amp:
@@ -113,11 +115,11 @@ def train_transformer(
     else:
         scaler = None
 
-    best_val_loss = float('inf')
+    best_val_acc = 0.0
     param_count = sum(p.numel() for p in model.parameters())
 
     print(f"\n{'=' * 60}")
-    print(f"Training {model_name}")
+    print(f"Training {model_name} (v3: classification, {num_classes} classes)")
     print(f"{'=' * 60}")
     print(f"  Parameters: {param_count:,}")
     print(f"  AMP: {use_amp}  Device: {device}")
@@ -138,8 +140,7 @@ def train_transformer(
         for batch_idx, batch in enumerate(train_loader):
             input_ids = batch["input_ids"].to(device, non_blocking=True)
             attention_mask = batch["attention_mask"].to(device, non_blocking=True)
-            labels_norm = batch["final_value_normalized"].to(device, non_blocking=True).float()
-            labels_raw = batch["final_value"].to(device, non_blocking=True)
+            labels_raw = batch["final_value"].to(device, non_blocking=True).long()
 
             mask = (attention_mask == 0)  # True for padding
 
@@ -147,15 +148,15 @@ def train_transformer(
             if use_amp:
                 try:
                     with torch.npu.amp.autocast():
-                        predictions = model(input_ids, mask=mask)
+                        logits = model(input_ids, mask=mask)
                 except AttributeError:
                     with torch.cuda.amp.autocast():
-                        predictions = model(input_ids, mask=mask)
+                        logits = model(input_ids, mask=mask)
             else:
-                predictions = model(input_ids, mask=mask)
+                logits = model(input_ids, mask=mask)
 
-            # MSE loss in FP32 outside autocast
-            loss = criterion(predictions.float(), labels_norm.float())
+            # CE loss (classification)
+            loss = F.cross_entropy(logits.float(), labels_raw)
 
             if scaler is not None:
                 scaler.scale(loss).backward()
@@ -172,8 +173,8 @@ def train_transformer(
             optimizer.zero_grad()
 
             total_loss += loss.item()
-            predicted_values = (predictions * 100).round().clamp(0, 100)
-            total_correct += (predicted_values == labels_raw).sum().item()
+            predicted_classes = logits.argmax(dim=-1)
+            total_correct += (predicted_classes == labels_raw).sum().item()
             total_samples += labels_raw.size(0)
 
         synchronize()
@@ -182,7 +183,6 @@ def train_transformer(
 
         # ---- Validate ----
         model.eval()
-        val_loss = 0.0
         val_correct = 0
         val_samples = 0
 
@@ -190,42 +190,36 @@ def train_transformer(
             for batch in val_loader:
                 input_ids = batch["input_ids"].to(device, non_blocking=True)
                 attention_mask = batch["attention_mask"].to(device, non_blocking=True)
-                labels_norm = batch["final_value_normalized"].to(device, non_blocking=True).float()
-                labels_raw = batch["final_value"].to(device, non_blocking=True)
+                labels_raw = batch["final_value"].to(device, non_blocking=True).long()
 
                 mask = (attention_mask == 0)
                 predictions = model(input_ids, mask=mask)
-                loss = criterion(predictions.float(), labels_norm.float())
-
-                val_loss += loss.item()
-                predicted_values = (predictions * 100).round().clamp(0, 100)
-                val_correct += (predicted_values == labels_raw).sum().item()
+                predicted_classes = (predictions * 100).round().long()
+                val_correct += (predicted_classes == labels_raw).sum().item()
                 val_samples += labels_raw.size(0)
 
-        val_loss_avg = val_loss / len(val_loader)
         val_acc = val_correct / val_samples
         epoch_time = time.time() - epoch_start
 
-        if (epoch + 1) % 5 == 0 or epoch == 0 or val_loss_avg < best_val_loss:
+        if (epoch + 1) % 5 == 0 or epoch == 0 or val_acc > best_val_acc:
             print(f"  Epoch {epoch+1:3d}/{num_epochs}: "
-                  f"train={train_loss:.4f}/{train_acc:.4f}  "
-                  f"val={val_loss_avg:.4f}/{val_acc:.4f}  [{epoch_time:.1f}s]")
+                  f"loss={train_loss:.4f}/acc={train_acc:.4f}  "
+                  f"val_acc={val_acc:.4f}  [{epoch_time:.1f}s]")
 
-        # Save best
-        if val_loss_avg < best_val_loss:
-            best_val_loss = val_loss_avg
+        # Save best by val accuracy
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
             save_path = os.path.join(save_dir, f"{model_name}_best.pt")
             torch.save({
                 "model_state_dict": model.state_dict(),
-                "val_loss": val_loss_avg,
                 "val_accuracy": val_acc,
                 "epoch": epoch,
                 "param_count": param_count,
             }, save_path)
-            print(f"  -> Saved best (val_loss={val_loss_avg:.4f})")
+            print(f"  -> Saved best (val_acc={val_acc:.4f})")
 
-    print(f"\n  {model_name} done. Best val_loss: {best_val_loss:.4f}")
-    return best_val_loss
+    print(f"\n  {model_name} done. Best val_acc: {best_val_acc:.4f}")
+    return best_val_acc
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +296,7 @@ def train_execution(
         epoch_start = time.time()
 
         optimizer.zero_grad()
+        carry_state = None  # Reset state each epoch (data is shuffled)
 
         for batch_idx, batch in enumerate(train_loader):
             input_ids = batch["input_ids"].to(device, non_blocking=True)
@@ -309,10 +304,14 @@ def train_execution(
             labels_raw = batch["final_value"].to(device, non_blocking=True).long()
             inter_targets = batch["intermediate_targets"].to(device, non_blocking=True).long()
 
-            # Forward with intermediate predictions
-            final_logits, inter_logits = model(
-                input_ids, attention_mask=attention_mask, return_intermediate=True
+            # Forward with intermediate predictions and state passing
+            final_logits, inter_logits, new_state = model(
+                input_ids, attention_mask=attention_mask,
+                return_intermediate=True, state=carry_state
             )
+
+            # Carry state forward (detached to prevent cross-batch gradients)
+            carry_state = {k: v.detach() for k, v in new_state.items()}
 
             # Final classification loss: (batch, 101) vs (batch,)
             final_loss = F.cross_entropy(final_logits, labels_raw)
@@ -399,7 +398,7 @@ def run_full_evaluation(save_dir, device, tokenizer,
     """Load all 3 checkpoints, evaluate at multiple lengths, print table."""
 
     if multipliers is None:
-        multipliers = [1, 2, 4, 8]
+        multipliers = [1, 2, 4, 8, 16, 32]
 
     config = SFMConfig.small()
     results = {}
@@ -408,9 +407,9 @@ def run_full_evaluation(save_dir, device, tokenizer,
     model_specs = [
         ("execution", "State Slots", False, {}),
         ("transformer_fair", "Transformer-Fair", True,
-         dict(d_model=128, num_heads=4, num_layers=3, d_ff=256, num_output_classes=1)),
+         dict(d_model=128, num_heads=4, num_layers=3, d_ff=256, num_output_classes=NUM_CLASSES)),
         ("transformer_large", "Transformer-Large", True,
-         dict(d_model=256, num_heads=8, num_layers=4, d_ff=512, num_output_classes=1)),
+         dict(d_model=256, num_heads=8, num_layers=4, d_ff=512, num_output_classes=NUM_CLASSES)),
     ]
 
     for model_type, model_name, is_transformer, extra_kwargs in model_specs:
@@ -541,7 +540,7 @@ def run_full_evaluation(save_dir, device, tokenizer,
                 'g:^', lw=2, ms=8, label='Transformer-Large')
         ax.set_xlabel('Length Multiplier', fontsize=12)
         ax.set_ylabel('Exact Match Accuracy (%)', fontsize=12)
-        ax.set_title('Experiment 0 v2: Classification + Intermediate Supervision', fontsize=14)
+        ax.set_title('Experiment 0 v3: Fair Classification + Mixed-Length + State Passing', fontsize=14)
         ax.legend(fontsize=11)
         ax.grid(True, alpha=0.3)
         ax.set_ylim(0, 100)
@@ -613,16 +612,31 @@ def main():
 
     if need_regen:
         os.makedirs(data_dir, exist_ok=True)
-        print(f"Generating data: {min_train_samples} train / 1000 val, "
+
+        # Training data: mixed-length for generalization (v3)
+        print(f"Generating MIXED-LENGTH training data: {min_train_samples} samples, "
               f"difficulty={args.difficulty}, seed=42...")
-        generate_and_save(
-            output_dir=data_dir,
-            train_samples=min_train_samples,
-            val_samples=1000,
-            max_program_length=20,
-            seed=42,
-            difficulty=args.difficulty
+        train_data = generate_mixed_length_dataset(
+            num_samples=min_train_samples,
+            include_trace=True,
+            seed=42
         )
+        train_path_for_save = os.path.join(data_dir, "train.json")
+        with open(train_path_for_save, 'w') as f:
+            json.dump(train_data, f, indent=2)
+        print(f"Saved mixed-length training data to {train_path_for_save}")
+
+        # Validation data: standard hard range (10-27 ops) for comparable metrics
+        print(f"Generating validation data: 1000 samples (standard range)...")
+        val_gen = SimpleProgramGenerator(
+            num_variables=5, max_program_length=20,
+            seed=42, difficulty=args.difficulty
+        )
+        val_data = val_gen.generate_dataset(1000)
+        val_path_save = os.path.join(data_dir, "val.json")
+        with open(val_path_save, 'w') as f:
+            json.dump(val_data, f, indent=2)
+        print(f"Saved validation data to {val_path_save}")
 
     # ---- Build / load tokenizer ----
     with open(train_path, 'r') as f:
@@ -637,7 +651,7 @@ def main():
     train_loader, val_loader = create_dataloaders(
         data_dir, tokenizer,
         batch_size=args.batch_size,
-        max_length=200,
+        max_length=512,
         distributed=False, rank=0, world_size=1
     )
     print(f"Data: {len(train_loader.dataset)} train, {len(val_loader.dataset)} val samples")
@@ -728,12 +742,12 @@ def main():
         if "npu" in str(device):
             torch.npu.empty_cache()
 
-        # ======== Train Transformers ========
+        # ======== Train Transformers (v3: classification) ========
         if "npu" in str(device):
             print("\nWarming up NPU (transformer)...")
             warmup_model = TransformerEncoderOnly(
                 tokenizer.vocab_size_actual, d_model=128, num_heads=4,
-                num_layers=1, d_ff=256, num_output_classes=1
+                num_layers=1, d_ff=256, num_output_classes=NUM_CLASSES
             ).to(device)
             warmup_model.train()
             warmup_opt = torch.optim.SGD(warmup_model.parameters(), lr=0.0)
@@ -746,14 +760,14 @@ def main():
                 if use_amp:
                     try:
                         with torch.npu.amp.autocast():
-                            out = warmup_model(ids, mask=mask)
+                            logits = warmup_model(ids, mask=mask)
                     except AttributeError:
                         with torch.cuda.amp.autocast():
-                            out = warmup_model(ids, mask=mask)
+                            logits = warmup_model(ids, mask=mask)
                 else:
-                    out = warmup_model(ids, mask=mask)
-                loss = F.mse_loss(out.float(),
-                                  warmup_batch["final_value_normalized"].to(device).float())
+                    logits = warmup_model(ids, mask=mask)
+                loss = F.cross_entropy(logits.float(),
+                                       warmup_batch["final_value"].to(device).long())
                 loss.backward()
                 warmup_opt.step()
             synchronize()
@@ -761,33 +775,87 @@ def main():
             del warmup_model, warmup_opt
             torch.npu.empty_cache()
 
+        # ======== LR Grid Search for Transformer-Fair ========
+        tf_learning_rates = [3e-4, 5e-4, 1e-3, 2e-3, 5e-3]
+        tf_grid_epochs = 10
+        tf_subset_size = 2000
+
+        print(f"\n{'=' * 60}")
+        print(f"Transformer LR Grid Search: {len(tf_learning_rates)} LRs, "
+              f"{tf_grid_epochs} epochs each, {tf_subset_size} samples")
+        print(f"{'=' * 60}")
+
+        actual_subset = min(tf_subset_size, len(train_loader.dataset))
+        indices = list(range(actual_subset))
+        tf_subset_dataset = Subset(train_loader.dataset, indices)
+        tf_subset_loader = DataLoader(
+            tf_subset_dataset, batch_size=args.batch_size,
+            shuffle=True, drop_last=True
+        )
+
+        tf_grid_results = {}
+        for tf_lr in tf_learning_rates:
+            set_seed(42)
+            tf_model = TransformerEncoderOnly(
+                vocab_size=tokenizer.vocab_size_actual,
+                d_model=128, num_heads=4, num_layers=3, d_ff=256,
+                num_output_classes=NUM_CLASSES
+            ).to(device)
+            best_va = train_transformer(
+                tf_model, tf_subset_loader, val_loader, device,
+                "transformer_fair", args.save_dir,
+                num_epochs=tf_grid_epochs, lr=tf_lr,
+                warmup_steps=max(50, 200 // tf_grid_epochs * 2),
+                use_amp=use_amp, num_classes=NUM_CLASSES,
+            )
+            tf_grid_results[tf_lr] = best_va
+            del tf_model
+            if "npu" in str(device):
+                torch.npu.empty_cache()
+
+        print(f"\n{'=' * 60}")
+        print("Transformer LR Grid Search Results")
+        print(f"{'=' * 60}")
+        for tf_lr, acc in sorted(tf_grid_results.items()):
+            marker = " <-- BEST" if acc == max(tf_grid_results.values()) else ""
+            print(f"  lr={tf_lr:<8}  val_acc={acc:.4f}{marker}")
+
+        best_tf_lr = max(tf_grid_results, key=tf_grid_results.get)
+        print(f"\n  Selected LR: {best_tf_lr} (val_acc={tf_grid_results[best_tf_lr]:.4f})")
+
+        # ======== Train Transformer-Fair (full) ========
+        set_seed(42)
         tf_fair = TransformerEncoderOnly(
             vocab_size=tokenizer.vocab_size_actual,
             d_model=128, num_heads=4, num_layers=3, d_ff=256,
-            num_output_classes=1
+            num_output_classes=NUM_CLASSES
         ).to(device)
 
         train_transformer(
             tf_fair, train_loader, val_loader, device,
             "transformer_fair", args.save_dir,
-            num_epochs=args.epochs, lr=args.lr,
-            warmup_steps=args.warmup_steps, use_amp=use_amp
+            num_epochs=args.epochs, lr=best_tf_lr,
+            warmup_steps=args.warmup_steps, use_amp=use_amp,
+            num_classes=NUM_CLASSES,
         )
         del tf_fair
         if "npu" in str(device):
             torch.npu.empty_cache()
 
+        # ======== Train Transformer-Large ========
+        set_seed(42)
         tf_large = TransformerEncoderOnly(
             vocab_size=tokenizer.vocab_size_actual,
             d_model=256, num_heads=8, num_layers=4, d_ff=512,
-            num_output_classes=1
+            num_output_classes=NUM_CLASSES
         ).to(device)
 
         train_transformer(
             tf_large, train_loader, val_loader, device,
             "transformer_large", args.save_dir,
             num_epochs=args.epochs, lr=args.lr,
-            warmup_steps=args.warmup_steps, use_amp=use_amp
+            warmup_steps=args.warmup_steps, use_amp=use_amp,
+            num_classes=NUM_CLASSES,
         )
         del tf_large
 
@@ -799,7 +867,7 @@ def main():
     run_full_evaluation(
         args.save_dir, device, tokenizer,
         base_length=10,
-        multipliers=[1, 2, 4, 8],
+        multipliers=[1, 2, 4, 8, 16, 32],
         samples_per_length=args.eval_samples,
         difficulty=args.difficulty
     )

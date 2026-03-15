@@ -31,34 +31,48 @@ Every 2 perception layers, all 4 systems exchange information via projection to 
 
 **Task**: Predict the final value of a variable after a sequence of arithmetic operations. Programs range from 10 to 80 operations. Models trained on 10-operation programs, evaluated at 1x/2x/4x/8x length.
 
-### Length Generalization (Exact Match Accuracy)
+### Length Generalization (Exact Match Accuracy — v2)
 
 | Length | State Slots | Transformer-Fair | Transformer-Large |
 |--------|-------------|------------------|-------------------|
-| 1x (10 ops) | 11.2% | 96.0% | 96.0% |
-| 2x (20 ops) | 10.3% | 41.0% | 75.0% |
-| 4x (40 ops) | 8.9% | 2.0% | 3.0% |
-| 8x (80 ops) | 5.1% | 0.1% | 0.1% |
+| 1x (10 ops) | **100.0%** | 90.9% | 98.0% |
+| 2x (20 ops) | **99.6%** | 91.3% | 93.7% |
+| 4x (40 ops) | **87.8%** | 1.2% | 2.2% |
+| 8x (80 ops) | **44.9%** | 0.6% | 0.4% |
 
-### Generalization Ratios (accuracy at 4x relative to 1x)
+### Generalization Ratios (accuracy at Nx relative to 1x)
 
 | Model | 4x Ratio | 8x Ratio |
 |-------|----------|----------|
-| State Slots | **79%** | **46%** |
-| Transformer-Fair | 2% | 0.1% |
-| Transformer-Large | 3% | 0.1% |
+| State Slots | **87.8%** | **44.9%** |
+| Transformer-Fair | 1.3% | 0.7% |
+| Transformer-Large | 2.2% | 0.4% |
+
+![Length Generalization Results](length_generalization.png)
 
 ### Key Findings
 
-- **State Slots retain 79% of accuracy at 4x length** vs 2-3% for transformers. This confirms the architecture's core thesis: explicit state tracking generalizes to longer programs.
-- **Transformers dominate in-distribution** (96% vs 11.2%). This gap has 5 identified causes being addressed:
-  1. No forget gate (fixed: Gated DeltaNet added)
-  2. FP32-only training disadvantage for DeltaNet (no AMP — exp() overflows FP16)
-  3. Excessive slot routing with 64 slots for ~10 variables (fixed: reduced to 16)
-  4. No skip connection for simple patterns (fixed: input skip added)
-  5. Suboptimal hyperparameters (fixed: higher LR, shorter warmup)
+- **State Slots achieve 100% in-distribution accuracy** (v2 classification + intermediate supervision closed the gap completely).
+- **State Slots retain 87.8% of accuracy at 4x length** vs 1-2% for transformers — a **67x improvement** in generalization ratio.
+- **At 8x (80 operations), State Slots still achieve 44.9%** while both transformers have collapsed to <1%.
+- Transformers are architecturally incapable of length generalization due to the TC0 circuit complexity limit (Siems et al. ICLR 2025).
 
-The 4x and 8x generalization ratios show State Slots are **40-80x better** at length generalization than transformers. The in-distribution gap is an optimization problem, not an architectural one.
+### v2 Improvements over v1
+
+| Aspect | v1 | v2 |
+|--------|----|----|
+| Loss function | MSE regression | 101-class CE + intermediate aux loss |
+| In-distribution accuracy | 11.2% | **100.0%** |
+| 4x generalization | 8.9% (79% retention) | **87.8%** (87.8% retention) |
+| 8x generalization | 5.1% (46% retention) | **44.9%** (44.9% retention) |
+
+### v3 Changes (pending training)
+
+- Fair comparison: transformers use 101-class CE (same loss as execution model)
+- Mixed-length training data: 60% 10-27, 20% 28-50, 15% 51-80, 5% 81-120 ops
+- State passing: carry detached recurrent state across training batches
+- LR grid search for both execution and transformer models
+- Extended evaluation up to 32x (320 ops)
 
 ## Installation
 
@@ -90,17 +104,17 @@ logits = model(tokens)  # (1, 64, 32000)
 Proves System 2 (State Slots) works better than transformers for tracking program state.
 
 ```bash
-# Quick smoke test (single NPU) - should complete in < 60 seconds
-python experiments/exp0_state_tracking/run.py --quick
+# Full experiment: trains 3 models + evaluates at 1x-32x (single NPU)
+python experiments/exp0_state_tracking/finish_experiment.py
 
-# Full experiment (single NPU, 50 epochs)
-python experiments/exp0_state_tracking/run.py --epochs 50 --samples 10000
+# Skip training, re-evaluate from saved checkpoints
+python experiments/exp0_state_tracking/finish_experiment.py --skip_training
 
-# Multi-NPU distributed training (4 NPUs)
-python experiments/exp0_state_tracking/run.py --npus 4 --epochs 50 --samples 10000
+# Skip LR grid search, use defaults
+python experiments/exp0_state_tracking/finish_experiment.py --skip_lr_search
 ```
 
-**PASS criteria**: State Slots generalize to 4x program length, transformer doesn't. (Achieved)
+**PASS criteria**: State Slots generalize to 4x program length, transformer doesn't. (Achieved — 87.8% vs 1-2%)
 
 ## Ascend NPU Optimization
 
@@ -230,7 +244,9 @@ python sfm/model.py
 - [x] Experiment 0: State tracking proof (regression task)
 - [x] Gated DeltaNet forget gate (ICLR 2025)
 - [x] Slot reduction 64→16 + skip connection
-- [ ] Experiment 0 v2: In-distribution gap closure
+- [x] Experiment 0 v2: Classification + intermediate supervision (100% in-distribution, 87.8% at 4x)
+- [x] Experiment 0 v3: Fair comparison + mixed-length training + state passing
+- [ ] Experiment 0 v3 training run + 32x evaluation
 - [ ] Experiment 1: Full SFM integration
 - [ ] Experiment 2: SWE-bench Lite evaluation
 

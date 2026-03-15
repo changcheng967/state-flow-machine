@@ -214,7 +214,7 @@ def load_model(
             num_heads=4,
             num_layers=3,
             d_ff=512,
-            num_output_classes=1
+            num_output_classes=101
         )
     elif model_type == "transformer_large":
         # Transformer-Large: ~3.26M params (for reference)
@@ -224,7 +224,7 @@ def load_model(
             num_heads=4,
             num_layers=4,
             d_ff=1024,
-            num_output_classes=1
+            num_output_classes=101
         )
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
@@ -245,7 +245,7 @@ def load_model(
 def run_evaluation(
     save_dir: str,
     base_length: int = 10,
-    multipliers: List[int] = [1, 2, 4, 8],
+    multipliers: List[int] = [1, 2, 4, 8, 16, 32],
     samples_per_length: int = 1000,
     difficulty: str = "easy",
     quick: bool = False
@@ -408,7 +408,7 @@ if __name__ == "__main__":
                         help="Directory with saved models")
     parser.add_argument("--base_length", type=int, default=10,
                         help="Base program length (number of operations)")
-    parser.add_argument("--multipliers", type=int, nargs="+", default=[1, 2, 4, 8],
+    parser.add_argument("--multipliers", type=int, nargs="+", default=[1, 2, 4, 8, 16, 32],
                         help="Length multipliers to test")
     parser.add_argument("--samples", type=int, default=1000,
                         help="Samples per length")

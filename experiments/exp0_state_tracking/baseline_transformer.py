@@ -218,15 +218,26 @@ class TransformerEncoderOnly(nn.Module):
         # Custom encoder (no nn.TransformerEncoder)
         self.encoder = TransformerEncoder(d_model, num_heads, d_ff, num_layers, dropout)
 
-        # REGRESSION: Output single scalar with sigmoid
-        self.regressor = nn.Sequential(
-            nn.LayerNorm(d_model),
-            nn.Linear(d_model, d_model),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model, 1),
-            nn.Sigmoid()  # Output in [0, 1]
-        )
+        self.num_output_classes = num_output_classes
+
+        if num_output_classes > 1:
+            # CLASSIFICATION: predict integer class
+            self.regressor = nn.Sequential(
+                nn.LayerNorm(d_model),
+                nn.Linear(d_model, d_model),
+                nn.ReLU(),
+                nn.Linear(d_model, num_output_classes),
+            )
+        else:
+            # REGRESSION: Output single scalar with sigmoid
+            self.regressor = nn.Sequential(
+                nn.LayerNorm(d_model),
+                nn.Linear(d_model, d_model),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(d_model, 1),
+                nn.Sigmoid()  # Output in [0, 1]
+            )
 
         self._init_weights()
 
@@ -283,8 +294,17 @@ class TransformerEncoderOnly(nn.Module):
             else:
                 x = x[:, -1, :]
 
-        # REGRESSION: Return (batch,) not (batch, 1)
-        return self.regressor(x).squeeze(-1)
+        output = self.regressor(x)
+
+        if self.num_output_classes > 1:
+            # Classification: return raw logits (batch, num_classes) during training,
+            # argmax/100.0 (batch,) during eval for backward compat with evaluate.py
+            if not self.training:
+                return output.argmax(dim=-1).float() / 100.0
+            return output
+        else:
+            # REGRESSION: Return (batch,) not (batch, 1)
+            return output.squeeze(-1)
 
     def count_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters())
@@ -466,10 +486,11 @@ class StateTrackingWrapper(nn.Module):
         self,
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
-        return_intermediate: bool = False
-    ) -> torch.Tensor:
+        return_intermediate: bool = False,
+        state: Optional[Dict[str, torch.Tensor]] = None
+    ):
         x = self.embedding(input_ids)
-        x = self.execution(x)
+        x, new_state, _ = self.execution(x, state=state, return_state=True)
 
         # Intermediate predictions at every position
         if self.intermediate_head is not None:
@@ -485,13 +506,17 @@ class StateTrackingWrapper(nn.Module):
         final_logits = self.classifier(pooled)  # (batch, num_classes) or (batch, 1)
 
         if return_intermediate and self.intermediate_head is not None:
-            return final_logits, intermediate_logits
+            return final_logits, intermediate_logits, new_state
 
         # Eval mode: return backward-compatible (batch,) tensor
         if self.num_classes > 1:
-            return final_logits.argmax(dim=-1).float() / 100.0  # (batch,) in [0,1]
+            pred = final_logits.argmax(dim=-1).float() / 100.0  # (batch,) in [0,1]
         else:
-            return final_logits.squeeze(-1)  # (batch,)
+            pred = final_logits.squeeze(-1)  # (batch,)
+
+        if state is not None:
+            return pred, new_state
+        return pred
 
     def count_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters())
@@ -525,15 +550,22 @@ if __name__ == "__main__":
     mask = torch.zeros(batch_size, seq_len, dtype=torch.bool)
     mask[:, -5:] = True  # Mask last 5 positions
 
+    encoder.train()
     logits = encoder(src, mask=mask, pooling="mean")
-    print(f"   Output logits shape: {logits.shape}")
-    assert logits.shape == (batch_size, 100), f"Encoder shape mismatch! Got {logits.shape}"
+    print(f"   Output logits shape (train): {logits.shape}")
+    assert logits.shape == (batch_size, 100), f"Encoder train shape mismatch! Got {logits.shape}"
+
+    encoder.eval()
+    pred = encoder(src, mask=mask, pooling="mean")
+    print(f"   Output pred shape (eval): {pred.shape}")
+    assert pred.shape == (batch_size,), f"Encoder eval shape mismatch! Got {pred.shape}"
 
     print(f"   Parameters: {encoder.count_parameters():,}")
     print("   [OK] TransformerEncoderOnly test passed!")
 
     # Test without mask
     print("\n2. Testing without mask...")
+    encoder.train()
     logits_no_mask = encoder(src, mask=None, pooling="mean")
     print(f"   Output shape: {logits_no_mask.shape}")
     assert logits_no_mask.shape == (batch_size, 100)
@@ -541,6 +573,7 @@ if __name__ == "__main__":
 
     # Test different pooling
     print("\n3. Testing different pooling methods...")
+    encoder.train()
     for pooling in ["mean", "first", "last"]:
         logits_p = encoder(src, mask=mask, pooling=pooling)
         print(f"   {pooling}: {logits_p.shape}")
@@ -576,6 +609,7 @@ if __name__ == "__main__":
 
     # Test gradient flow
     print("\n5. Testing gradient flow...")
+    encoder.train()
     logits = encoder(src, mask=mask)
     loss = logits.sum()
     loss.backward()

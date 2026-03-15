@@ -307,6 +307,70 @@ class SimpleProgramGenerator:
         return dataset
 
 
+def generate_mixed_length_dataset(
+    num_samples: int,
+    include_trace: bool = True,
+    seed: int = 42
+) -> List[Dict]:
+    """Generate dataset with mixed program lengths for better generalization.
+
+    Distribution:
+        60%: 10-27 ops (current hard training range)
+        20%: 28-50 ops
+        15%: 51-80 ops
+         5%: 81-120 ops
+
+    Args:
+        num_samples: Number of samples to generate.
+        include_trace: Whether to include execution traces.
+        seed: Random seed.
+
+    Returns:
+        List of samples in same format as generate_dataset().
+    """
+    rng = random.Random(seed)
+    generator = SimpleProgramGenerator(
+        num_variables=5,
+        max_program_length=120,
+        min_program_length=10,
+        seed=seed,
+        difficulty="hard"
+    )
+
+    dataset = []
+    for i in range(num_samples):
+        r = rng.random()
+        if r < 0.60:
+            length = rng.randint(10, 27)
+        elif r < 0.80:
+            length = rng.randint(28, 50)
+        elif r < 0.95:
+            length = rng.randint(51, 80)
+        else:
+            length = rng.randint(81, 120)
+
+        program, target, final_value = generator.generate_program(exact_length=length)
+        trace = generator.generate_execution_trace(program) if include_trace else None
+
+        sample = {
+            "program": program,
+            "target_variable": target,
+            "final_value": final_value,
+            "num_lines": len(program)
+        }
+
+        if include_trace:
+            sample["trace"] = trace
+            intermediate_states = []
+            for entry in trace:
+                intermediate_states.append(entry["state"].get(target, 0))
+            sample["intermediate_states"] = intermediate_states
+
+        dataset.append(sample)
+
+    return dataset
+
+
 def generate_and_save(
     output_dir: str,
     train_samples: int = 10000,
