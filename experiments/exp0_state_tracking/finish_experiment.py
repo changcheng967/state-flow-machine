@@ -1,15 +1,14 @@
 """
-finish_experiment.py - Single-NPU transformer training + full evaluation
+finish_experiment.py - Single-NPU training + full evaluation
 
-Trains Transformer-Fair and Transformer-Large on a single NPU (no DDP),
-then evaluates all three models (execution + two transformers) on
-length generalization at 1x, 2x, 4x, 8x.
+Self-contained: trains all three models (execution + two transformers) on a
+single NPU (no DDP), then evaluates all three on length generalization at
+1x, 2x, 4x, 8x.
 
 Prerequisites:
   - train.py must have already run and saved:
       outputs/exp0/tokenizer_vocab.json
       outputs/exp0/data/train.json, val.json
-      outputs/exp0/execution_best.pt
 
 Usage:
     python experiments/exp0_state_tracking/finish_experiment.py
@@ -220,6 +219,130 @@ def train_transformer(
             print(f"  -> Saved best (val_loss={val_loss_avg:.4f})")
 
     print(f"\n  {model_name} done. Best val_loss: {best_val_loss:.4f}")
+    return best_val_loss
+
+
+# ---------------------------------------------------------------------------
+# Training loop for execution model (FP32, no AMP)
+# ---------------------------------------------------------------------------
+
+def train_execution(
+    model,
+    train_loader,
+    val_loader,
+    device,
+    save_dir,
+    num_epochs=50,
+    lr=1e-3,
+    weight_decay=0.01,
+    max_grad_norm=1.0,
+    warmup_steps=200,
+):
+    """Train execution model on single NPU, no AMP (FP32 only).
+
+    DeltaNet backward through exp() overflows FP16, so AMP is disabled.
+    Uses higher LR and shorter warmup to compensate.
+    """
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    total_steps = len(train_loader) * num_epochs
+    scheduler = WarmupCosineScheduler(optimizer, warmup_steps, total_steps)
+    criterion = nn.MSELoss()
+
+    best_val_loss = float('inf')
+    param_count = sum(p.numel() for p in model.parameters())
+
+    print(f"\n{'=' * 60}")
+    print(f"Training Execution Model (State Slots)")
+    print(f"{'=' * 60}")
+    print(f"  Parameters: {param_count:,}")
+    print(f"  AMP: False (FP32 only)  Device: {device}")
+    print(f"  LR: {lr}  Warmup: {warmup_steps} steps")
+    print(f"  Batch size: {train_loader.batch_size}  Steps/epoch: {len(train_loader)}")
+    print("-" * 60)
+
+    for epoch in range(num_epochs):
+        # ---- Train ----
+        model.train()
+        total_loss = 0.0
+        total_correct = 0
+        total_samples = 0
+        epoch_start = time.time()
+
+        optimizer.zero_grad()
+
+        for batch_idx, batch in enumerate(train_loader):
+            input_ids = batch["input_ids"].to(device, non_blocking=True)
+            attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+            labels_norm = batch["final_value_normalized"].to(device, non_blocking=True).float()
+            labels_raw = batch["final_value"].to(device, non_blocking=True)
+
+            # Forward (FP32, no AMP)
+            predictions = model(input_ids, attention_mask=attention_mask)
+
+            # MSE loss
+            loss = criterion(predictions.float(), labels_norm.float())
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            optimizer.step()
+
+            scheduler.step()
+            optimizer.zero_grad()
+
+            total_loss += loss.item()
+            predicted_values = (predictions * 100).round().clamp(0, 100)
+            total_correct += (predicted_values == labels_raw).sum().item()
+            total_samples += labels_raw.size(0)
+
+        synchronize()
+        train_loss = total_loss / len(train_loader)
+        train_acc = total_correct / total_samples
+
+        # ---- Validate ----
+        model.eval()
+        val_loss = 0.0
+        val_correct = 0
+        val_samples = 0
+
+        with torch.no_grad():
+            for batch in val_loader:
+                input_ids = batch["input_ids"].to(device, non_blocking=True)
+                attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+                labels_norm = batch["final_value_normalized"].to(device, non_blocking=True).float()
+                labels_raw = batch["final_value"].to(device, non_blocking=True)
+
+                predictions = model(input_ids, attention_mask=attention_mask)
+                loss = criterion(predictions.float(), labels_norm.float())
+
+                val_loss += loss.item()
+                predicted_values = (predictions * 100).round().clamp(0, 100)
+                val_correct += (predicted_values == labels_raw).sum().item()
+                val_samples += labels_raw.size(0)
+
+        val_loss_avg = val_loss / len(val_loader)
+        val_acc = val_correct / val_samples
+        epoch_time = time.time() - epoch_start
+
+        if (epoch + 1) % 5 == 0 or epoch == 0 or val_loss_avg < best_val_loss:
+            print(f"  Epoch {epoch+1:3d}/{num_epochs}: "
+                  f"train={train_loss:.4f}/{train_acc:.4f}  "
+                  f"val={val_loss_avg:.4f}/{val_acc:.4f}  [{epoch_time:.1f}s]")
+
+        # Save best
+        if val_loss_avg < best_val_loss:
+            best_val_loss = val_loss_avg
+            save_path = os.path.join(save_dir, "execution_best.pt")
+            torch.save({
+                "model_state_dict": model.state_dict(),
+                "val_loss": val_loss_avg,
+                "val_accuracy": val_acc,
+                "epoch": epoch,
+                "param_count": param_count,
+            }, save_path)
+            print(f"  -> Saved best (val_loss={val_loss_avg:.4f})")
+
+    print(f"\n  Execution done. Best val_loss: {best_val_loss:.4f}")
     return best_val_loss
 
 
@@ -436,8 +559,58 @@ def main():
 
     use_amp = "npu" in str(device)
 
-    # ---- Train transformers ----
+    # ---- Train all models ----
     if not args.skip_training:
+        # ---- Train Execution Model first ----
+        config = SFMConfig.small()
+        execution_sys = ExecutionSystem(
+            input_dim=config.d_model,
+            hidden_dim=config.deltanet_hidden_dim,
+            num_slots=16,
+            slot_dim=config.execution_slot_dim,
+            max_ticks=config.execution_max_ticks,
+            num_heads=config.execution_num_heads,
+            dropout=config.dropout
+        )
+        execution_model = StateTrackingWrapper(
+            execution_sys, tokenizer.vocab_size_actual
+        ).to(device)
+
+        print(f"\nExecution model parameters: {sum(p.numel() for p in execution_model.parameters()):,}")
+
+        # NPU warmup for execution model
+        if "npu" in str(device):
+            print("\nWarming up NPU (execution model)...")
+            warmup_exec = execution_model
+            warmup_exec.train()
+            warmup_opt = torch.optim.SGD(warmup_exec.parameters(), lr=0.0)
+            warmup_batch = next(iter(train_loader))
+
+            for _ in range(3):
+                warmup_opt.zero_grad()
+                ids = warmup_batch["input_ids"].to(device, non_blocking=True)
+                attn_mask = warmup_batch["attention_mask"].to(device, non_blocking=True)
+                out = warmup_exec(ids, attention_mask=attn_mask)
+                loss = F.mse_loss(out.float(),
+                                  warmup_batch["final_value_normalized"].to(device).float())
+                loss.backward()
+                warmup_opt.step()
+
+            synchronize()
+            print("NPU warmup complete (execution)")
+            del warmup_opt
+            torch.npu.empty_cache()
+
+        train_execution(
+            execution_model, train_loader, val_loader, device,
+            save_dir=args.save_dir,
+            num_epochs=args.epochs, lr=1e-3, warmup_steps=200,
+        )
+        del execution_model
+        if "npu" in str(device):
+            torch.npu.empty_cache()
+
+        # ---- Train Transformers ----
         # NPU warmup (3 iterations with real batch shape)
         if "npu" in str(device):
             print("\nWarming up NPU...")
