@@ -26,7 +26,6 @@ def test_single_npu(device_id: int) -> dict:
         props = torch.npu.get_device_properties(device_id)
         result["details"].append(f"  Name: {props.name}")
         result["details"].append(f"  Total memory: {props.total_memory / 1e9:.1f} GB")
-        result["details"].append(f"  Major: {props.major}, Minor: {props.minor}")
 
         # Memory query
         total_mem, free_mem = torch.npu.mem_get_info(device_id)
