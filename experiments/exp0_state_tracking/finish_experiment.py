@@ -605,6 +605,15 @@ def main():
             print(f"Existing data has only {len(existing_train)} samples, "
                   f"regenerating with {min_train_samples}...")
             need_regen = True
+        else:
+            # Validate data format: standard hard programs have at most ~27 lines
+            # (5 init + max_program_length ops + 2 query). If programs are longer,
+            # the data is stale (e.g. from a mixed-length run) and must be regenerated.
+            max_lines = max(s["num_lines"] for s in existing_train[:100])
+            if max_lines > 35:
+                print(f"Stale data detected (max {max_lines} lines, expected <=27), "
+                      f"regenerating with {min_train_samples} standard-length samples...")
+                need_regen = True
     else:
         need_regen = True
 
@@ -707,7 +716,7 @@ def main():
                 warmup_opt.zero_grad()
                 ids = warmup_batch["input_ids"].to(device, non_blocking=True)
                 attn = warmup_batch["attention_mask"].to(device, non_blocking=True)
-                out = execution_model(ids, attention_mask=attn)
+                out, _, _ = execution_model(ids, attention_mask=attn, return_intermediate=True)
                 loss = out.sum()
                 loss.backward()
                 warmup_opt.step()
