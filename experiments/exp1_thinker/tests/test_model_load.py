@@ -2,6 +2,7 @@
 test_model_load.py - Distributed model loading for Thinker (DDP across 4 NPUs)
 
 Tests loading Qwen2.5-Coder-7B-Instruct in DDP across all 4 Ascend NPUs.
+Downloads models from ModelScope, then loads from local path with HuggingFace.
 Tries FP16, BF16, FP32 in order. Falls back to 3B if all 7B configs fail.
 
 Usage:
@@ -11,10 +12,9 @@ Usage:
 import os
 import sys
 import time
+import shutil
 
-# CRITICAL: HF mirror + ASCEND device isolation BEFORE any imports
-os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-
+# CRITICAL: ASCEND device isolation BEFORE any torch/torch_npu imports
 is_torchrun = "RANK" in os.environ and "WORLD_SIZE" in os.environ
 if is_torchrun and "LOCAL_RANK" in os.environ:
     os.environ["ASCEND_RT_VISIBLE_DEVICES"] = os.environ["LOCAL_RANK"]
@@ -32,61 +32,134 @@ import torch.distributed as dist
 # Configurations to try, in order
 # ---------------------------------------------------------------------------
 
+MODEL_DIR = "/home/ma-user/models"
+
 CONFIGS = [
     {
         "name": "A (7B FP16)",
         "model_id": "Qwen/Qwen2.5-Coder-7B-Instruct",
+        "local_path": os.path.join(MODEL_DIR, "Qwen2.5-Coder-7B-Instruct"),
         "dtype": torch.float16,
     },
     {
         "name": "B (7B BF16)",
         "model_id": "Qwen/Qwen2.5-Coder-7B-Instruct",
+        "local_path": os.path.join(MODEL_DIR, "Qwen2.5-Coder-7B-Instruct"),
         "dtype": torch.bfloat16,
     },
     {
         "name": "C (7B FP32)",
         "model_id": "Qwen/Qwen2.5-Coder-7B-Instruct",
+        "local_path": os.path.join(MODEL_DIR, "Qwen2.5-Coder-7B-Instruct"),
         "dtype": torch.float32,
     },
     {
         "name": "D (3B FP16 fallback)",
         "model_id": "Qwen/Qwen2.5-Coder-3B-Instruct",
+        "local_path": os.path.join(MODEL_DIR, "Qwen2.5-Coder-3B-Instruct"),
         "dtype": torch.float16,
     },
 ]
 
 SHORT_PROMPT = "def fibonacci(n):\n    "
+MIN_DISK_GB = 20  # minimum free space required before downloading
+
+
+def check_disk_space(path: str = "/") -> tuple:
+    """Return (total_gb, used_gb, free_gb) for the filesystem containing path."""
+    usage = shutil.disk_usage(path)
+    return usage.total / 1e9, usage.used / 1e9, usage.free / 1e9
+
+
+def delete_model_dir(local_path: str, rank: int) -> None:
+    """Delete a model directory to reclaim disk space. Rank 0 deletes, others wait."""
+    if rank != 0:
+        dist.barrier()
+        return
+
+    if os.path.isdir(local_path):
+        import subprocess
+        print(f"  Deleting {local_path} to reclaim space...", flush=True)
+        subprocess.run(["rm", "-rf", local_path], check=True)
+        print(f"  Deleted.", flush=True)
+    dist.barrier()
+
+
+def download_from_modelscope(model_id: str, local_path: str, rank: int) -> bool:
+    """Download model from ModelScope on rank 0. Other ranks wait at barrier.
+
+    Returns True if download succeeded (or was already cached), False on failure.
+    """
+    if rank != 0:
+        print(f"  Rank {rank}: waiting for rank 0 to download {model_id}...", flush=True)
+        dist.barrier()
+        return os.path.isdir(local_path)
+
+    print(f"\n  Downloading {model_id} from ModelScope...", flush=True)
+
+    # Check disk space before downloading
+    _, _, free_gb = check_disk_space(local_path)
+    print(f"  Disk space before download: {free_gb:.1f} GB free", flush=True)
+    if free_gb < MIN_DISK_GB:
+        print(f"  ABORT: Only {free_gb:.1f} GB free (need {MIN_DISK_GB} GB)")
+        return False
+
+    try:
+        from modelscope import snapshot_download
+        snapshot_download(model_id, local_dir=local_path)
+        print(f"  Downloaded to {local_path}")
+        return True
+    except ImportError:
+        print(f"  modelscope not installed, installing...", flush=True)
+        import subprocess
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "modelscope", "-q"])
+        from modelscope import snapshot_download
+        snapshot_download(model_id, local_dir=local_path)
+        print(f"  Downloaded to {local_path}")
+        return True
+    except Exception as e:
+        print(f"  Download FAILED: {e}")
+        return False
 
 
 def try_load_ddp(config: dict, rank: int, world_size: int) -> tuple:
-    """Try loading a model in DDP. Returns (model, tokenizer, config) or (None, None, config)."""
+    """Try loading a model in DDP from local path. Returns (model, tokenizer, config) or (None, None, config)."""
     import torch_npu
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     device = torch.device("npu:0")
     torch.npu.set_device(device)
+    local_path = config["local_path"]
 
     if rank == 0:
         print(f"\n--- Trying CONFIG {config['name']} ---")
-        print(f"  Model: {config['model_id']}")
-        print(f"  Dtype: {config['dtype']}")
-        print(f"  World size: {world_size}")
-        print(f"  Loading model on rank 0...", flush=True)
+        print(f"  Model:   {config['model_id']}")
+        print(f"  Path:    {local_path}")
+        print(f"  Dtype:  {config['dtype']}")
+        print(f"  World:   {world_size}")
+        print(f"  Loading model...", flush=True)
 
-    dist.barrier()
+    # Rank 0 downloads, others wait
+    if not os.path.isdir(local_path):
+        if not download_from_modelscope(config["model_id"], local_path, rank):
+            dist.barrier()
+            return None, None, config
+    else:
+        if rank == 0:
+            print(f"  Model already cached at {local_path}")
+        dist.barrier()
 
     try:
         tokenizer = AutoTokenizer.from_pretrained(
-            config["model_id"], trust_remote_code=True
+            local_path, trust_remote_code=True
         )
         model = AutoModelForCausalLM.from_pretrained(
-            config["model_id"],
+            local_path,
             torch_dtype=config["dtype"],
             trust_remote_code=True,
         )
         model = model.to(device)
 
-        # Sync all ranks have model loaded
         dist.barrier()
 
         ddp_model = nn.parallel.DistributedDataParallel(
@@ -139,7 +212,7 @@ def test_generation(model, tokenizer, device, prompt: str,
     _, free_mem = torch.npu.mem_get_info(0)
     free_mem_gb = free_mem / 1e9
 
-    dist.barrier()  # sync after generation
+    dist.barrier()
 
     return {
         "text": generated_text,
@@ -160,9 +233,7 @@ def test_training_step(model, tokenizer, rank: int, world_size: int, device: tor
 
     torch.npu.reset_peak_memory_stats(device)
 
-    # Create dummy batch (same on all ranks for consistency)
     torch.manual_seed(42)
-    batch_size = 4
     inputs = tokenizer(
         "def add(a, b):\n    return a + b\n\nprint(add(1, 2))",
         return_tensors="pt",
@@ -171,7 +242,6 @@ def test_training_step(model, tokenizer, rank: int, world_size: int, device: tor
         max_length=128,
     ).to(device)
 
-    # Forward
     try:
         outputs = model(**inputs, labels=inputs["input_ids"])
         loss = outputs.loss
@@ -181,7 +251,6 @@ def test_training_step(model, tokenizer, rank: int, world_size: int, device: tor
         dist.barrier()
         return False
 
-    # Backward
     try:
         loss.backward()
     except Exception as e:
@@ -190,7 +259,6 @@ def test_training_step(model, tokenizer, rank: int, world_size: int, device: tor
         dist.barrier()
         return False
 
-    # Verify gradients exist on all ranks
     has_grad = sum(1 for p in model.parameters() if p.grad is not None)
     total_p = sum(1 for p in model.parameters())
 
@@ -216,10 +284,10 @@ def main():
         print(f"torch version:     {torch.__version__}")
         print(f"torch_npu version: {torch_npu.__version__}")
         print(f"World size:       {world_size}")
+        print(f"Model source:     ModelScope -> {MODEL_DIR}/")
 
     device = torch.device("npu:0")
 
-    # Initialize process group
     dist.init_process_group(backend="hccl")
     dist.barrier()
 
@@ -228,19 +296,31 @@ def main():
         print(f"HBM per device:   {total_hbm:.1f} GB")
         print(f"Total HBM (4x):   {total_hbm * world_size:.1f} GB")
 
-    # Try configs in order
     model = None
     tokenizer = None
     working_config = None
+    prev_local_path = None  # track previous model dir for cleanup
+
+    # Print initial disk space
+    _, _, free_gb = check_disk_space("/")
+    if rank == 0:
+        print(f"Disk space: {free_gb:.1f} GB free")
 
     for config in CONFIGS:
-        # Destroy previous DDP model if any
         if model is not None:
             del model
             if "npu" in str(device):
                 torch.npu.empty_cache()
 
+        # Delete previous model files if a different model is needed
+        if prev_local_path is not None and config["local_path"] != prev_local_path:
+            delete_model_dir(prev_local_path, rank)
+            _, _, free_gb = check_disk_space("/")
+            if rank == 0:
+                print(f"Disk space after cleanup: {free_gb:.1f} GB free")
+
         model, tokenizer, working_config = try_load_ddp(config, rank, world_size)
+        prev_local_path = config["local_path"]
         if model is not None:
             break
 
@@ -250,13 +330,13 @@ def main():
         dist.destroy_process_group()
         sys.exit(1)
 
-    # --- Generation test (rank 0 only) ---
+    # Generation test (rank 0 only)
     metrics = test_generation(model, tokenizer, device, SHORT_PROMPT, max_new_tokens=50)
 
-    # --- Training step test (all ranks) ---
+    # Training step test (all ranks)
     train_ok = test_training_step(model, tokenizer, rank, world_size, device)
 
-    # --- Summary (rank 0 only) ---
+    # Summary (rank 0 only)
     if rank == 0:
         cfg = working_config
         dtype_name = str(cfg["dtype"]).replace("torch.", "")
@@ -273,15 +353,12 @@ def main():
         print(f"  Generation:  {metrics['tokens_per_sec']:.1f} tokens/sec")
         print(f"  Training:    {'PASS' if train_ok else 'FAIL'}")
 
-        # Memory headroom for training
         model_mem = metrics["peak_memory_gb"]
         free = metrics["free_memory_gb"]
-        # DDP model params: gradients ~1x model, optimizer (AdamW) ~2x model
-        # But for LoRA/adapter-only training: gradients + optimizer ~0.5x model
-        lora_overhead = 1.5   # rank 16 LoRA
-        sfm_overhead = 0.2    # SFM slot adapters
-        grad_opt = model_mem * 0.5  # adapter gradients + optimizer states
-        activation_overhead = 2.0  # activations + KV cache
+        lora_overhead = 1.5
+        sfm_overhead = 0.2
+        grad_opt = model_mem * 0.5
+        activation_overhead = 2.0
         total_overhead = lora_overhead + sfm_overhead + grad_opt + activation_overhead
         net_headroom = free - total_overhead
 
@@ -295,7 +372,6 @@ def main():
         print(f"    Total overhead:~{total_overhead:.1f} GB")
         print(f"    Net headroom:  ~{net_headroom:.1f} GB")
 
-        # Estimate max batch size (rough: activations scale linearly)
         if net_headroom > 4.0:
             est_batch = max(1, int(net_headroom / 2.0))
         else:
@@ -311,7 +387,6 @@ def main():
               f"{world_size}x NPU DDP) is "
               f"{'FEASIBLE' if feasible else 'NOT FEASIBLE'}")
 
-        # Write results to file
         results_path = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             "tests", "model_load_results.txt"
