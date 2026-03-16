@@ -13,29 +13,84 @@ Usage:
 
 import os
 import sys
+import time
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.multiprocessing as mp
 
 
+# HCCL requires these environment variables for correct multi-NPU operation
+HCCL_ENV_VARS = {
+    "TASK_QUEUE_ENABLE": "2",
+    "CPU_AFFINITY_CONF": "1",
+    "HCCL_OP_EXPANSION_MODE": "AIV",
+    "HCCL_DETERMINISTIC": "1",
+}
+
+
+def setup_hccl_env(rank: int):
+    """Set HCCL environment variables before init."""
+    for key, val in HCCL_ENV_VARS.items():
+        if key not in os.environ:
+            os.environ[key] = val
+    # Each rank must only see its own device for HCCL
+    if "ASCEND_RT_VISIBLE_DEVICES" not in os.environ:
+        os.environ["ASCEND_RT_VISIBLE_DEVICES"] = str(rank)
+
+
+def try_init_process_group(backend: str, rank: int, world_size: int, retries: int = 2, delay: int = 10):
+    """Try initializing process group with retries for HCCL."""
+    for attempt in range(retries):
+        try:
+            dist.init_process_group(
+                backend=backend,
+                rank=rank,
+                world_size=world_size,
+                init_method="env://"
+            )
+            dist.barrier()
+            return True
+        except RuntimeError as e:
+            if attempt < retries - 1 and "hccl" in str(e).lower():
+                print(f"Rank {rank}: HCCL init failed (attempt {attempt+1}), "
+                      f"retrying in {delay}s... Error: {e}", flush=True)
+                try:
+                    dist.destroy_process_group()
+                except Exception:
+                    pass
+                time.sleep(delay)
+            else:
+                raise
+    return False
+
+
 def worker(rank: int, world_size: int, backend: str):
     """DDP worker function."""
+    import torch_npu
+
+    # Set device BEFORE process group init (critical for HCCL)
+    setup_hccl_env(rank)
+    device = torch.device(f"npu:{rank}")
+    torch.npu.set_device(device)
+
     try:
-        import torch_npu
-
-        # Initialize process group
-        dist.init_process_group(
-            backend=backend,
-            rank=rank,
-            world_size=world_size,
-            init_method="env://"
-        )
-        dist.barrier()  # all ranks must join before proceeding
-
-        # Explicitly set device before model creation
-        device = torch.device(f"npu:{rank}")
-        torch.npu.set_device(device)
+        # Initialize process group with retries
+        try:
+            try_init_process_group(backend, rank, world_size)
+            print(f"Rank {rank}: {backend} backend initialized on {device}", flush=True)
+        except RuntimeError as e:
+            if backend == "hccl":
+                print(f"Rank {rank}: HCCL failed after retries, trying gloo...", flush=True)
+                try:
+                    dist.destroy_process_group()
+                except Exception:
+                    pass
+                backend = "gloo"
+                try_init_process_group(backend, rank, world_size)
+                print(f"Rank {rank}: gloo backend initialized (HCCL unavailable)", flush=True)
+            else:
+                raise
 
         # Create model on this rank's NPU
         model = nn.Sequential(
@@ -51,8 +106,9 @@ def worker(rank: int, world_size: int, backend: str):
             model, device_ids=[rank], output_device=rank
         )
 
-        # Create dummy batch (same seed-like data on all ranks for consistency)
+        # Create dummy batch
         batch_size = 16
+        torch.manual_seed(42)  # same data on all ranks
         inputs = torch.randn(batch_size, 512, device=device)
         labels = torch.randint(0, 10, (batch_size,), device=device)
 
@@ -62,6 +118,7 @@ def worker(rank: int, world_size: int, backend: str):
         dist.barrier()  # all ranks ready before training
 
         # Training loop: 10 steps
+        train_ok = True
         try:
             for step in range(10):
                 optimizer.zero_grad()
@@ -70,11 +127,10 @@ def worker(rank: int, world_size: int, backend: str):
                 loss.backward()
                 optimizer.step()
 
-                if rank == 0:
-                    print(f"  Step {step}: loss={loss.item():.4f}", flush=True)
+                print(f"  Rank {rank} Step {step}: loss={loss.item():.4f}", flush=True)
         except Exception as train_err:
-            print(f"Rank {rank} on npu:{rank} -- TRAINING FAIL at step: {train_err}",
-                  flush=True)
+            print(f"Rank {rank} on npu:{rank} -- TRAINING FAIL: {train_err}", flush=True)
+            train_ok = False
 
         # All-reduce verification
         dist.barrier()
@@ -83,15 +139,19 @@ def worker(rank: int, world_size: int, backend: str):
         expected = world_size * (world_size + 1) / 2  # sum(1..world_size)
         all_reduce_ok = abs(test_tensor.item() - expected) < 0.01
 
-        if all_reduce_ok:
+        dist.barrier()
+
+        if all_reduce_ok and train_ok:
             print(f"Rank {rank} on npu:{rank} -- DDP PASS "
                   f"(10 steps completed, all-reduce verified: "
-                  f"got {test_tensor.item():.1f}, expected {expected:.1f})",
+                  f"got {test_tensor.item():.1f}, expected {expected:.1f}, "
+                  f"backend={backend})",
                   flush=True)
         else:
             print(f"Rank {rank} on npu:{rank} -- DDP PARTIAL "
-                  f"(10 steps completed, all-reduce MISMATCH: "
-                  f"got {test_tensor.item():.1f}, expected {expected:.1f})",
+                  f"(train={'ok' if train_ok else 'FAIL'}, "
+                  f"all_reduce={'ok' if all_reduce_ok else 'FAIL'}, "
+                  f"backend={backend})",
                   flush=True)
 
         dist.destroy_process_group()
@@ -107,7 +167,7 @@ def worker(rank: int, world_size: int, backend: str):
 
 
 def run_with_torchrun(backend: str):
-    """Standard torchrun entry point — env vars set by torchrun."""
+    """Standard torchrun entry point -- env vars set by torchrun."""
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     worker(rank, world_size, backend)
@@ -145,22 +205,10 @@ def main():
     if is_torchrun:
         print(f"Launched via torchrun: RANK={os.environ['RANK']}, "
               f"WORLD_SIZE={os.environ['WORLD_SIZE']}")
-        print(f"Attempting HCCL backend...")
-        try:
-            run_with_torchrun(backend)
-        except Exception as e:
-            print(f"HCCL failed: {e}")
-            print(f"Falling back to gloo backend...")
-            run_with_torchrun("gloo")
+        run_with_torchrun(backend)
     else:
         print(f"Manual spawn mode (world_size={world_size})")
-        print(f"Attempting HCCL backend...")
-        try:
-            run_manual_spawn(backend, world_size)
-        except Exception as e:
-            print(f"HCCL failed: {e}")
-            print(f"Falling back to gloo backend...")
-            run_manual_spawn("gloo", world_size)
+        run_manual_spawn(backend, world_size)
 
 
 if __name__ == "__main__":
