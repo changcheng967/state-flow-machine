@@ -8,8 +8,6 @@ State Flow Machine replaces the single-transformer paradigm with 4 specialized s
 
 **System 2 (Execution)** is the breakthrough. It uses a State Slot Bank — 16 explicit memory registers that bind to variables and track their values through execution. Each slot uses a Gated DeltaNet recurrent cell (ICLR 2025) with a forget gate that controls state retention vs injection, enabling proper variable reassignment tracking. Intermediate state supervision provides training signal at every token position, not just the final output. The system processes statements sequentially with adaptive compute (1-8 internal ticks per statement).
 
-See [CLAUDE.md](CLAUDE.md) for the full 4-system architecture and repository structure.
-
 ## Experiment 0: Result — PASS
 
 ### Task
