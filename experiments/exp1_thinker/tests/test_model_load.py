@@ -97,8 +97,10 @@ def download_from_modelscope(model_id: str, local_path: str, rank: int) -> bool:
 
     print(f"\n  Downloading {model_id} from ModelScope...", flush=True)
 
-    # Check disk space before downloading
-    _, _, free_gb = check_disk_space(local_path)
+    # Check disk space before downloading (use parent dir since local_path may not exist yet)
+    parent_dir = os.path.dirname(local_path)
+    os.makedirs(parent_dir, exist_ok=True)
+    _, _, free_gb = check_disk_space(parent_dir)
     print(f"  Disk space before download: {free_gb:.1f} GB free", flush=True)
     if free_gb < MIN_DISK_GB:
         print(f"  ABORT: Only {free_gb:.1f} GB free (need {MIN_DISK_GB} GB)")
