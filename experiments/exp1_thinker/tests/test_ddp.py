@@ -22,23 +22,20 @@ import torch.multiprocessing as mp
 def worker(rank: int, world_size: int, backend: str):
     """DDP worker function."""
     try:
-        # Initialize process group
-        if backend == "hccl":
-            dist.init_process_group(
-                backend=backend,
-                rank=rank,
-                world_size=world_size,
-                init_method="env://"
-            )
-        else:
-            dist.init_process_group(
-                backend=backend,
-                rank=rank,
-                world_size=world_size,
-                init_method="env://"
-            )
+        import torch_npu
 
+        # Initialize process group
+        dist.init_process_group(
+            backend=backend,
+            rank=rank,
+            world_size=world_size,
+            init_method="env://"
+        )
+        dist.barrier()  # all ranks must join before proceeding
+
+        # Explicitly set device before model creation
         device = torch.device(f"npu:{rank}")
+        torch.npu.set_device(device)
 
         # Create model on this rank's NPU
         model = nn.Sequential(
@@ -47,12 +44,14 @@ def worker(rank: int, world_size: int, backend: str):
             nn.Linear(512, 10)
         ).to(device)
 
+        dist.barrier()  # all ranks have model ready before DDP wrap
+
         # Wrap with DDP
         ddp_model = nn.parallel.DistributedDataParallel(
             model, device_ids=[rank], output_device=rank
         )
 
-        # Create dummy batch
+        # Create dummy batch (same seed-like data on all ranks for consistency)
         batch_size = 16
         inputs = torch.randn(batch_size, 512, device=device)
         labels = torch.randint(0, 10, (batch_size,), device=device)
@@ -60,18 +59,25 @@ def worker(rank: int, world_size: int, backend: str):
         # Optimizer
         optimizer = torch.optim.SGD(ddp_model.parameters(), lr=0.01)
 
-        # Training loop: 10 steps
-        for step in range(10):
-            optimizer.zero_grad()
-            outputs = ddp_model(inputs)
-            loss = nn.functional.cross_entropy(outputs, labels)
-            loss.backward()
-            optimizer.step()
+        dist.barrier()  # all ranks ready before training
 
-            if rank == 0 and step == 0:
-                print(f"  Step {step}: loss={loss.item():.4f}", flush=True)
+        # Training loop: 10 steps
+        try:
+            for step in range(10):
+                optimizer.zero_grad()
+                outputs = ddp_model(inputs)
+                loss = nn.functional.cross_entropy(outputs, labels)
+                loss.backward()
+                optimizer.step()
+
+                if rank == 0:
+                    print(f"  Step {step}: loss={loss.item():.4f}", flush=True)
+        except Exception as train_err:
+            print(f"Rank {rank} on npu:{rank} -- TRAINING FAIL at step: {train_err}",
+                  flush=True)
 
         # All-reduce verification
+        dist.barrier()
         test_tensor = torch.tensor([rank + 1.0], device=device)
         dist.all_reduce(test_tensor, op=dist.ReduceOp.SUM)
         expected = world_size * (world_size + 1) / 2  # sum(1..world_size)
@@ -92,6 +98,8 @@ def worker(rank: int, world_size: int, backend: str):
 
     except Exception as e:
         print(f"Rank {rank} on npu:{rank} -- DDP FAIL: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
         try:
             dist.destroy_process_group()
         except Exception:
