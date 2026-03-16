@@ -416,7 +416,7 @@ def run_one_config(model, optimizer, device, config, rank, world_size):
         free_hbm = 0.0
         try:
             peak_hbm = torch.npu.max_memory_allocated(device) / 1e9
-            _, free_mem = torch.npu.mem_get_info(device.index if device.index is not None else 0)
+            free_mem, _ = torch.npu.mem_get_info(device.index if device.index is not None else 0)
             free_hbm = free_mem / 1e9
             torch.npu.reset_peak_memory_stats(device)
         except (AttributeError, RuntimeError):
@@ -458,14 +458,15 @@ def print_results(results, world_size, output_path):
         f"{'Peak HBM':>9} | {'Free HBM':>9}")
     log("-" * 100)
 
-    for r in results:
+    for i, r in enumerate(results):
+        cfg = BENCHMARK_CONFIGS[i]
         if r is not None:
             log(f"{r['name']:>3} | {r['batch_size']:>5} | {r['seq_len']:>6} | "
                 f"{r['tokens_per_step']:>9,} | {r['tokens_per_sec_dev']:>10.1f} | "
                 f"{r['tokens_per_sec_total']:>12.1f} | {r['avg_ms_per_step']:>8.1f} | "
                 f"{r['peak_hbm_gb']:>8.2f}G | {r['free_hbm_gb']:>8.2f}G")
         else:
-            log(f"{r['name']:>3} | {'OOM':>5}")
+            log(f"{cfg['name']:>3} | B={cfg['batch_size']:<4} | S={cfg['seq_len']:<5} | OOM")
 
     # Best config
     valid = [r for r in results if r is not None]
@@ -489,7 +490,8 @@ def print_results(results, world_size, output_path):
         f.write("=" * 100 + "\n")
         f.write(f"World size: {world_size} NPUs\n")
         f.write(f"Warmup: {WARMUP_STEPS} steps, Measure: {MEASURE_STEPS} steps\n\n")
-        for r in results:
+        for i, r in enumerate(results):
+            cfg = BENCHMARK_CONFIGS[i]
             if r is not None:
                 f.write(f"Config {r['name']}: B={r['batch_size']}, S={r['seq_len']}\n")
                 f.write(f"  tok/step={r['tokens_per_step']:,}, "
@@ -499,7 +501,8 @@ def print_results(results, world_size, output_path):
                         f"peak_hbm={r['peak_hbm_gb']:.2f}GB, "
                         f"free_hbm={r['free_hbm_gb']:.2f}GB\n\n")
             else:
-                f.write(f"Config {r['name']}: OOM\n\n")
+                f.write(f"Config {cfg['name']}: B={cfg['batch_size']}, "
+                        f"S={cfg['seq_len']} — OOM\n\n")
 
         if valid:
             best = max(valid, key=lambda x: x["tokens_per_sec_dev"])
@@ -517,8 +520,42 @@ def print_results(results, world_size, output_path):
 # =============================================================================
 
 def main():
-    args = parse_args()
+    import traceback
 
+    args = parse_args()
+    # Shared mutable container so _main_inner can update output_path for crash handler
+    ctx = {"output_path": "/tmp/sfm_throughput_output"}
+
+    try:
+        _main_inner(args, ctx)
+    except Exception:
+        # Log full traceback to both stdout and log file
+        tb = traceback.format_exc()
+        log(f"\n{'='*80}")
+        log("FATAL ERROR — saving partial results and uploading logs")
+        log(f"{'='*80}")
+        log(tb)
+
+        # Try to save partial results and upload
+        try:
+            crash_dir = ctx["output_path"]
+            os.makedirs(crash_dir, exist_ok=True)
+            crash_path = os.path.join(crash_dir, "CRASH_LOG.txt")
+            with open(crash_path, "w") as f:
+                f.write(tb)
+            log(f"Crash log saved to {crash_path}")
+            try:
+                upload_output()
+                log("Partial results uploaded.")
+            except Exception as upload_err:
+                log(f"Upload failed: {upload_err}")
+        except Exception as save_err:
+            log(f"Could not save crash log: {save_err}")
+
+        raise
+
+
+def _main_inner(args, ctx):
     # ------------------------------------------------------------------
     # Local test mode (syntax/import check, no Ascend hardware)
     # ------------------------------------------------------------------
@@ -575,12 +612,13 @@ def main():
 
     # c2net prepare — rank 0 first, others wait for flag file
     c2net_ctx = None
-    output_path = "/tmp/sfm_throughput_output"
+    output_path = ctx["output_path"]
 
     if rank_id == 0:
         log("Rank 0: calling c2net prepare()...")
         c2net_ctx = prepare()
         output_path = c2net_ctx.output_path
+        ctx["output_path"] = output_path
         os.makedirs(output_path, exist_ok=True)
         configure_file_logging(output_path)
 
@@ -605,18 +643,19 @@ def main():
         log(f"Rank {rank_id}: calling c2net prepare()...")
         c2net_ctx = prepare()
         output_path = c2net_ctx.output_path
+        ctx["output_path"] = output_path
         os.makedirs(output_path, exist_ok=True)
         configure_file_logging(output_path)
 
     # Determine model path
     model_path = args.model_path
     if not model_path:
-        # Try c2net context paths
-        for attr in ["pretrain_model_path", "model_path"]:
-            p = getattr(c2net_ctx, attr, None)
-            if p:
-                model_path = p
-                break
+        # c2net pretrain_model_path is a root dir; append the model folder name
+        pmp = getattr(c2net_ctx, "pretrain_model_path", None)
+        if pmp:
+            model_path = os.path.join(pmp, "Qwen2.5-Coder-7B")
+        else:
+            model_path = getattr(c2net_ctx, "model_path", None)
 
     if not model_path:
         log("ERROR: No model path provided. Use --model_path or configure c2net dataset.")
@@ -637,7 +676,6 @@ def main():
         ("TASK_QUEUE_ENABLE", "2"),
         ("CPU_AFFINITY_CONF", "1"),
         ("HCCL_OP_EXPANSION_MODE", "AIV"),
-        ("HCCL_DETERMINISTIC", "true"),
     ]:
         if key not in os.environ:
             os.environ[key] = val
@@ -652,9 +690,10 @@ def main():
         log(f"torch_npu version: {torch_npu.__version__}")
         log(f"Distributed:       {world_size} NPUs, backend=hccl")
 
-        # HBM info
+        # HBM info — mem_get_info returns (free, total)
         try:
-            total_hbm = torch.npu.mem_get_info(0)[0] / 1e9
+            free_hbm_init, total_hbm = torch.npu.mem_get_info(0)
+            total_hbm /= 1e9
             log(f"HBM per device:   {total_hbm:.1f} GB")
             log(f"Total HBM (4x):   {total_hbm * world_size:.1f} GB")
         except Exception as e:
@@ -787,4 +826,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import traceback
+    try:
+        main()
+    except Exception:
+        print(traceback.format_exc(), flush=True)
+        raise
