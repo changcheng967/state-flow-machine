@@ -7,11 +7,9 @@ single NPU (no DDP), then evaluates all three on length generalization at
 
 v3 changes:
 - Fair comparison: transformers use 101-class CE (same as execution model)
-- Mixed-length training: 60% 10-27, 20% 28-50, 15% 51-80, 5% 81-120 ops
 - State passing: carry detached recurrent state across training batches
 - LR grid search for both execution and transformer models
 - Extended evaluation up to 32x (320 ops)
-- max_length=512 for longer programs
 
 Usage:
     python experiments/exp0_state_tracking/finish_experiment.py
@@ -39,7 +37,7 @@ from sfm.utils.device import get_device, set_seed, synchronize
 from baseline_transformer import TransformerEncoderOnly, StateTrackingWrapper
 from dataset import create_dataloaders
 from evaluate import Evaluator, generate_test_programs
-from generate_data import generate_mixed_length_dataset, SimpleProgramGenerator
+from generate_data import generate_and_save
 
 
 NUM_CLASSES = 101  # values 0-100
@@ -612,31 +610,16 @@ def main():
 
     if need_regen:
         os.makedirs(data_dir, exist_ok=True)
-
-        # Training data: mixed-length for generalization (v3)
-        print(f"Generating MIXED-LENGTH training data: {min_train_samples} samples, "
+        print(f"Generating data: {min_train_samples} train / 1000 val, "
               f"difficulty={args.difficulty}, seed=42...")
-        train_data = generate_mixed_length_dataset(
-            num_samples=min_train_samples,
-            include_trace=True,
-            seed=42
+        generate_and_save(
+            output_dir=data_dir,
+            train_samples=min_train_samples,
+            val_samples=1000,
+            max_program_length=20,
+            seed=42,
+            difficulty=args.difficulty
         )
-        train_path_for_save = os.path.join(data_dir, "train.json")
-        with open(train_path_for_save, 'w') as f:
-            json.dump(train_data, f, indent=2)
-        print(f"Saved mixed-length training data to {train_path_for_save}")
-
-        # Validation data: standard hard range (10-27 ops) for comparable metrics
-        print(f"Generating validation data: 1000 samples (standard range)...")
-        val_gen = SimpleProgramGenerator(
-            num_variables=5, max_program_length=20,
-            seed=42, difficulty=args.difficulty
-        )
-        val_data = val_gen.generate_dataset(1000)
-        val_path_save = os.path.join(data_dir, "val.json")
-        with open(val_path_save, 'w') as f:
-            json.dump(val_data, f, indent=2)
-        print(f"Saved validation data to {val_path_save}")
 
     # ---- Build / load tokenizer ----
     with open(train_path, 'r') as f:
@@ -651,7 +634,7 @@ def main():
     train_loader, val_loader = create_dataloaders(
         data_dir, tokenizer,
         batch_size=args.batch_size,
-        max_length=512,
+        max_length=200,
         distributed=False, rank=0, world_size=1
     )
     print(f"Data: {len(train_loader.dataset)} train, {len(val_loader.dataset)} val samples")
@@ -724,7 +707,7 @@ def main():
                 warmup_opt.zero_grad()
                 ids = warmup_batch["input_ids"].to(device, non_blocking=True)
                 attn = warmup_batch["attention_mask"].to(device, non_blocking=True)
-                out, _ = execution_model(ids, attention_mask=attn, return_intermediate=True)
+                out = execution_model(ids, attention_mask=attn)
                 loss = out.sum()
                 loss.backward()
                 warmup_opt.step()
