@@ -71,7 +71,8 @@ def worker(rank: int, world_size: int, backend: str):
 
     # Set device BEFORE process group init (critical for HCCL)
     setup_hccl_env(rank)
-    device = torch.device(f"npu:{rank}")
+    # When ASCEND_RT_VISIBLE_DEVICES=rank, each rank sees exactly 1 NPU at index 0
+    device = torch.device("npu:0")
     torch.npu.set_device(device)
 
     try:
@@ -101,9 +102,9 @@ def worker(rank: int, world_size: int, backend: str):
 
         dist.barrier()  # all ranks have model ready before DDP wrap
 
-        # Wrap with DDP
+        # Wrap with DDP (device_ids uses local index, always 0 with ASCEND_RT_VISIBLE_DEVICES)
         ddp_model = nn.parallel.DistributedDataParallel(
-            model, device_ids=[rank], output_device=rank
+            model, device_ids=[0], output_device=0
         )
 
         # Create dummy batch
@@ -129,7 +130,7 @@ def worker(rank: int, world_size: int, backend: str):
 
                 print(f"  Rank {rank} Step {step}: loss={loss.item():.4f}", flush=True)
         except Exception as train_err:
-            print(f"Rank {rank} on npu:{rank} -- TRAINING FAIL: {train_err}", flush=True)
+            print(f"Rank {rank} (physical npu:{rank}) -- TRAINING FAIL: {train_err}", flush=True)
             train_ok = False
 
         # All-reduce verification
@@ -142,13 +143,13 @@ def worker(rank: int, world_size: int, backend: str):
         dist.barrier()
 
         if all_reduce_ok and train_ok:
-            print(f"Rank {rank} on npu:{rank} -- DDP PASS "
+            print(f"Rank {rank} (physical npu:{rank}) -- DDP PASS "
                   f"(10 steps completed, all-reduce verified: "
                   f"got {test_tensor.item():.1f}, expected {expected:.1f}, "
                   f"backend={backend})",
                   flush=True)
         else:
-            print(f"Rank {rank} on npu:{rank} -- DDP PARTIAL "
+            print(f"Rank {rank} (physical npu:{rank}) -- DDP PARTIAL "
                   f"(train={'ok' if train_ok else 'FAIL'}, "
                   f"all_reduce={'ok' if all_reduce_ok else 'FAIL'}, "
                   f"backend={backend})",
@@ -157,7 +158,7 @@ def worker(rank: int, world_size: int, backend: str):
         dist.destroy_process_group()
 
     except Exception as e:
-        print(f"Rank {rank} on npu:{rank} -- DDP FAIL: {e}", flush=True)
+        print(f"Rank {rank} (physical npu:{rank}) -- DDP FAIL: {e}", flush=True)
         import traceback
         traceback.print_exc()
         try:
