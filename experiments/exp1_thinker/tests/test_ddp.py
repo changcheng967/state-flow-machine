@@ -30,13 +30,10 @@ HCCL_ENV_VARS = {
 
 
 def setup_hccl_env(rank: int):
-    """Set HCCL environment variables before init."""
+    """Set HCCL environment variables (ASCEND_RT_VISIBLE_DEVICES handled in main)."""
     for key, val in HCCL_ENV_VARS.items():
         if key not in os.environ:
             os.environ[key] = val
-    # Each rank must only see its own device for HCCL
-    if "ASCEND_RT_VISIBLE_DEVICES" not in os.environ:
-        os.environ["ASCEND_RT_VISIBLE_DEVICES"] = str(rank)
 
 
 def try_init_process_group(backend: str, rank: int, world_size: int, retries: int = 2, delay: int = 10):
@@ -189,23 +186,33 @@ def run_manual_spawn(backend: str, world_size: int = 4):
 
 
 def main():
+    # CRITICAL: Set ASCEND_RT_VISIBLE_DEVICES BEFORE importing torch_npu.
+    # torch_npu initializes the driver on first import, and the visible
+    # devices cannot be changed after that.
+    is_torchrun = "RANK" in os.environ and "WORLD_SIZE" in os.environ
+    if is_torchrun and "LOCAL_RANK" in os.environ:
+        local_rank = int(os.environ["LOCAL_RANK"])
+        os.environ["ASCEND_RT_VISIBLE_DEVICES"] = str(local_rank)
+        # Also set HCCL env vars before import
+        for key, val in HCCL_ENV_VARS.items():
+            if key not in os.environ:
+                os.environ[key] = val
+
     print("=" * 60)
     print("Thinker-3B Hardware Validation: Multi-NPU DDP")
     print("=" * 60)
 
     import torch_npu
     n_devices = torch.npu.device_count()
-    print(f"NPU devices available: {n_devices}")
-
-    # Determine if launched via torchrun or manual
-    is_torchrun = "RANK" in os.environ and "WORLD_SIZE" in os.environ
+    print(f"NPU devices available (visible to this rank): {n_devices}")
+    if is_torchrun:
+        print(f"RANK={os.environ['RANK']}, LOCAL_RANK={os.environ.get('LOCAL_RANK')}, "
+              f"WORLD_SIZE={os.environ['WORLD_SIZE']}")
 
     backend = "hccl"
     world_size = int(os.environ.get("WORLD_SIZE", n_devices))
 
     if is_torchrun:
-        print(f"Launched via torchrun: RANK={os.environ['RANK']}, "
-              f"WORLD_SIZE={os.environ['WORLD_SIZE']}")
         run_with_torchrun(backend)
     else:
         print(f"Manual spawn mode (world_size={world_size})")
