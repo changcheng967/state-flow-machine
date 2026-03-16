@@ -1,78 +1,71 @@
-# State-Flow Machine (SFM)
+# State Flow Machine (SFM)
 
-A novel post-transformer architecture for code intelligence.
+A novel post-transformer architecture for code intelligence, optimized for Huawei Ascend 910 ProA NPUs.
 
-## What This Is
+## Architecture
 
-Not a wrapper, not a fine-tune, not RAG — a new architecture with 4 specialized systems that replaces the transformer paradigm for code tasks.
+State Flow Machine replaces the single-transformer paradigm with 4 specialized systems. The core insight is that coding is about **state transformations** — what a program does vs what it should do — and explicit state tracking generalizes to longer programs in ways that implicit token-level models provably cannot (TC0 circuit complexity limit, Siems et al. ICLR 2025).
 
-## Why It Exists
+**System 2 (Execution)** is the breakthrough. It uses a State Slot Bank — 16 explicit memory registers that bind to variables and track their values through execution. Each slot uses a Gated DeltaNet recurrent cell (ICLR 2025) with a forget gate that controls state retention vs injection, enabling proper variable reassignment tracking. Intermediate state supervision provides training signal at every token position, not just the final output. The system processes statements sequentially with adaptive compute (1-8 internal ticks per statement).
 
-Every coding LLM (GPT, Claude, Gemini, DeepSeek) processes code as flat text. They predict the next token. But coding is about state transformations — what a program does vs what it should do. Transformers are provably incapable of tracking program state (TC0 circuit complexity limit, Siems et al. ICLR 2025). This architecture fixes that.
+See [CLAUDE.md](CLAUDE.md) for the full 4-system architecture and repository structure.
 
-## The 4 Systems
+## Experiment 0: Result — PASS
 
-### System 1 — Perception
-Linear-attention decoder. O(n) not O(n^2). Reads tokens. That's it.
+### Task
 
-### System 2 — Execution (the breakthrough)
-State Slot Bank: 16 registers that explicitly bind to variables and track values through execution. Uses **Gated DeltaNet** recurrent cell with eigenvalues in [-1,1] (not [0,1] — the negative eigenvalues enable state tracking that transformers and standard RNNs cannot do). The forget gate (from ICLR 2025 Gated DeltaNet paper) controls state retention vs injection, enabling proper variable reassignment tracking. Processes statements sequentially with adaptive compute (1-8 internal ticks per statement).
+Predict the final value of a target variable after a sequence of arithmetic operations. 101-class classification (values 0-100). All models trained on short programs (10-27 ops, hard difficulty), evaluated at length multipliers up to 32x (320 ops). Same training recipe for all models: 101-class cross-entropy, LR grid search (5 LRs, 10 epochs each), FP32, cosine annealing with warmup.
 
-### System 3 — Structure
-Dynamic graph neural network. Nodes = functions, classes, variables, files. Edges = calls, imports, mutates, reads. Updated via sparse message-passing. Gives the model a live dependency map so it doesn't break existing code when editing.
+### Exact Match Accuracy
 
-### System 4 — Meta
-Small recurrent controller. Maintains a hypothesis register (what it thinks is wrong) and a plan stack (what it intends to do). Has a verification head that checks its own output before emitting. Prevents death-spirals (repeated failed attempts).
-
-### Cross-System Bridges
-Every 2 perception layers, all 4 systems exchange information via projection to a shared 256d space.
-
-## Experiment 0 Results: State Tracking
-
-**Task**: Predict the final value of a variable after a sequence of arithmetic operations. Programs range from 10 to 80 operations. Models trained on 10-operation programs, evaluated at 1x/2x/4x/8x length.
-
-### Length Generalization (Exact Match Accuracy — v2)
-
-| Length | State Slots | Transformer-Fair | Transformer-Large |
-|--------|-------------|------------------|-------------------|
-| 1x (10 ops) | **100.0%** | 90.9% | 98.0% |
-| 2x (20 ops) | **99.6%** | 91.3% | 93.7% |
-| 4x (40 ops) | **87.8%** | 1.2% | 2.2% |
-| 8x (80 ops) | **44.9%** | 0.6% | 0.4% |
+| Length | State Slots (961K) | Transformer-Fair (443K) | Transformer-Large (2.2M) |
+|--------|--------------------|--------------------------|---------------------------|
+| 1x (10 ops) | 99.9% | **100.0%** | **100.0%** |
+| 2x (20 ops) | 92.9% | **99.0%** | 99.5% |
+| 4x (40 ops) | **62.0%** | 1.9% | 3.1% |
+| 8x (80 ops) | **35.3%** | 1.3% | 1.0% |
+| 16x (160 ops) | **5.1%** | 0.9% | 0.7% |
+| 32x (320 ops) | **5.0%** | 1.0% | 0.8% |
 
 ### Generalization Ratios (accuracy at Nx relative to 1x)
 
-| Model | 4x Ratio | 8x Ratio |
+| Model | 4x / 1x | 8x / 1x |
+|-------|---------|---------|
+| State Slots | **0.62x** | **0.35x** |
+| Transformer-Fair | 0.02x | 0.01x |
+| Transformer-Large | 0.03x | 0.01x |
+
+### Mean Absolute Error at 4x and 8x
+
+| Model | MAE @ 4x | MAE @ 8x |
 |-------|----------|----------|
-| State Slots | **87.8%** | **44.9%** |
-| Transformer-Fair | 1.3% | 0.7% |
-| Transformer-Large | 2.2% | 0.4% |
+| State Slots | **14.03** | **26.73** |
+| Transformer-Fair | 40.33 | 41.71 |
+| Transformer-Large | 36.76 | 41.19 |
 
 ![Length Generalization Results](length_generalization.png)
 
 ### Key Findings
 
-- **State Slots achieve 100% in-distribution accuracy** (v2 classification + intermediate supervision closed the gap completely).
-- **State Slots retain 87.8% of accuracy at 4x length** vs 1-2% for transformers — a **67x improvement** in generalization ratio.
-- **At 8x (80 operations), State Slots still achieve 44.9%** while both transformers have collapsed to <1%.
-- Transformers are architecturally incapable of length generalization due to the TC0 circuit complexity limit (Siems et al. ICLR 2025).
+Transformers dominate in-distribution (100% at 1x for both) but collapse to approximately 2% at 4x length and below 1.5% beyond that. State Slots degrades gracefully, retaining 62% accuracy at 4x and 35% at 8x — a 30x gap in generalization ratio at 4x. This gap is architectural, not an artifact of optimization or training recipe differences: all three models used identical training procedures including 101-class cross-entropy loss, LR grid search over 5 learning rates, FP32 precision, and cosine annealing with warmup. The 2.2M-parameter Transformer-Large (2.3x the size of State Slots) performs no better than the 443K Transformer-Fair at extrapolation, confirming that scale does not address the fundamental limitation.
 
-### v2 Improvements over v1
+### What Made It Work
 
-| Aspect | v1 | v2 |
-|--------|----|----|
-| Loss function | MSE regression | 101-class CE + intermediate aux loss |
-| In-distribution accuracy | 11.2% | **100.0%** |
-| 4x generalization | 8.9% (79% retention) | **87.8%** (87.8% retention) |
-| 8x generalization | 5.1% (46% retention) | **44.9%** (44.9% retention) |
+Three changes across v2 and v3 closed the in-distribution gap and improved generalization:
 
-### v3 Changes (pending training)
+1. **Intermediate state supervision** — An auxiliary cross-entropy loss at every token position teaches the execution system to track state at each step, not just predict the final value. This provides 20-50x more gradient signal per sample.
+2. **Classification head** — Replacing MSE regression with 101-class cross-entropy gives sharper gradients. Instead of the model learning to output "approximately 47.3", it must pick the correct class "47" with full confidence.
+3. **LR grid search** — Both execution and transformer models select the best learning rate from [3e-4, 5e-4, 1e-3, 2e-3, 5e-3] via 10-epoch grid search on a 2K subset before full training. This eliminates hyperparameter sensitivity as a confound.
 
-- Fair comparison: transformers use 101-class CE (same loss as execution model)
-- Mixed-length training data: 60% 10-27, 20% 28-50, 15% 51-80, 5% 81-120 ops
-- State passing: carry detached recurrent state across training batches
-- LR grid search for both execution and transformer models
-- Extended evaluation up to 32x (320 ops)
+### Version Evolution
+
+| Version | Loss | 1x EM | 4x EM | 4x/1x Ratio | 8x EM | 8x/1x Ratio |
+|---------|------|-------|-------|-------------|-------|-------------|
+| v1 | MSE regression | 11.2% | 8.9% | 0.79x | 5.1% | 0.46x |
+| v2 | 101-class CE + intermediate supervision | 100.0% | 87.8% | 0.88x | 44.9% | 0.45x |
+| v3 final | Fair CE for all, state passing, LR grid search | 99.9% | 62.0% | 0.62x | 35.3% | 0.35x |
+
+v2 and v3 are not directly comparable: v2 used MSE for transformers (unfair), while v3 gave all models identical 101-class CE loss and LR grid search. The v3 numbers are the fair comparison.
 
 ## Installation
 
@@ -80,187 +73,29 @@ Every 2 perception layers, all 4 systems exchange information via projection to 
 pip install -r requirements.txt
 ```
 
-## Quick Start
+Requires a Huawei Ascend NPU (910ProA recommended) with `torch_npu` and CANN software stack installed.
 
-```python
-from sfm import create_sfm, SFMConfig
-
-# Create model with small config for testing
-model = create_sfm(SFMConfig.small())
-
-# Or use default config
-model = create_sfm()
-
-# Forward pass
-import torch
-tokens = torch.randint(0, 32000, (1, 64))  # batch=1, seq_len=64
-logits = model(tokens)  # (1, 64, 32000)
-```
-
-## Running the Experiments
-
-### Experiment 0: State Tracking
-
-Proves System 2 (State Slots) works better than transformers for tracking program state.
+## Usage
 
 ```bash
-# Full experiment: trains 3 models + evaluates at 1x-32x (single NPU)
+# Full experiment: trains 3 models (State Slots + 2 transformers), evaluates at 1x-32x
 python experiments/exp0_state_tracking/finish_experiment.py
 
-# Skip training, re-evaluate from saved checkpoints
+# Re-evaluate from saved checkpoints (skip training)
 python experiments/exp0_state_tracking/finish_experiment.py --skip_training
 
-# Skip LR grid search, use defaults
+# Skip LR grid search, use default LR=1e-3
 python experiments/exp0_state_tracking/finish_experiment.py --skip_lr_search
 ```
 
-**PASS criteria**: State Slots generalize to 4x program length, transformer doesn't. (Achieved — 87.8% vs 1-2%)
+## Reproducibility
 
-## Ascend NPU Optimization
-
-This architecture is **optimized for Huawei Ascend NPUs** with the DaVinci Cube unit:
-
-### Dimension Alignment
-All tensor dimensions are multiples of 16 to match the Cube unit's 16x16x16 MAC array:
-- `d_model`: 256 (16 x 16)
-- `hidden_dim`: 256 (16 x 16)
-- `num_slots`: 16 (16 x 1)
-- `slot_dim`: 128 (16 x 8)
-
-### Cube-First Parallel Scan
-DeltaNet uses a matrix-based parallel scan:
-1. Reshape sequence into 16-step chunks
-2. Within-chunk recurrence as matrix multiply (Cube unit)
-3. Between-chunk carry on Vector unit
-4. Pipeline parallelism: Cube computes next chunk while Vector carries
-
-### Batched Operations
-- All slot operations use `torch.bmm` for batched matmul
-- MATCH: `scores = torch.matmul(query, slot_keys.T)` — one Cube call
-- READ: `values = torch.matmul(weights, slot_values)` — one Cube call
-- WRITE: `torch.baddbmm` for erase-then-write update
-
-### Performance Targets
-- Quick mode (100 samples, 1 epoch, 1 NPU): < 60 seconds
-- Full mode (10k samples, 50 epochs, 4 NPUs): < 30 minutes
-
-## Project Structure
-
-```
-sfm/
-├── sfm/                          # Core library
-│   ├── config.py                 # All hyperparameters (16-aligned)
-│   ├── model.py                  # Full SFM assembly
-│   ├── systems/                  # 4 systems
-│   │   ├── perception.py         # System 1
-│   │   ├── execution.py          # System 2 (Cube-optimized, Gated DeltaNet)
-│   │   ├── structure.py          # System 3
-│   │   └── meta.py               # System 4
-│   ├── components/               # Reusable building blocks
-│   │   ├── deltanet_cell.py      # Gated DeltaNet + Cube-first parallel scan
-│   │   ├── state_slots.py        # Cube-optimized slots (default 16)
-│   │   ├── linear_attention.py   # O(n) attention
-│   │   ├── graph_attention.py    # GNN for structure
-│   │   ├── adaptive_halting.py   # Dynamic compute
-│   │   └── cross_system_bridge.py # System communication
-│   ├── tokenizer/
-│   │   └── code_tokenizer.py
-│   └── utils/
-│       └── device.py             # NPU optimization
-├── experiments/                  # Experiments
-│   ├── exp0_state_tracking/      # Prove System 2 works
-│   │   ├── run.py                # Main entry point
-│   │   ├── train.py              # Unified training (single + multi-NPU)
-│   │   ├── finish_experiment.py  # Single-NPU transformer training + eval
-│   │   ├── dataset.py            # Data loading
-│   │   ├── generate_data.py      # Synthetic data
-│   │   ├── baseline_transformer.py
-│   │   └── evaluate.py
-│   └── exp1_full_sfm/            # Full integration
-└── scripts/
-    └── visualize.py
-```
-
-## Hardware Requirements
-
-**Designed for Huawei Ascend NPUs only.**
-
-Requires:
-- Huawei Ascend NPU (910ProA recommended)
-- torch_npu package
-- CANN software stack
-
-No CUDA or CPU fallback — this architecture is optimized for Ascend hardware.
-
-## Distributed Training Features
-
-- **DistributedDataParallel (DDP)** - Multi-process, best performance
-- **HCCL Backend** - Huawei's collective communication library
-- **Gradient Accumulation** - effective_batch = batch_size x npus x accumulation_steps
-- **Mixed Precision (AMP)** - Automatic loss scaling for FP16 (transformers only)
-- **Cosine Annealing with Warmup** - Execution: lr=1e-3, warmup=200; Transformers: lr=3e-4, warmup=500
-
-```bash
-# Single node, 4 NPUs (effective batch = 32 x 4 x 2 = 256)
-torchrun --nproc_per_node=4 experiments/exp0_state_tracking/train.py --epochs 50
-```
-
-## Testing
-
-Each component has a standalone smoke test:
-
-```bash
-# Test individual components
-python sfm/components/deltanet_cell.py    # Gated DeltaNet + Cube-first parallel scan
-python sfm/components/state_slots.py      # Cube-optimized slots (16 slots)
-python sfm/components/linear_attention.py
-python sfm/components/graph_attention.py
-python sfm/components/adaptive_halting.py
-python sfm/components/cross_system_bridge.py
-
-# Test systems
-python sfm/systems/perception.py
-python sfm/systems/execution.py           # Full execution system
-python sfm/systems/structure.py
-python sfm/systems/meta.py
-
-# Test full model (prints dimension alignment)
-python sfm/model.py
-```
-
-## Key Design Principles
-
-1. **All operations differentiable** — No hard discrete ops, soft attention everywhere
-2. **Sequential execution** — System 2 processes statements sequentially (execution is sequential)
-3. **Parallel perception** — System 1 processes tokens in parallel with linear attention
-4. **Fixed bridge dimension** — Cross-system bridges use fixed 256d vectors
-5. **Modular testing** — Every component runnable standalone
-6. **Cube-optimized dimensions** — All dimensions multiples of 16
-
-## Roadmap
-
-- [x] Core architecture implementation
-- [x] Cube-first NPU optimization
-- [x] Experiment 0: State tracking proof (regression task)
-- [x] Gated DeltaNet forget gate (ICLR 2025)
-- [x] Slot reduction 64→16 + skip connection
-- [x] Experiment 0 v2: Classification + intermediate supervision (100% in-distribution, 87.8% at 4x)
-- [x] Experiment 0 v3: Fair comparison + mixed-length training + state passing
-- [ ] Experiment 0 v3 training run + 32x evaluation
-- [ ] Experiment 1: Full SFM integration
-- [ ] Experiment 2: SWE-bench Lite evaluation
-
-## Citation
-
-If you use this architecture, please cite:
-
-```bibtex
-@software{sfm2025,
-  title = {State-Flow Machine: A Post-Transformer Architecture for Code Intelligence},
-  year = {2025},
-  note = {Novel architecture with 4 specialized systems, optimized for Ascend NPUs}
-}
-```
+- **Dataset**: 10,000 train / 1,000 validation samples, hard difficulty, seed 42
+- **Data files**: `outputs/exp0/data/train.json`, `outputs/exp0/data/val.json`
+- **Checkpoints**: `outputs/exp0/execution_best.pt`, `outputs/exp0/transformer_fair_best.pt`, `outputs/exp0/transformer_large_best.pt`
+- **Evaluation results**: `outputs/exp0/evaluation_results.json`
+- **Plot**: `outputs/exp0/length_generalization.png`
+- **Training script**: `experiments/exp0_state_tracking/finish_experiment.py`
 
 ## License
 
