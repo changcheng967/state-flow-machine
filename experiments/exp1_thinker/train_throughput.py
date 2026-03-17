@@ -62,19 +62,24 @@ log(f"[BOOT] RANK_ID={os.getenv('RANK_ID', 'NOT SET')}")
 # Phase 1: Install PyTorch + torch_npu + transformers if missing
 # ===========================================================================
 
-def _pip_install(*packages):
-    """Install packages via pip with Tsinghua mirror. Streams output."""
+def _pip_install(*packages, timeout=300):
+    """Install packages via pip. Uses system default index (no mirror override).
+    Streams output and has a timeout to prevent hanging."""
     import subprocess
-    mirror = "https://pypi.tuna.tsinghua.edu.cn/simple"
-    cmd = [sys.executable, "-m", "pip", "install"] + list(packages) + [
-        "-i", mirror, "--no-cache-dir", "-q"]
-    log(f"[PIP] pip install {' '.join(packages)}")
-    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    for line in iter(p.stdout.readline, b''):
-        text = line.decode('utf-8', errors='replace').strip()
-        if text:
-            log(f"  {text}")
-    p.wait()
+    cmd = [sys.executable, "-m", "pip", "install"] + list(packages) + ["-q"]
+    log(f"[PIP] pip install {' '.join(packages)} (timeout={timeout}s)")
+    try:
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        for line in iter(p.stdout.readline, b''):
+            text = line.decode('utf-8', errors='replace').strip()
+            if text:
+                log(f"  {text}")
+        p.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        log(f"[PIP] TIMEOUT after {timeout}s — killing pip")
+        p.kill()
+        p.wait()
+        return False
     if p.returncode != 0:
         log(f"[PIP] FAILED (exit code {p.returncode})")
     return p.returncode == 0
@@ -89,63 +94,73 @@ def _try_import(name):
         return False
 
 
-# --- Check and install torch ---
-# mindspore_2_2_cann7_train has CANN 7.0.0 (toolkit 5.0.0).
+# --- Check and install torch + torch_npu ---
+# mindspore_2_2_cann7_train has CANN 7.0.0.
 # Per torch_npu PyPI compatibility table:
 #   CANN 7.0.0 -> torch==2.1.0, torch_npu==2.1.0 (no .post suffix)
-#   All .postN versions (post3, post4, ...) are for CANN 8.x and will
-#   fail with "undefined symbol: aclGetDeviceCapability" on CANN 7.
-if _try_import("torch"):
+#   All .postN versions are for CANN 8.x (need aclGetDeviceCapability).
+#
+# We install torch and torch_npu TOGETHER so pip resolves them consistently.
+# We use the system default pip index (on OpenI: Huawei mirror with CANN-matched wheels).
+# We do NOT override to Tsinghua mirror or use --no-cache-dir.
+
+_is_local_test = "--local_test" in sys.argv
+
+if _try_import("torch") and (_is_local_test or _try_import("torch_npu")):
     import torch
     log(f"[BOOT] torch {torch.__version__} (pre-installed)")
+    if _try_import("torch_npu"):
+        import torch_npu
+        log(f"[BOOT] torch_npu {torch_npu.__version__} (pre-installed)")
 else:
-    log("[BOOT] torch not found, installing torch==2.1.0 (CANN 7)...")
-    if not _pip_install("torch==2.1.0"):
-        log("[BOOT] FATAL: cannot install torch==2.1.0.")
-        sys.exit(1)
-    import torch
-    log(f"[BOOT] torch {torch.__version__} installed OK")
-
-# --- Check and install torch_npu (skip on --local_test) ---
-if "--local_test" in sys.argv:
-    log("[BOOT] Skipping torch_npu check (local test mode)")
-elif _try_import("torch_npu"):
-    import torch_npu
-    log(f"[BOOT] torch_npu {torch_npu.__version__} (pre-installed)")
-else:
-    # Try exact CANN 7 version first, then fall back to latest
-    npu_installed = False
-    for npu_spec in ["torch_npu==2.1.0", "torch_npu"]:
-        log(f"[BOOT] Installing {npu_spec}...")
-        if _pip_install(npu_spec):
-            # Verify it actually imports (not just pip success)
-            try:
-                import torch_npu
-                log(f"[BOOT] torch_npu {torch_npu.__version__} installed + imported OK")
-                npu_installed = True
-                break
-            except ImportError as e:
-                log(f"[BOOT] torch_npu pip OK but import FAILED: {e}")
-                log(f"[BOOT]   (likely CANN version mismatch, trying next)")
-        else:
-            log(f"[BOOT] {npu_spec} pip install failed")
-    if not npu_installed:
-        log("[BOOT] FATAL: no working torch_npu version found for this CANN.")
+    # Try CANN 7 compatible versions first, then latest as fallback
+    installed = False
+    for attempt_name, torch_spec, npu_spec in [
+        ("CANN 7 exact", "torch==2.1.0", "torch_npu==2.1.0"),
+        ("latest", "torch", "torch_npu"),
+    ]:
+        log(f"[BOOT] Trying {attempt_name}: {torch_spec} + {npu_spec}")
+        pkgs = [torch_spec]
+        if not _is_local_test:
+            pkgs.append(npu_spec)
+        if not _pip_install(*pkgs, timeout=600):
+            log(f"[BOOT] {attempt_name}: pip install failed")
+            continue
+        # Verify imports
+        try:
+            import torch
+            log(f"[BOOT] torch {torch.__version__} imported OK")
+        except ImportError as e:
+            log(f"[BOOT] torch import FAILED: {e}")
+            continue
+        if _is_local_test:
+            installed = True
+            break
+        try:
+            import torch_npu
+            log(f"[BOOT] torch_npu {torch_npu.__version__} imported OK")
+            installed = True
+            break
+        except ImportError as e:
+            log(f"[BOOT] torch_npu import FAILED: {e}")
+            log(f"[BOOT]   (CANN version mismatch, trying next)")
+    if not installed:
+        log("[BOOT] FATAL: no working torch+torch_npu combination found.")
         sys.exit(1)
 
 # --- Check and install transformers ---
 if _try_import("transformers"):
     log("[BOOT] transformers (pre-installed)")
 else:
-    log("[BOOT] transformers not found, installing...")
-    if not _pip_install("transformers>=4.37.0,<4.47.0"):
+    log("[BOOT] Installing transformers...")
+    if not _pip_install("transformers"):
         log("[BOOT] FATAL: cannot install transformers")
         sys.exit(1)
     log("[BOOT] transformers installed OK")
 
 # --- Check c2net ---
 if not _try_import("c2net"):
-    log("[BOOT] c2net not found, installing...")
+    log("[BOOT] Installing c2net...")
     _pip_install("-U", "c2net")
     if not _try_import("c2net"):
         log("[BOOT] FATAL: cannot install c2net")
