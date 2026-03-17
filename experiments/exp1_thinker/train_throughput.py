@@ -250,8 +250,9 @@ class LoRALinear(nn.Cell):
         self.scaling = Tensor(alpha / rank, ms.float16)
         in_f = base.in_channels
         out_f = base.out_channels
-        self.A = Parameter(initializer(Normal(0.02), (rank, in_f)), name="lora_A")
-        self.B = Parameter(initializer(Zero(), (out_f, rank)), name="lora_B")
+        # Explicit FP16 init — to_float may miss dynamically-injected subcells in MS 2.2
+        self.A = Parameter(initializer(Normal(0.02), (rank, in_f), ms.float16), name="lora_A")
+        self.B = Parameter(initializer(Zero(), (out_f, rank), ms.float16), name="lora_B")
 
     def construct(self, x: Tensor) -> Tensor:
         # base: (B, S, in_f) -> (B, S, out_f)
@@ -277,6 +278,7 @@ class SFMSlotBank(nn.Cell):
     """State Slot Bank: cross-attention to slots + gated recurrent update.
 
     16 slots x 256d. Injected into transformer layers.
+    All params explicitly FP16 — to_float may miss dynamically-injected cells.
     """
 
     def __init__(self, hidden_dim: int = 3584, slot_dim: int = 256,
@@ -288,16 +290,33 @@ class SFMSlotBank(nn.Cell):
         self.head_dim = slot_dim
 
         self.slot_vectors = Parameter(
-            initializer(Normal(0.02), (num_slots, slot_dim)), name="slot_vectors")
-        self.q_proj = nn.Dense(hidden_dim, num_heads * slot_dim, has_bias=False)
-        self.k_proj = nn.Dense(slot_dim, num_heads * slot_dim, has_bias=False)
-        self.v_proj = nn.Dense(slot_dim, num_heads * slot_dim, has_bias=False)
-        self.out_proj = nn.Dense(num_heads * slot_dim, hidden_dim, has_bias=False)
+            initializer(Normal(0.02), (num_slots, slot_dim), ms.float16), name="slot_vectors")
+        self.q_proj = nn.Dense(hidden_dim, num_heads * slot_dim, has_bias=False,
+                                weight_init=Normal(0.02))
+        self.k_proj = nn.Dense(slot_dim, num_heads * slot_dim, has_bias=False,
+                                weight_init=Normal(0.02))
+        self.v_proj = nn.Dense(slot_dim, num_heads * slot_dim, has_bias=False,
+                                weight_init=Normal(0.02))
+        self.out_proj = nn.Dense(num_heads * slot_dim, hidden_dim, has_bias=False,
+                                  weight_init=Normal(0.02))
         self.layer_norm = RMSNorm(hidden_dim)
-        self.W_alpha = nn.Dense(hidden_dim, slot_dim)
-        self.W_beta = nn.Dense(hidden_dim, slot_dim)
-        self.W_v = nn.Dense(hidden_dim, slot_dim)
+        self.W_alpha = nn.Dense(hidden_dim, slot_dim,
+                                 weight_init=Normal(0.02), bias_init=Zero())
+        self.W_beta = nn.Dense(hidden_dim, slot_dim,
+                                weight_init=Normal(0.02), bias_init=Zero())
+        self.W_v = nn.Dense(hidden_dim, slot_dim,
+                             weight_init=Normal(0.02), bias_init=Zero())
         self.scale = Tensor(slot_dim ** -0.5, ms.float16)
+        # Force all Dense weights to FP16
+        for cell_name in ["q_proj", "k_proj", "v_proj", "out_proj", "W_alpha", "W_beta", "W_v"]:
+            dense = getattr(self, cell_name)
+            dense.weight = Parameter(
+                initializer(Normal(0.02), dense.weight.shape, ms.float16),
+                name=f"{cell_name}.weight")
+            if dense.has_bias:
+                dense.bias = Parameter(
+                    initializer(Zero(), dense.bias.shape, ms.float16),
+                    name=f"{cell_name}.bias")
 
     def construct(self, hidden_states: Tensor) -> tuple:
         """Returns (modified_hidden, new_slots)."""
