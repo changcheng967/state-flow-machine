@@ -3,24 +3,26 @@ train_throughput.py - OpenI Training Throughput Benchmark for SFM + LoRA
 
 Self-contained boot file for OpenI Train Task. Measures real training throughput
 (tokens/sec) of Qwen2.5-Coder-7B-Instruct with LoRA + SFM adapters across
-4x Ascend 910 ProA NPUs in DDP.
+NPUs in DDP.
 
-Two modes:
-  Boot mode  (OpenI platform calls this once per card):
-    - Rank 0: c2net prepare() -> launch torchrun subprocess
-    - Other ranks: exit immediately (following OpenI_LLM_Finetune_Example pattern)
-  Worker mode (torchrun launches this for each NPU):
-    - Standard PyTorch DDP with ASCEND_RT_VISIBLE_DEVICES per worker
+Follows the official OpenI multi-card pattern:
+  - All cards run this script simultaneously (platform launches once per card)
+  - Rank 0 calls prepare(), writes sync file to /cache/
+  - Other ranks poll /cache/ until ready
+  - All ranks then do DDP training
+  - Rank 0 calls upload_output() at the end
 
 No imports from sfm/ — all architecture code is inline for OpenI portability.
+
+Usage:
+    # OpenI Train Task: set as boot file, no args needed
+    # Local test: python train_throughput.py --local_test
 """
 
 import os
 import sys
 import time
 import argparse
-import subprocess
-import traceback
 
 os.environ["PYTHONUNBUFFERED"] = "1"
 try:
@@ -33,56 +35,44 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# =============================================================================
-# c2net (module-level import, prepare() called in boot mode only)
-# =============================================================================
+# c2net — module-level import per OpenI docs
 try:
     from c2net.context import prepare, upload_output
 except ImportError:
     def prepare():
-        class _DummyCtx:
-            output_path = "/tmp/sfm_throughput_output"
+        class _Ctx:
+            output_path = "/tmp/sfm_output"
             pretrain_model_path = None
             dataset_path = None
-        return _DummyCtx()
+        return _Ctx()
     def upload_output():
         pass
 
 
 # =============================================================================
+# Args (parse_known_args per OpenI docs to ignore --ckpt_url etc.)
+# =============================================================================
+parser = argparse.ArgumentParser(description="SFM+LoRA Throughput Benchmark")
+parser.add_argument("--model_path", type=str, default=None)
+parser.add_argument("--local_test", action="store_true")
+parser.add_argument("--npu_count", type=int, default=0,
+                    help="Override NPU count (0=auto-detect)")
+
+
+# =============================================================================
 # Logging
 # =============================================================================
-_logger_configured = False
+_log_file = None
 
 
 def log(msg: str) -> None:
     print(msg, flush=True)
-    if _logger_configured:
-        import logging
-        logging.info(msg)
-
-
-def configure_logging(output_path: str) -> None:
-    global _logger_configured
-    import logging
-    log_path = os.path.join(output_path, "training.log")
-    logging.basicConfig(
-        filename=log_path, level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S", filemode="w",
-    )
-    _logger_configured = True
-    log(f"File logging: {log_path}")
-
-
-# =============================================================================
-# Args
-# =============================================================================
-parser = argparse.ArgumentParser(description="SFM+LoRA Throughput Benchmark")
-parser.add_argument("--model_path", type=str, default=None)
-parser.add_argument("--output_path", type=str, default=None)
-parser.add_argument("--_worker", action="store_true", help=argparse.SUPPRESS)
-parser.add_argument("--local_test", action="store_true")
+    if _log_file:
+        try:
+            with open(_log_file, "a") as f:
+                f.write(msg + "\n")
+        except Exception:
+            pass
 
 
 # =============================================================================
@@ -90,7 +80,7 @@ parser.add_argument("--local_test", action="store_true")
 # =============================================================================
 
 class LoRALinear(nn.Module):
-    """Low-Rank Adaptation wrapper: output = base(x) + (x @ A.T @ B.T) * scale."""
+    """output = base(x) + (x @ A.T @ B.T) * scale"""
 
     def __init__(self, base_linear: nn.Linear, rank: int = 64, alpha: float = 16.0):
         super().__init__()
@@ -190,14 +180,12 @@ def inject_sfm_adapters(model: nn.Module, hidden_dim: int, indices: list) -> dic
     for idx in indices:
         adapter = SFMAdapter(hidden_dim, slot_dim=256)
         model.add_module(f"sfm_adapter_layer{idx}", adapter)
-
-        def _hook(adapter_ref):
+        def _hook(ref):
             def hook(module, inp, output):
                 hidden = output[0] if isinstance(output, tuple) else output
-                modified, _ = adapter_ref(hidden)
+                modified, _ = ref(hidden)
                 return (modified,) + output[1:] if isinstance(output, tuple) else modified
             return hook
-
         model.model.layers[idx].register_forward_hook(_hook(adapter))
         adapters[idx] = adapter
     return adapters
@@ -210,7 +198,34 @@ def count_params(model: nn.Module) -> tuple:
 
 
 # =============================================================================
-# Benchmark configs
+# Model path resolution
+# =============================================================================
+
+def resolve_model_path(c2net_ctx, args):
+    """Resolve model path from args or c2net pretrain_model_path."""
+    if args.model_path:
+        return args.model_path
+
+    pmp = getattr(c2net_ctx, "pretrain_model_path", None)
+    if pmp and os.path.isdir(pmp):
+        try:
+            entries = [e for e in os.listdir(pmp)
+                       if os.path.isdir(os.path.join(pmp, e))]
+            log(f"Model root: {pmp}, subdirs: {entries}")
+            for name in ["Qwen2.5-Coder-7B-Instruct", "Qwen2.5-Coder-7B"]:
+                if name in entries:
+                    return os.path.join(pmp, name)
+            if len(entries) == 1:
+                return os.path.join(pmp, entries[0])
+            if os.path.exists(os.path.join(pmp, "config.json")):
+                return pmp
+        except OSError as e:
+            log(f"Could not list model dir: {e}")
+    return None
+
+
+# =============================================================================
+# Benchmark
 # =============================================================================
 
 CONFIGS = [
@@ -225,10 +240,6 @@ WARMUP = 5
 MEASURE = 15
 
 
-# =============================================================================
-# Worker mode (launched by torchrun)
-# =============================================================================
-
 def _sync():
     try:
         torch.npu.synchronize()
@@ -238,20 +249,16 @@ def _sync():
 
 def run_one_config(model, optimizer, device, cfg, rank, world_size, dist):
     B, S = cfg["batch_size"], cfg["seq_len"]
-    tok_per_step = B * S
-
+    tok = B * S
     torch.manual_seed(42)
     try:
         torch.npu.manual_seed(42)
     except AttributeError:
         pass
-
     vocab = model.module.config.vocab_size if hasattr(model, "module") else model.config.vocab_size
     input_ids = torch.randint(0, vocab, (B, S), device=device)
     labels = input_ids.clone()
-
-    log(f"  Config {cfg['name']}: B={B}, S={S}, tok/step={tok_per_step:,}")
-
+    log(f"  Config {cfg['name']}: B={B}, S={S}, tok/step={tok:,}")
     try:
         for _ in range(WARMUP):
             optimizer.zero_grad(set_to_none=True)
@@ -260,8 +267,8 @@ def run_one_config(model, optimizer, device, cfg, rank, world_size, dist):
             out.loss.backward()
             optimizer.step()
             _sync()
-        dist.barrier()
-
+        if world_size > 1:
+            dist.barrier()
         elapsed = []
         for _ in range(MEASURE):
             optimizer.zero_grad(set_to_none=True)
@@ -272,11 +279,10 @@ def run_one_config(model, optimizer, device, cfg, rank, world_size, dist):
             optimizer.step()
             _sync()
             elapsed.append(time.time() - t0)
-        dist.barrier()
-
+        if world_size > 1:
+            dist.barrier()
         avg_ms = sum(elapsed) / len(elapsed) * 1000
-        tps = tok_per_step / (avg_ms / 1000)
-
+        tps = tok / (avg_ms / 1000)
         peak = free = 0.0
         try:
             peak = torch.npu.max_memory_allocated(device) / 1e9
@@ -284,16 +290,15 @@ def run_one_config(model, optimizer, device, cfg, rank, world_size, dist):
             torch.npu.reset_peak_memory_stats(device)
         except (AttributeError, RuntimeError):
             pass
-
         return {"name": cfg["name"], "batch_size": B, "seq_len": S,
-                "tok_per_step": tok_per_step, "avg_ms": avg_ms,
+                "tok": tok, "avg_ms": avg_ms,
                 "tps_dev": tps, "tps_total": tps * world_size,
-                "peak_hbm": peak, "free_hbm": free}
-
+                "peak": peak, "free": free}
     except RuntimeError as e:
         if "out of memory" in str(e).lower():
             log(f"  Config {cfg['name']}: OOM (B={B}, S={S})")
-            dist.barrier()
+            if world_size > 1:
+                dist.barrier()
             try:
                 torch.npu.empty_cache()
             except AttributeError:
@@ -302,56 +307,247 @@ def run_one_config(model, optimizer, device, cfg, rank, world_size, dist):
         raise
 
 
-def run_worker(args):
-    """torchrun worker: standard PyTorch DDP across NPUs."""
-    import torch.distributed as dist
-    import torch_npu
+def print_results(results, world_size, output_path):
+    log("")
+    log("=" * 100)
+    log("THROUGHPUT RESULTS")
+    log("=" * 100)
+    log(f"{'Cfg':>3} | {'Batch':>5} | {'SeqLen':>6} | {'Tok/step':>9} | "
+        f"{'Tok/s/dev':>10} | {'Tok/s(total)':>12} | {'ms/step':>8} | "
+        f"{'Peak HBM':>9} | {'Free HBM':>9}")
+    log("-" * 100)
+    for i, r in enumerate(results):
+        cfg = CONFIGS[i]
+        if r is not None:
+            log(f"{r['name']:>3} | {r['batch_size']:>5} | {r['seq_len']:>6} | "
+                f"{r['tok']:>9,} | {r['tps_dev']:>10.1f} | "
+                f"{r['tps_total']:>12.1f} | {r['avg_ms']:>8.1f} | "
+                f"{r['peak']:>8.2f}G | {r['free']:>8.2f}G")
+        else:
+            log(f"{cfg['name']:>3} | B={cfg['batch_size']:<4} | "
+                f"S={cfg['seq_len']:<5} | OOM")
+    valid = [r for r in results if r is not None]
+    if valid:
+        best = max(valid, key=lambda x: x["tps_dev"])
+        log(f"\nBest: {best['name']} (B={best['batch_size']}, S={best['seq_len']})")
+        log(f"  {best['tps_dev']:.1f} tok/s/device, "
+            f"{best['tps_total']:.1f} tok/s total ({world_size}x NPUs)")
+        hours = 1.1e9 / (best["tps_total"] * 3600)
+        log(f"  1.1B tokens estimate: {hours:.1f} hours")
+    path = os.path.join(output_path, "throughput_results.txt")
+    with open(path, "w") as f:
+        f.write("SFM+LoRA Training Throughput Benchmark\n")
+        f.write(f"World size: {world_size} NPUs\n\n")
+        for i, r in enumerate(results):
+            cfg = CONFIGS[i]
+            if r is not None:
+                f.write(f"Config {r['name']}: B={r['batch_size']}, S={r['seq_len']}\n"
+                        f"  tok/s/dev={r['tps_dev']:.1f}, tok/s(total)={r['tps_total']:.1f}\n"
+                        f"  ms/step={r['avg_ms']:.1f}, peak={r['peak']:.2f}GB, free={r['free']:.2f}GB\n\n")
+            else:
+                f.write(f"Config {cfg['name']}: OOM\n\n")
+        if valid:
+            best = max(valid, key=lambda x: x["tps_dev"])
+            hours = 1.1e9 / (best["tps_total"] * 3600)
+            f.write(f"Best: {best['name']} — {best['tps_dev']:.1f} tok/s/dev\n"
+                    f"1.1B tokens: {hours:.1f} hours\n")
+    log(f"Results saved to {path}")
 
-    # Ascend env vars BEFORE torch_npu operations
+
+# =============================================================================
+# Local test
+# =============================================================================
+
+def run_local_test():
+    log("LOCAL TEST MODE")
+    h = torch.randn(1, 10, 3584)
+    sb = SFMSlotBank(3584, 256)
+    o, s = sb(h)
+    log(f"  SFMSlotBank: {h.shape} -> {o.shape}, slots {s.shape}")
+    ad = SFMAdapter(3584)
+    o2, s2 = ad(h)
+    log(f"  SFMAdapter:  {h.shape} -> {o2.shape}, slots {s2.shape}")
+    base = nn.Linear(512, 512)
+    lora = LoRALinear(base, rank=8, alpha=16)
+    y = lora(torch.randn(2, 8, 512))
+    log(f"  LoRALinear:  (2,8,512) -> {y.shape}")
+    log("\nLOCAL TEST COMPLETE")
+
+
+# =============================================================================
+# Main
+# =============================================================================
+
+def main():
+    global _log_file
+    args, unknown = parser.parse_known_args()
+
+    if args.local_test:
+        run_local_test()
+        return
+
+    # --- Determine rank from OpenI env ---
+    # RANK_ID is set by OpenI for multi-card tasks (per official docs)
+    rank_id_str = os.getenv('RANK_ID')
+    if rank_id_str is None:
+        rank_id = 0
+        is_multi_card = False
+    else:
+        rank_id = int(rank_id_str)
+        is_multi_card = True
+
+    log(f"Rank {rank_id}, multi_card={is_multi_card}")
+
+    # ================================================================
+    # Phase 1: Data preparation (rank 0 only, others wait)
+    # Following the /cache/ sync pattern from OpenI docs:
+    #   if local_rank%8==0: prepare... write flag... close
+    #   while not exists(flag): sleep(1)
+    # ================================================================
+    _SYNC_FILE = "/cache/sfm_ready.txt"
+
+    model_path = None
+    output_path = None
+    world_size = 1
+
+    if rank_id == 0:
+        try:
+            c2net_ctx = prepare()
+
+            output_path = c2net_ctx.output_path
+            os.makedirs(output_path, exist_ok=True)
+            _log_file = os.path.join(output_path, "training.log")
+
+            model_path = resolve_model_path(c2net_ctx, args)
+            if not model_path:
+                log("ERROR: no model path found. Configure a model dataset on OpenI.")
+                with open(_SYNC_FILE, "w") as f:
+                    f.write("ERROR\n")
+                sys.exit(1)
+
+            # Detect NPU count before device isolation
+            try:
+                import torch_npu
+                detected = torch.npu.device_count()
+            except ImportError:
+                detected = 1
+                log("WARNING: torch_npu not available")
+
+            world_size = args.npu_count if args.npu_count > 0 else detected
+            log(f"Output: {output_path}")
+            log(f"Model:  {model_path}")
+            log(f"NPUs:   {world_size}")
+
+            # Write sync file with paths + world_size for other ranks
+            with open(_SYNC_FILE, "w") as f:
+                f.write(f"{output_path}\n")
+                f.write(f"{model_path}\n")
+                f.write(f"{world_size}\n")
+
+            log("Rank 0: preparation done, sync file written.")
+
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            log(f"Rank 0: preparation FAILED:\n{tb}")
+            try:
+                with open(_SYNC_FILE, "w") as f:
+                    f.write(f"ERROR: {e}\n")
+            except Exception:
+                pass
+            sys.exit(1)
+
+    else:
+        # Other ranks: wait for rank 0's sync file (per OpenI docs pattern)
+        log(f"Rank {rank_id}: waiting for rank 0 preparation...")
+        while not os.path.exists(_SYNC_FILE):
+            time.sleep(1)
+
+    # All ranks: read sync file
+    if rank_id != 0:
+        with open(_SYNC_FILE, "r") as f:
+            output_path = f.readline().strip()
+            model_path = f.readline().strip()
+            world_size = int(f.readline().strip())
+        os.makedirs(output_path, exist_ok=True)
+        _log_file = os.path.join(output_path, "training.log")
+        log(f"Rank {rank_id}: paths loaded. Model={model_path}, NPUs={world_size}")
+
+    # ================================================================
+    # Phase 2: Ascend env + device setup
+    # Env vars MUST be set before torch_npu operations
+    # ================================================================
     os.environ.setdefault("TASK_QUEUE_ENABLE", "2")
     os.environ.setdefault("CPU_AFFINITY_CONF", "1")
     os.environ.setdefault("HCCL_OP_EXPANSION_MODE", "AIV")
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ.setdefault("MASTER_PORT", "29500")
 
-    # Device isolation: each worker uses only its own NPU
-    local_rank = int(os.environ["LOCAL_RANK"])
-    rank = int(os.environ["RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
-    os.environ["ASCEND_RT_VISIBLE_DEVICES"] = str(local_rank)
+    # Device isolation: each rank sees only its own NPU
+    # On OpenI, RANK_ID is the card index (0, 1, 2, 3 for 4 NPUs)
+    os.environ["ASCEND_RT_VISIBLE_DEVICES"] = str(rank_id)
+
+    try:
+        import torch_npu
+    except ImportError:
+        log("ERROR: torch_npu not available. Select a PyTorch+NPU image on OpenI.")
+        sys.exit(1)
 
     device = torch.device("npu:0")
     torch.npu.set_device(device)
 
-    dist.init_process_group(backend="hccl")
-
-    if rank == 0 and args.output_path:
-        configure_logging(args.output_path)
-        log(f"Worker: rank={rank}/{world_size}, local_rank={local_rank}")
+    if rank_id == 0:
         log(f"torch={torch.__version__}, torch_npu={torch_npu.__version__}")
-
         try:
             free_i, total_i = torch.npu.mem_get_info(0)
             log(f"HBM: {total_i/1e9:.1f} GB total, {free_i/1e9:.1f} GB free")
         except Exception as e:
-            log(f"HBM info failed: {e}")
+            log(f"HBM info: {e}")
 
-    # Load model
-    model_path = args.model_path
-    if rank == 0:
-        log(f"Loading model: {model_path}")
+    # ================================================================
+    # Phase 3: DDP init
+    # ================================================================
+    import torch.distributed as dist
+
+    if world_size > 1:
+        try:
+            dist.init_process_group(
+                backend="hccl",
+                rank=rank_id,
+                world_size=world_size,
+            )
+            if rank_id == 0:
+                log(f"DDP initialized: {world_size} NPUs, backend=hccl")
+        except Exception as e:
+            log(f"DDP init failed: {e}")
+            if rank_id == 0:
+                log("Falling back to single-card mode.")
+            world_size = 1
+    else:
+        if rank_id == 0:
+            log("Single-card mode (no DDP).")
+
+    # ================================================================
+    # Phase 4: Load model
+    # ================================================================
+    if rank_id == 0:
+        log(f"\nLoading model: {model_path}")
 
     from transformers import AutoModelForCausalLM
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path, torch_dtype=torch.float16, trust_remote_code=True,
-    )
-    model = model.to(device)
-    dist.barrier()
 
-    if rank == 0:
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path, torch_dtype=torch.float16, trust_remote_code=True)
+    model = model.to(device)
+
+    if world_size > 1:
+        dist.barrier()
+
+    if rank_id == 0:
         log("Model loaded on all ranks.")
 
-    # Freeze + inject
+    # ================================================================
+    # Phase 5: Freeze + inject adapters
+    # ================================================================
     for p in model.parameters():
         p.requires_grad = False
 
@@ -365,9 +561,11 @@ def run_worker(args):
     for m in model.modules():
         if isinstance(m, (SFMAdapter, LoRALinear)):
             m.to(device=device, dtype=torch.float16)
-    dist.barrier()
 
-    if rank == 0:
+    if world_size > 1:
+        dist.barrier()
+
+    if rank_id == 0:
         total, trainable = count_params(model)
         log(f"Model: {model.config.model_type}, {n_layers} layers, hidden={h_dim}")
         log(f"LoRA: rank=64, alpha=16, {lora_n} projections")
@@ -375,15 +573,25 @@ def run_worker(args):
         log(f"Params: {total:,} total, {trainable:,} trainable "
             f"({100*trainable/total:.2f}%)")
 
-    # DDP
-    ddp = nn.parallel.DistributedDataParallel(
-        model, device_ids=[0], output_device=0)
+    # ================================================================
+    # Phase 6: DDP wrap + optimizer
+    # ================================================================
+    if world_size > 1:
+        ddp = nn.parallel.DistributedDataParallel(
+            model, device_ids=[0], output_device=0)
+    else:
+        ddp = model
+
     optimizer = torch.optim.AdamW(
         [p for p in ddp.parameters() if p.requires_grad], lr=2e-4)
-    dist.barrier()
 
-    # Benchmark
-    if rank == 0:
+    if world_size > 1:
+        dist.barrier()
+
+    # ================================================================
+    # Phase 7: Benchmark
+    # ================================================================
+    if rank_id == 0:
         log("")
         log("=" * 100)
         log("TRAINING THROUGHPUT BENCHMARK")
@@ -393,229 +601,40 @@ def run_worker(args):
 
     results = []
     for cfg in CONFIGS:
-        results.append(run_one_config(ddp, optimizer, device, cfg,
-                                      rank, world_size, dist))
+        results.append(
+            run_one_config(ddp, optimizer, device, cfg, rank_id, world_size, dist))
 
-    # Results (rank 0 only)
-    if rank == 0 and args.output_path:
-        _print_results(results, world_size, args.output_path)
+    # ================================================================
+    # Phase 8: Results + upload (rank 0 only)
+    # ================================================================
+    if rank_id == 0:
+        print_results(results, world_size, output_path)
+        log("\nUploading results...")
+        try:
+            upload_output()
+            log("Upload complete.")
+        except Exception as e:
+            log(f"Upload failed (non-fatal): {e}")
 
-    dist.barrier()
-    dist.destroy_process_group()
+    # ================================================================
+    # Phase 9: Cleanup
+    # ================================================================
+    if world_size > 1:
+        dist.barrier()
+        dist.destroy_process_group()
 
-    if rank == 0:
+    if rank_id == 0:
         log("")
         log("=" * 100)
         log("DONE")
         log("=" * 100)
 
 
-def _print_results(results, world_size, output_path):
-    log("")
-    log("=" * 100)
-    log("THROUGHPUT RESULTS")
-    log("=" * 100)
-    log(f"{'Cfg':>3} | {'Batch':>5} | {'SeqLen':>6} | {'Tok/step':>9} | "
-        f"{'Tok/s/dev':>10} | {'Tok/s(total)':>12} | {'ms/step':>8} | "
-        f"{'Peak HBM':>9} | {'Free HBM':>9}")
-    log("-" * 100)
-
-    for i, r in enumerate(results):
-        cfg = CONFIGS[i]
-        if r is not None:
-            log(f"{r['name']:>3} | {r['batch_size']:>5} | {r['seq_len']:>6} | "
-                f"{r['tok_per_step']:>9,} | {r['tps_dev']:>10.1f} | "
-                f"{r['tps_total']:>12.1f} | {r['avg_ms']:>8.1f} | "
-                f"{r['peak_hbm']:>8.2f}G | {r['free_hbm']:>8.2f}G")
-        else:
-            log(f"{cfg['name']:>3} | B={cfg['batch_size']:<4} | "
-                f"S={cfg['seq_len']:<5} | OOM")
-
-    valid = [r for r in results if r is not None]
-    if valid:
-        best = max(valid, key=lambda x: x["tps_dev"])
-        log(f"\nBest: {best['name']} (B={best['batch_size']}, "
-            f"S={best['seq_len']})")
-        log(f"  {best['tps_dev']:.1f} tok/s/device, "
-            f"{best['tps_total']:.1f} tok/s total ({world_size}x NPUs)")
-        hours = 1.1e9 / (best["tps_total"] * 3600)
-        log(f"  1.1B tokens estimate: {hours:.1f} hours")
-
-    # Save file
-    path = os.path.join(output_path, "throughput_results.txt")
-    with open(path, "w") as f:
-        f.write("SFM+LoRA Training Throughput Benchmark\n")
-        f.write(f"World size: {world_size} NPUs\n\n")
-        for i, r in enumerate(results):
-            cfg = CONFIGS[i]
-            if r is not None:
-                f.write(f"Config {r['name']}: B={r['batch_size']}, S={r['seq_len']}\n"
-                        f"  tok/s/dev={r['tps_dev']:.1f}, "
-                        f"tok/s(total)={r['tps_total']:.1f}, "
-                        f"ms/step={r['avg_ms']:.1f}\n"
-                        f"  peak_hbm={r['peak_hbm']:.2f}GB, "
-                        f"free_hbm={r['free_hbm']:.2f}GB\n\n")
-            else:
-                f.write(f"Config {cfg['name']}: B={cfg['batch_size']}, "
-                        f"S={cfg['seq_len']} — OOM\n\n")
-        if valid:
-            best = max(valid, key=lambda x: x["tps_dev"])
-            hours = 1.1e9 / (best["tps_total"] * 3600)
-            f.write(f"Best: {best['name']} — {best['tps_dev']:.1f} tok/s/dev\n"
-                    f"1.1B tokens estimate: {hours:.1f} hours\n")
-    log(f"Results saved to {path}")
-
-
-# =============================================================================
-# Boot mode (OpenI platform entry point, rank 0 only)
-# =============================================================================
-
-def resolve_model_path(c2net_ctx, args):
-    """Resolve model path from args or c2net context with auto-detection."""
-    if args.model_path:
-        return args.model_path
-
-    pmp = getattr(c2net_ctx, "pretrain_model_path", None)
-    if pmp and os.path.isdir(pmp):
-        try:
-            entries = [e for e in os.listdir(pmp)
-                       if os.path.isdir(os.path.join(pmp, e))]
-            log(f"Model root: {pmp} — subdirs: {entries}")
-            for name in ["Qwen2.5-Coder-7B-Instruct", "Qwen2.5-Coder-7B"]:
-                if name in entries:
-                    return os.path.join(pmp, name)
-            if len(entries) == 1:
-                return os.path.join(pmp, entries[0])
-            if os.path.exists(os.path.join(pmp, "config.json")):
-                return pmp
-        except OSError as e:
-            log(f"Could not list model dir: {e}")
-
-    mp = getattr(c2net_ctx, "model_path", None)
-    return mp
-
-
-def run_boot(args):
-    """OpenI boot: prepare() -> detect NPUs -> launch torchrun subprocess."""
-    c2net_ctx = prepare()
-    output_path = c2net_ctx.output_path
-    os.makedirs(output_path, exist_ok=True)
-    configure_logging(output_path)
-
-    model_path = resolve_model_path(c2net_ctx, args)
-    if not model_path:
-        log("ERROR: no model path found. Upload a model dataset on OpenI.")
-        try:
-            upload_output()
-        except Exception:
-            pass
-        sys.exit(1)
-
-    log(f"Model path: {model_path}")
-
-    # Detect NPUs (rank 0 sees all of them on OpenI)
-    try:
-        import torch_npu
-        npu_count = torch.npu.device_count()
-    except ImportError:
-        log("ERROR: torch_npu not available")
-        sys.exit(1)
-
-    log(f"NPU count: {npu_count}")
-
-    if npu_count == 0:
-        log("ERROR: no NPUs detected")
-        sys.exit(1)
-
-    # Build torchrun command (following OpenI_LLM_Finetune_Example pattern)
-    env = os.environ.copy()
-    env["ASCEND_RT_VISIBLE_DEVICES"] = ",".join(str(i) for i in range(npu_count))
-    env.setdefault("TASK_QUEUE_ENABLE", "2")
-    env.setdefault("CPU_AFFINITY_CONF", "1")
-    env.setdefault("HCCL_OP_EXPANSION_MODE", "AIV")
-
-    cmd = [
-        sys.executable, "-m", "torch.distributed.run",
-        "--nproc_per_node", str(npu_count),
-        __file__,
-        "--_worker",
-        "--model_path", model_path,
-        "--output_path", output_path,
-    ]
-
-    log(f"Launching: {' '.join(cmd)}")
-
-    # Stream output (same pattern as OpenI_LLM_Finetune_Example)
-    p = subprocess.Popen(cmd, env=env,
-                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    for line in iter(p.stdout.readline, b''):
-        text = line.decode('utf-8', errors='replace').strip()
-        if text:
-            log(text)
-    p.wait()
-
-    if p.returncode != 0:
-        log(f"torchrun exited with code {p.returncode}")
-    else:
-        log("torchrun completed successfully.")
-
-    # Upload results
-    log("Uploading results...")
-    try:
-        upload_output()
-        log("Upload complete.")
-    except Exception as e:
-        log(f"Upload failed (non-fatal): {e}")
-
-
-# =============================================================================
-# Local test mode
-# =============================================================================
-
-def run_local_test():
-    log("LOCAL TEST MODE")
-    h = torch.randn(1, 10, 3584)
-
-    sb = SFMSlotBank(hidden_dim=3584, slot_dim=256)
-    out, slots = sb(h)
-    log(f"  SFMSlotBank: {h.shape} -> {out.shape}, slots {slots.shape}")
-
-    ad = SFMAdapter(hidden_dim=3584)
-    out2, slots2 = ad(h)
-    log(f"  SFMAdapter:  {h.shape} -> {out2.shape}, slots {slots2.shape}")
-
-    base = nn.Linear(512, 512)
-    lora = LoRALinear(base, rank=8, alpha=16)
-    y = lora(torch.randn(2, 8, 512))
-    log(f"  LoRALinear:  (2,8,512) -> {y.shape}")
-
-    log("\nLOCAL TEST COMPLETE")
-
-
-# =============================================================================
-# Entry point
-# =============================================================================
-
 if __name__ == "__main__":
-    args, _ = parser.parse_known_args()
-
-    if args._worker:
-        # torchrun worker mode — run actual DDP benchmark
-        run_worker(args)
-    elif args.local_test:
-        # Local syntax/import check
-        run_local_test()
-    else:
-        # Boot mode — OpenI platform entry point
-        rank_id = os.getenv('RANK_ID')
-        if rank_id is not None and int(rank_id) != 0:
-            # Multi-card mode: only rank 0 does work
-            # (following OpenI_LLM_Finetune_Example pattern)
-            sys.exit(0)
-
-        try:
-            run_boot(args)
-        except Exception:
-            tb = traceback.format_exc()
-            log(f"\nFATAL ERROR:\n{tb}")
-            raise
+    args, unknown = parser.parse_known_args()
+    try:
+        main()
+    except Exception:
+        import traceback
+        print(traceback.format_exc(), flush=True)
+        raise
