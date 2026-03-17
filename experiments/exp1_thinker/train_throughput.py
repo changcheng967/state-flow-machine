@@ -142,24 +142,41 @@ def _apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
 
 
 # ===========================================================================
+# Phase 5.5: FP16 helpers — to_float is unreliable in MS 2.2
+# ===========================================================================
+
+def _fp16_dense(in_channels: int, out_channels: int, has_bias: bool = False) -> nn.Dense:
+    """Create nn.Dense with explicit FP16 weight (no to_float needed)."""
+    d = nn.Dense(in_channels, out_channels, has_bias=has_bias)
+    d.weight = Parameter(
+        initializer(Normal(0.02), d.weight.shape, ms.float16),
+        name="weight")
+    if has_bias:
+        d.bias = Parameter(
+            initializer(Zero(), d.bias.shape, ms.float16),
+            name="bias")
+    return d
+
+
+# ===========================================================================
 # Phase 6: Transformer Block (MHA + SwiGLU FFN + RMSNorm)
 # ===========================================================================
 
 class TransformerBlock(nn.Cell):
-    """Single transformer layer with GQA, RoPE, SwiGLU FFN."""
+    """Single transformer layer with GQA, RoPE, SwiGLU FFN. All FP16."""
 
     def __init__(self):
         super().__init__()
-        # Attention projections
-        self.q_proj = nn.Dense(HIDDEN_DIM, NUM_HEADS * HEAD_DIM, has_bias=False)
-        self.k_proj = nn.Dense(HIDDEN_DIM, NUM_KV_HEADS * HEAD_DIM, has_bias=False)
-        self.v_proj = nn.Dense(HIDDEN_DIM, NUM_KV_HEADS * HEAD_DIM, has_bias=False)
-        self.o_proj = nn.Dense(NUM_HEADS * HEAD_DIM, HIDDEN_DIM, has_bias=False)
+        # Attention projections — FP16 weights
+        self.q_proj = _fp16_dense(HIDDEN_DIM, NUM_HEADS * HEAD_DIM)
+        self.k_proj = _fp16_dense(HIDDEN_DIM, NUM_KV_HEADS * HEAD_DIM)
+        self.v_proj = _fp16_dense(HIDDEN_DIM, NUM_KV_HEADS * HEAD_DIM)
+        self.o_proj = _fp16_dense(NUM_HEADS * HEAD_DIM, HIDDEN_DIM)
 
         # FFN (SwiGLU)
-        self.gate_proj = nn.Dense(HIDDEN_DIM, INTERMEDIATE_DIM, has_bias=False)
-        self.up_proj = nn.Dense(HIDDEN_DIM, INTERMEDIATE_DIM, has_bias=False)
-        self.down_proj = nn.Dense(INTERMEDIATE_DIM, HIDDEN_DIM, has_bias=False)
+        self.gate_proj = _fp16_dense(HIDDEN_DIM, INTERMEDIATE_DIM)
+        self.up_proj = _fp16_dense(HIDDEN_DIM, INTERMEDIATE_DIM)
+        self.down_proj = _fp16_dense(INTERMEDIATE_DIM, HIDDEN_DIM)
 
         # Norms
         self.input_norm = RMSNorm(HIDDEN_DIM)
@@ -208,19 +225,18 @@ class TransformerBlock(nn.Cell):
 # ===========================================================================
 
 class Qwen2LikeModel(nn.Cell):
-    """~6.4B param model matching Qwen2.5-Coder-7B dimensions.
-
-    Embedding -> 28x TransformerBlock -> RMSNorm -> LM head (weight-tied).
-    """
+    """~6.4B param model matching Qwen2.5-Coder-7B dimensions. All FP16."""
 
     def __init__(self):
         super().__init__()
         self.embed_tokens = nn.Embedding(VOCAB_SIZE, HIDDEN_DIM)
+        # Override embedding table to FP16
+        self.embed_tokens.embedding_table = Parameter(
+            initializer(Normal(0.02), (VOCAB_SIZE, HIDDEN_DIM), ms.float16),
+            name="embedding_table")
         self.layers = nn.CellList([TransformerBlock() for _ in range(NUM_LAYERS)])
         self.norm = RMSNorm(HIDDEN_DIM)
-        # LM head shares weights with embedding (weight tying)
-        self.lm_head = nn.Dense(HIDDEN_DIM, VOCAB_SIZE, has_bias=False)
-        # Weight tying done in set_train / after init
+        self.lm_head = _fp16_dense(HIDDEN_DIM, VOCAB_SIZE)
 
     def construct(self, input_ids: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
         """Forward pass. Returns logits (B, S, V).
@@ -276,10 +292,7 @@ class LoRALinear(nn.Cell):
 
 class SFMSlotBank(nn.Cell):
     """State Slot Bank: cross-attention to slots + gated recurrent update.
-
-    16 slots x 256d. Injected into transformer layers.
-    All params explicitly FP16 — to_float may miss dynamically-injected cells.
-    """
+    16 slots x 256d. All params FP16."""
 
     def __init__(self, hidden_dim: int = 3584, slot_dim: int = 256,
                  num_slots: int = 16, num_heads: int = 4):
@@ -291,32 +304,15 @@ class SFMSlotBank(nn.Cell):
 
         self.slot_vectors = Parameter(
             initializer(Normal(0.02), (num_slots, slot_dim), ms.float16), name="slot_vectors")
-        self.q_proj = nn.Dense(hidden_dim, num_heads * slot_dim, has_bias=False,
-                                weight_init=Normal(0.02))
-        self.k_proj = nn.Dense(slot_dim, num_heads * slot_dim, has_bias=False,
-                                weight_init=Normal(0.02))
-        self.v_proj = nn.Dense(slot_dim, num_heads * slot_dim, has_bias=False,
-                                weight_init=Normal(0.02))
-        self.out_proj = nn.Dense(num_heads * slot_dim, hidden_dim, has_bias=False,
-                                  weight_init=Normal(0.02))
+        self.q_proj = _fp16_dense(hidden_dim, num_heads * slot_dim)
+        self.k_proj = _fp16_dense(slot_dim, num_heads * slot_dim)
+        self.v_proj = _fp16_dense(slot_dim, num_heads * slot_dim)
+        self.out_proj = _fp16_dense(num_heads * slot_dim, hidden_dim)
         self.layer_norm = RMSNorm(hidden_dim)
-        self.W_alpha = nn.Dense(hidden_dim, slot_dim,
-                                 weight_init=Normal(0.02), bias_init=Zero())
-        self.W_beta = nn.Dense(hidden_dim, slot_dim,
-                                weight_init=Normal(0.02), bias_init=Zero())
-        self.W_v = nn.Dense(hidden_dim, slot_dim,
-                             weight_init=Normal(0.02), bias_init=Zero())
+        self.W_alpha = _fp16_dense(hidden_dim, slot_dim, has_bias=True)
+        self.W_beta = _fp16_dense(hidden_dim, slot_dim, has_bias=True)
+        self.W_v = _fp16_dense(hidden_dim, slot_dim, has_bias=True)
         self.scale = Tensor(slot_dim ** -0.5, ms.float16)
-        # Force all Dense weights to FP16
-        for cell_name in ["q_proj", "k_proj", "v_proj", "out_proj", "W_alpha", "W_beta", "W_v"]:
-            dense = getattr(self, cell_name)
-            dense.weight = Parameter(
-                initializer(Normal(0.02), dense.weight.shape, ms.float16),
-                name=f"{cell_name}.weight")
-            if dense.has_bias:
-                dense.bias = Parameter(
-                    initializer(Zero(), dense.bias.shape, ms.float16),
-                    name=f"{cell_name}.bias")
 
     def construct(self, hidden_states: Tensor) -> tuple:
         """Returns (modified_hidden, new_slots)."""
@@ -830,8 +826,7 @@ def main():
         log(f"Params: {total:,} total, {trainable:,} trainable "
             f"({100 * trainable / total:.2f}%)")
 
-    # ---- Mixed precision (FP16) ----
-    model.to_float(ms.float16)
+    # All params are already FP16 — no to_float needed
 
     # ---- Loss + optimizer ----
     loss_fn = nn.CrossEntropyLoss()
