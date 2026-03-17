@@ -129,13 +129,13 @@ def _build_rope_cache(seq_len: int, head_dim: int, base: float = 10000.0, dtype=
 
 
 def _apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
-    """Apply rotary embedding. x: (H, B, S, D). cos/sin: (S, D/2)."""
+    """Apply rotary embedding. x: (B, H, S, D). cos/sin: (S, D/2)."""
     D = x.shape[-1]
     x1 = x[..., :D // 2]
     x2 = x[..., D // 2:]
-    # cos/sin precomputed for exact seq_len, no dynamic slicing needed
-    cos_s = cos.reshape(1, cos.shape[0], 1, D // 2)  # (1, S, 1, D/2)
-    sin_s = sin.reshape(1, sin.shape[0], 1, D // 2)
+    # Reshape to broadcast with (B, H, S, D//2)
+    cos_s = cos.reshape(1, 1, cos.shape[0], D // 2)  # (1, 1, S, D/2)
+    sin_s = sin.reshape(1, 1, sin.shape[0], D // 2)
     out1 = x1 * cos_s - x2 * sin_s
     out2 = x1 * sin_s + x2 * cos_s
     return ops.cat([out1, out2], axis=-1)
@@ -190,25 +190,27 @@ class TransformerBlock(nn.Cell):
 
         # ---- Self-attention ----
         h = self.input_norm(x)
-        Q = self.q_proj(h).view(B, S, NUM_HEADS, HEAD_DIM).transpose(0, 2, 1, 3)  # (H, B, S, D)
-        K = self.k_proj(h).view(B, S, NUM_KV_HEADS, HEAD_DIM).transpose(0, 2, 1, 3)
-        V = self.v_proj(h).view(B, S, NUM_KV_HEADS, HEAD_DIM).transpose(0, 2, 1, 3)
+        # (B, S, H*D) → (B, H, S, D)
+        Q = self.q_proj(h).view(B, S, NUM_HEADS, HEAD_DIM).transpose(1, 2)
+        K = self.k_proj(h).view(B, S, NUM_KV_HEADS, HEAD_DIM).transpose(1, 2)
+        V = self.v_proj(h).view(B, S, NUM_KV_HEADS, HEAD_DIM).transpose(1, 2)
 
         # RoPE on Q and K
         Q = _apply_rotary_emb(Q, cos, sin)
         K = _apply_rotary_emb(K, cos, sin)
 
-        # GQA: expand K/V from NUM_KV_HEADS to NUM_HEADS via tile
-        # ops.tile is more Cube-friendly than repeat_interleave
-        K = ops.tile(K, (NUM_KV_GROUPS, 1, 1, 1))  # (H, B, S, D)
-        V = ops.tile(V, (NUM_KV_GROUPS, 1, 1, 1))
+        # GQA: expand K/V from NUM_KV_HEADS to NUM_HEADS
+        K = ops.tile(K, (1, NUM_KV_GROUPS, 1, 1))  # (B, H, S, D)
+        V = ops.tile(V, (1, NUM_KV_GROUPS, 1, 1))
 
         # Scaled dot-product attention (causal)
-        attn = ops.matmul(Q, K.transpose(0, 1, 3, 2)) * self.scale  # (H, B, S, S)
-        attn = attn + mask  # mask: (1, 1, S, S) precomputed on NPU
+        # Q @ K^T: (B, H, S, D) @ (B, H, D, S) → (B, H, S, S)
+        attn = ops.matmul(Q, K.transpose(0, 1, 3, 2)) * self.scale
+        attn = attn + mask  # mask: (1, 1, S, S)
         attn = ops.softmax(attn, axis=-1)
-        out = ops.matmul(attn, V)  # (H, B, S, D)
-        out = out.transpose(0, 2, 1, 3).reshape(B, S, -1)
+        out = ops.matmul(attn, V)  # (B, H, S, D)
+        # (B, H, S, D) → (B, S, H*D)
+        out = out.transpose(1, 2).reshape(B, S, -1)
         out = self.o_proj(out)
         x = x + self.post_attn_norm(out)
 
@@ -321,14 +323,14 @@ class SFMSlotBank(nn.Cell):
             self.slot_vectors.reshape(1, self.num_slots, self.slot_dim),
             (B, self.num_slots, self.slot_dim))
 
-        Q = self.q_proj(hidden_states).view(B, S, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
-        K = self.k_proj(slots).view(B, self.num_slots, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
-        V = self.v_proj(slots).view(B, self.num_slots, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        Q = self.q_proj(hidden_states).view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
+        K = self.k_proj(slots).view(B, self.num_slots, self.num_heads, self.head_dim).transpose(1, 2)
+        V = self.v_proj(slots).view(B, self.num_slots, self.num_heads, self.head_dim).transpose(1, 2)
 
         attn = ops.matmul(Q, K.transpose(0, 1, 3, 2)) * self.scale
         attn = ops.softmax(attn, axis=-1)
         out = ops.matmul(attn, V)
-        out = out.transpose(0, 2, 1, 3).reshape(B, S, -1)
+        out = out.transpose(1, 2).reshape(B, S, -1)
         out = self.out_proj(out)
         modified = self.layer_norm(hidden_states + out)
 
