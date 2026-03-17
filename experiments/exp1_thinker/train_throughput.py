@@ -95,18 +95,17 @@ NUM_KV_GROUPS = NUM_HEADS // NUM_KV_HEADS  # 7
 # ===========================================================================
 
 class RMSNorm(nn.Cell):
-    """Root Mean Square Layer Normalization."""
+    """Root Mean Square Layer Normalization (FP16 throughout)."""
 
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
-        self.eps = eps
-        self.weight = Parameter(initializer(One(), (dim,), ms.float32), name="weight")
+        self.eps = Tensor(eps, ms.float16)
+        self.weight = Parameter(initializer(One(), (dim,), ms.float16), name="weight")
 
     def construct(self, x: Tensor) -> Tensor:
-        x_float = x.astype(ms.float32)
-        variance = ops.mean(x_float * x_float, axis=-1, keep_dims=True)
-        x_norm = x_float * ops.rsqrt(variance + self.eps)
-        return (x_norm * self.weight).astype(x.dtype)
+        variance = ops.mean(x * x, axis=-1, keep_dims=True)
+        x_norm = x * ops.rsqrt(variance + self.eps)
+        return x_norm * self.weight
 
 
 # ===========================================================================
@@ -124,13 +123,13 @@ def _build_rope_cache(seq_len: int, head_dim: int, base: float = 10000.0, dtype=
 
 
 def _apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
-    """Apply rotary embedding. x: (B, S, H, D). cos/sin: (S, D/2)."""
-    S = x.shape[1]
+    """Apply rotary embedding. x: (H, B, S, D). cos/sin: (S, D/2)."""
     D = x.shape[-1]
     x1 = x[..., :D // 2]
     x2 = x[..., D // 2:]
-    cos_s = cos[:S].unsqueeze(0).unsqueeze(2)  # (1, S, 1, D/2)
-    sin_s = sin[:S].unsqueeze(0).unsqueeze(2)
+    # cos/sin precomputed for exact seq_len, no dynamic slicing needed
+    cos_s = cos.reshape(1, cos.shape[0], 1, D // 2)  # (1, S, 1, D/2)
+    sin_s = sin.reshape(1, sin.shape[0], 1, D // 2)
     out1 = x1 * cos_s - x2 * sin_s
     out2 = x1 * sin_s + x2 * cos_s
     return ops.cat([out1, out2], axis=-1)
@@ -161,7 +160,7 @@ class TransformerBlock(nn.Cell):
         self.post_attn_norm = RMSNorm(HIDDEN_DIM)
         self.ffn_norm = RMSNorm(HIDDEN_DIM)
 
-        self.scale = HEAD_DIM ** -0.5
+        self.scale = Tensor(HEAD_DIM ** -0.5, ms.float16)
 
     def construct(self, x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
         B, S, _ = x.shape
@@ -245,7 +244,7 @@ class LoRALinear(nn.Cell):
     def __init__(self, base: nn.Dense, rank: int = 64, alpha: float = 16.0):
         super().__init__()
         self.base = base
-        self.scaling = alpha / rank
+        self.scaling = Tensor(alpha / rank, ms.float16)
         in_f = base.in_channels
         out_f = base.out_channels
         self.A = Parameter(initializer(Normal(0.02), (rank, in_f)), name="lora_A")
@@ -295,7 +294,7 @@ class SFMSlotBank(nn.Cell):
         self.W_alpha = nn.Dense(hidden_dim, slot_dim)
         self.W_beta = nn.Dense(hidden_dim, slot_dim)
         self.W_v = nn.Dense(hidden_dim, slot_dim)
-        self.scale = slot_dim ** -0.5
+        self.scale = Tensor(slot_dim ** -0.5, ms.float16)
 
     def construct(self, hidden_states: Tensor) -> tuple:
         """Returns (modified_hidden, new_slots)."""
@@ -368,23 +367,53 @@ def inject_sfm_adapters(model: nn.Cell, hidden_dim: int,
 
 
 class SFMEnhancedModel(nn.Cell):
-    """Model wrapper that applies SFM adapters at specified layers."""
+    """Model wrapper that applies SFM adapters at specified layers.
+
+    Uses named attributes (not CellDict) for GRAPH_MODE compatibility.
+    SFM indices must be [7, 14, 21, 27] — hardcoded in construct.
+    """
 
     def __init__(self, base_model: nn.Cell, sfm_adapters: list):
         super().__init__()
         self.base = base_model
-        self.sfm_adapters = sfm_adapters  # list of (idx, adapter)
-        self.sfm_dict = nn.CellDict()
+        # Store each adapter as a named attribute for GRAPH_MODE
+        self.sfm_layer_7 = None
+        self.sfm_layer_14 = None
+        self.sfm_layer_21 = None
+        self.sfm_layer_27 = None
         for idx, adapter in sfm_adapters:
-            self.sfm_dict[str(idx)] = adapter
-        self.sfm_indices = [idx for idx, _ in sfm_adapters]
+            setattr(self, f"sfm_layer_{idx}", adapter)
 
     def construct(self, input_ids: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
         x = self.base.embed_tokens(input_ids)
-        for i, layer in enumerate(self.base.layers):
-            x = layer(x, cos, sin)
-            if i in self.sfm_indices:
-                x, _ = self.sfm_dict[str(i)](x)
+        x = self.base.layers[0](x, cos, sin)
+        x = self.base.layers[1](x, cos, sin)
+        x = self.base.layers[2](x, cos, sin)
+        x = self.base.layers[3](x, cos, sin)
+        x = self.base.layers[4](x, cos, sin)
+        x = self.base.layers[5](x, cos, sin)
+        x = self.base.layers[6](x, cos, sin)
+        x, _ = self.sfm_layer_7(self.base.layers[7](x, cos, sin))
+        x = self.base.layers[8](x, cos, sin)
+        x = self.base.layers[9](x, cos, sin)
+        x = self.base.layers[10](x, cos, sin)
+        x = self.base.layers[11](x, cos, sin)
+        x = self.base.layers[12](x, cos, sin)
+        x = self.base.layers[13](x, cos, sin)
+        x, _ = self.sfm_layer_14(self.base.layers[14](x, cos, sin))
+        x = self.base.layers[15](x, cos, sin)
+        x = self.base.layers[16](x, cos, sin)
+        x = self.base.layers[17](x, cos, sin)
+        x = self.base.layers[18](x, cos, sin)
+        x = self.base.layers[19](x, cos, sin)
+        x = self.base.layers[20](x, cos, sin)
+        x, _ = self.sfm_layer_21(self.base.layers[21](x, cos, sin))
+        x = self.base.layers[22](x, cos, sin)
+        x = self.base.layers[23](x, cos, sin)
+        x = self.base.layers[24](x, cos, sin)
+        x = self.base.layers[25](x, cos, sin)
+        x = self.base.layers[26](x, cos, sin)
+        x, _ = self.sfm_layer_27(self.base.layers[27](x, cos, sin))
         x = self.base.norm(x)
         logits = self.base.lm_head(x)
         return logits
@@ -447,21 +476,6 @@ MEASURE = 15
 
 
 # ===========================================================================
-# Phase 13: Weight tying utility
-# ===========================================================================
-
-def tie_weights(model: nn.Cell):
-    """Tie embedding and LM head weights (Qwen2 style)."""
-    emb_w = model.embed_tokens.embedding_table
-    lm_w = model.lm_head.weight
-    # Share the same Parameter by reassigning
-    model.lm_head.weight = emb_w
-    # Must rebuild dense layer to use shared param
-    model.lm_head = nn.Dense(HIDDEN_DIM, VOCAB_SIZE, has_bias=False)
-    model.lm_head.weight = emb_w
-
-
-# ===========================================================================
 # Phase 14: Single-config benchmark (functional-style training)
 # ===========================================================================
 
@@ -473,8 +487,9 @@ def run_one_config(model, optimizer, loss_fn, cfg: dict, rank: int, world_size: 
     B, S = cfg["batch_size"], cfg["seq_len"]
     tok = B * S
 
-    # Precompute RoPE tables
-    cos, sin = _build_rope_cache(S, HEAD_DIM)
+    # Precompute RoPE tables for S-1 (after label shift trimming)
+    actual_len = S - 1
+    cos, sin = _build_rope_cache(actual_len, HEAD_DIM)
 
     # Create synthetic data tensors (pinned for this config)
     np.random.seed(42)
@@ -645,13 +660,6 @@ def run_local_test():
     o2, s2 = ad(h)
     log(f"    SFMAdapter: {h.shape} -> {o2.shape}, slots {s2.shape} [OK]")
 
-    # Test weight tying
-    log("  Testing weight tying...")
-    model = Qwen2LikeModel()
-    tie_weights(model)
-    shared = model.lm_head.weight is model.embed_tokens.embedding_table
-    log(f"    Weight tied: {shared} [OK]")
-
     # Test inject_lora
     log("  Testing LoRA injection...")
     model2 = Qwen2LikeModel()
@@ -779,7 +787,6 @@ def main():
         log("Building Qwen2-like model...")
 
     model = Qwen2LikeModel()
-    tie_weights(model)
 
     if rank_id == 0:
         log("Injecting LoRA + SFM adapters...")
@@ -805,10 +812,15 @@ def main():
     # ---- Loss + optimizer ----
     loss_fn = nn.CrossEntropyLoss()
 
-    # Only optimize trainable params (LoRA + SFM)
-    train_params = model.trainable_params()
+    # Collect ONLY LoRA + SFM trainable params (freeze base model)
+    train_params = []
+    for name, param in model.parameters_and_names():
+        if "lora_" in name or "sfm_" in name or "slot_" in name:
+            train_params.append(param)
     if rank_id == 0:
-        log(f"Trainable parameter groups: {len(train_params)}")
+        train_total = sum(p.size for p in train_params)
+        log(f"Trainable param groups: {len(train_params)} "
+            f"({train_total:,} params)")
 
     optimizer = nn.AdamWeightDecay(train_params, learning_rate=2e-4)
 
