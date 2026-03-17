@@ -190,10 +190,10 @@ class TransformerBlock(nn.Cell):
 
         # ---- Self-attention ----
         h = self.input_norm(x)
-        # (B, S, H*D) → (B, H, S, D)
-        Q = self.q_proj(h).view(B, S, NUM_HEADS, HEAD_DIM).transpose(1, 2)
-        K = self.k_proj(h).view(B, S, NUM_KV_HEADS, HEAD_DIM).transpose(1, 2)
-        V = self.v_proj(h).view(B, S, NUM_KV_HEADS, HEAD_DIM).transpose(1, 2)
+        # (B, S, H*D) → (B, H, S, D) — must use full 4-arg perm
+        Q = self.q_proj(h).view(B, S, NUM_HEADS, HEAD_DIM).transpose(0, 2, 1, 3)
+        K = self.k_proj(h).view(B, S, NUM_KV_HEADS, HEAD_DIM).transpose(0, 2, 1, 3)
+        V = self.v_proj(h).view(B, S, NUM_KV_HEADS, HEAD_DIM).transpose(0, 2, 1, 3)
 
         # RoPE on Q and K
         Q = _apply_rotary_emb(Q, cos, sin)
@@ -210,7 +210,7 @@ class TransformerBlock(nn.Cell):
         attn = ops.softmax(attn, axis=-1)
         out = ops.matmul(attn, V)  # (B, H, S, D)
         # (B, H, S, D) → (B, S, H*D)
-        out = out.transpose(1, 2).reshape(B, S, -1)
+        out = out.transpose(0, 2, 1, 3).reshape(B, S, -1)
         out = self.o_proj(out)
         x = x + self.post_attn_norm(out)
 
@@ -323,14 +323,14 @@ class SFMSlotBank(nn.Cell):
             self.slot_vectors.reshape(1, self.num_slots, self.slot_dim),
             (B, self.num_slots, self.slot_dim))
 
-        Q = self.q_proj(hidden_states).view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
-        K = self.k_proj(slots).view(B, self.num_slots, self.num_heads, self.head_dim).transpose(1, 2)
-        V = self.v_proj(slots).view(B, self.num_slots, self.num_heads, self.head_dim).transpose(1, 2)
+        Q = self.q_proj(hidden_states).view(B, S, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        K = self.k_proj(slots).view(B, self.num_slots, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        V = self.v_proj(slots).view(B, self.num_slots, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
 
         attn = ops.matmul(Q, K.transpose(0, 1, 3, 2)) * self.scale
         attn = ops.softmax(attn, axis=-1)
         out = ops.matmul(attn, V)
-        out = out.transpose(1, 2).reshape(B, S, -1)
+        out = out.transpose(0, 2, 1, 3).reshape(B, S, -1)
         out = self.out_proj(out)
         modified = self.layer_norm(hidden_states + out)
 
