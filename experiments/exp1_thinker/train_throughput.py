@@ -21,18 +21,41 @@ import os
 import sys
 import time
 
-print("=" * 60, flush=True)
-print("[BOOT] train_throughput.py starting", flush=True)
-print(f"[BOOT] Python {sys.version}", flush=True)
-print(f"[BOOT] CWD: {os.getcwd()}", flush=True)
-print(f"[BOOT] RANK_ID={os.getenv('RANK_ID', 'NOT SET')}", flush=True)
-
 os.environ["PYTHONUNBUFFERED"] = "1"
 try:
     sys.stdout.reconfigure(line_buffering=True)
     sys.stderr.reconfigure(line_buffering=True)
 except Exception:
     pass
+
+# --- Early boot log: /tmp/sfm_boot.log (before c2net prepare()) ---
+# This ensures output is captured even if pip install or early init fails.
+_boot_log = "/tmp/sfm_boot.log"
+_log_file = _boot_log  # global used by log()
+try:
+    with open(_boot_log, "w") as f:
+        f.write(f"[BOOT] train_throughput.py starting\n")
+        f.write(f"[BOOT] Python {sys.version}\n")
+        f.write(f"[BOOT] CWD: {os.getcwd()}\n")
+        f.write(f"[BOOT] RANK_ID={os.getenv('RANK_ID', 'NOT SET')}\n")
+except Exception:
+    pass
+
+def log(msg: str) -> None:
+    """Print to stdout AND write to log file (if set)."""
+    print(msg, flush=True)
+    if _log_file:
+        try:
+            with open(_log_file, "a") as f:
+                f.write(msg + "\n")
+        except Exception:
+            pass
+
+log("=" * 60)
+log("[BOOT] train_throughput.py starting")
+log(f"[BOOT] Python {sys.version}")
+log(f"[BOOT] CWD: {os.getcwd()}")
+log(f"[BOOT] RANK_ID={os.getenv('RANK_ID', 'NOT SET')}")
 
 
 # ===========================================================================
@@ -45,15 +68,15 @@ def _pip_install(*packages):
     mirror = "https://pypi.tuna.tsinghua.edu.cn/simple"
     cmd = [sys.executable, "-m", "pip", "install"] + list(packages) + [
         "-i", mirror, "--no-cache-dir", "-q"]
-    print(f"[PIP] {' '.join(packages)}", flush=True)
+    log(f"[PIP] pip install {' '.join(packages)}")
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     for line in iter(p.stdout.readline, b''):
         text = line.decode('utf-8', errors='replace').strip()
         if text:
-            print(f"  {text}", flush=True)
+            log(f"  {text}")
     p.wait()
     if p.returncode != 0:
-        print(f"[PIP] FAILED (exit code {p.returncode})", flush=True)
+        log(f"[PIP] FAILED (exit code {p.returncode})")
     return p.returncode == 0
 
 
@@ -74,51 +97,60 @@ def _try_import(name):
 #   fail with "undefined symbol: aclGetDeviceCapability" on CANN 7.
 if _try_import("torch"):
     import torch
-    print(f"[BOOT] torch {torch.__version__} (pre-installed)", flush=True)
+    log(f"[BOOT] torch {torch.__version__} (pre-installed)")
 else:
-    print("[BOOT] torch not found, installing torch==2.1.0 "
-          "(required for CANN 7)...", flush=True)
+    log("[BOOT] torch not found, installing torch==2.1.0 (CANN 7)...")
     if not _pip_install("torch==2.1.0"):
-        print("[BOOT] FATAL: cannot install torch==2.1.0. "
-              "The image may be incompatible.", flush=True)
+        log("[BOOT] FATAL: cannot install torch==2.1.0.")
         sys.exit(1)
     import torch
-    print(f"[BOOT] torch {torch.__version__} installed OK", flush=True)
+    log(f"[BOOT] torch {torch.__version__} installed OK")
 
 # --- Check and install torch_npu (skip on --local_test) ---
 if "--local_test" in sys.argv:
-    print("[BOOT] Skipping torch_npu check (local test mode)", flush=True)
+    log("[BOOT] Skipping torch_npu check (local test mode)")
 elif _try_import("torch_npu"):
     import torch_npu
-    print(f"[BOOT] torch_npu {torch_npu.__version__} (pre-installed)", flush=True)
+    log(f"[BOOT] torch_npu {torch_npu.__version__} (pre-installed)")
 else:
-    print("[BOOT] torch_npu not found, installing torch_npu==2.1.0 "
-          "(required for CANN 7)...", flush=True)
-    if not _pip_install("torch_npu==2.1.0"):
-        print("[BOOT] FATAL: cannot install torch_npu==2.1.0. "
-              "Is CANN 7 installed on this image?", flush=True)
+    # Try exact CANN 7 version first, then fall back to latest
+    npu_installed = False
+    for npu_spec in ["torch_npu==2.1.0", "torch_npu"]:
+        log(f"[BOOT] Installing {npu_spec}...")
+        if _pip_install(npu_spec):
+            # Verify it actually imports (not just pip success)
+            try:
+                import torch_npu
+                log(f"[BOOT] torch_npu {torch_npu.__version__} installed + imported OK")
+                npu_installed = True
+                break
+            except ImportError as e:
+                log(f"[BOOT] torch_npu pip OK but import FAILED: {e}")
+                log(f"[BOOT]   (likely CANN version mismatch, trying next)")
+        else:
+            log(f"[BOOT] {npu_spec} pip install failed")
+    if not npu_installed:
+        log("[BOOT] FATAL: no working torch_npu version found for this CANN.")
         sys.exit(1)
-    import torch_npu
-    print(f"[BOOT] torch_npu {torch_npu.__version__} installed OK", flush=True)
 
 # --- Check and install transformers ---
 if _try_import("transformers"):
-    print("[BOOT] transformers (pre-installed)", flush=True)
+    log("[BOOT] transformers (pre-installed)")
 else:
-    print("[BOOT] transformers not found, installing...", flush=True)
+    log("[BOOT] transformers not found, installing...")
     if not _pip_install("transformers>=4.37.0,<4.47.0"):
-        print("[BOOT] FATAL: cannot install transformers", flush=True)
+        log("[BOOT] FATAL: cannot install transformers")
         sys.exit(1)
-    print("[BOOT] transformers installed OK", flush=True)
+    log("[BOOT] transformers installed OK")
 
 # --- Check c2net ---
 if not _try_import("c2net"):
-    print("[BOOT] c2net not found, installing...", flush=True)
+    log("[BOOT] c2net not found, installing...")
     _pip_install("-U", "c2net")
     if not _try_import("c2net"):
-        print("[BOOT] FATAL: cannot install c2net", flush=True)
+        log("[BOOT] FATAL: cannot install c2net")
         sys.exit(1)
-    print("[BOOT] c2net installed OK", flush=True)
+    log("[BOOT] c2net installed OK")
 
 
 # ===========================================================================
@@ -134,11 +166,11 @@ from c2net.context import prepare, upload_output
 _has_npu = _try_import("torch_npu")
 if _has_npu:
     import torch_npu
-    print(f"[BOOT] All dependencies ready. "
-          f"torch={torch.__version__}, torch_npu={torch_npu.__version__}", flush=True)
+    log(f"[BOOT] All dependencies ready. "
+        f"torch={torch.__version__}, torch_npu={torch_npu.__version__}")
 else:
-    print(f"[BOOT] torch={torch.__version__} ready "
-          f"(torch_npu skipped for local test)", flush=True)
+    log(f"[BOOT] torch={torch.__version__} ready "
+        f"(torch_npu skipped for local test)")
 
 
 # ===========================================================================
@@ -148,22 +180,6 @@ parser = argparse.ArgumentParser(description="SFM+LoRA Throughput Benchmark")
 parser.add_argument("--model_path", type=str, default=None)
 parser.add_argument("--local_test", action="store_true")
 parser.add_argument("--npu_count", type=int, default=0)
-
-
-# ===========================================================================
-# Phase 4: Logging
-# ===========================================================================
-_log_file = None
-
-
-def log(msg: str) -> None:
-    print(msg, flush=True)
-    if _log_file:
-        try:
-            with open(_log_file, "a") as f:
-                f.write(msg + "\n")
-        except Exception:
-            pass
 
 
 # ===========================================================================
@@ -506,6 +522,13 @@ def main():
             output_path = c2net_ctx.output_path
             os.makedirs(output_path, exist_ok=True)
             _log_file = os.path.join(output_path, "training.log")
+            # Copy boot log into output dir so it gets uploaded
+            if os.path.exists(_boot_log):
+                try:
+                    import shutil
+                    shutil.copy2(_boot_log, os.path.join(output_path, "boot.log"))
+                except Exception:
+                    pass
 
             model_path = resolve_model_path(c2net_ctx, args)
             if not model_path:
