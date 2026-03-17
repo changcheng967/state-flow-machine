@@ -346,16 +346,19 @@ class LoRALinear(nn.Cell):
 
         if world_size > 1:
             # A matmul: replicated (LoRA rank is small, no benefit from splitting)
-            self.lora_a.shard(((1, 1, 1), (1, 1)))
+            self.lora_a.shard(((1, 1), (1, 1)))
             # B matmul: column-parallel (split out_f across NPUs, matching base)
-            self.lora_b.shard(((1, 1, 1), (world_size, 1)))
+            self.lora_b.shard(((1, 1), (world_size, 1)))
 
     def construct(self, x: Tensor) -> Tensor:
         # base: (B, S, in_f) -> (B, S, out_f)
         base_out = self.base(x)
-        # lora: x @ A^T -> (B, S, rank), then @ B^T -> (B, S, out_f)
-        hidden = self.lora_a(x, self.A)
-        lora_out = self.lora_b(hidden, self.B) * self.scaling
+        # lora: Ascend MatMul requires 2D inputs — reshape to (B*S, in_f)
+        x_shape = x.shape
+        x_2d = x.reshape(-1, x_shape[-1])
+        hidden = self.lora_a(x_2d, self.A)       # (B*S, rank)
+        lora_out = self.lora_b(hidden, self.B) * self.scaling  # (B*S, out_f)
+        lora_out = lora_out.reshape(x_shape[:-1] + (self.base.out_channels,))
         return base_out + lora_out
 
     @property
