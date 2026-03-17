@@ -240,16 +240,17 @@ class Qwen2LikeModel(nn.Cell):
         self.norm = RMSNorm(HIDDEN_DIM)
         self.lm_head = _fp16_dense(HIDDEN_DIM, VOCAB_SIZE)
 
-    def construct(self, input_ids: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+    def construct(self, input_ids: Tensor, cos: Tensor, sin: Tensor, mask: Tensor) -> Tensor:
         """Forward pass. Returns logits (B, S, V).
 
         Args:
             input_ids: (B, S) int32
             cos, sin: precomputed RoPE tables
+            mask: causal attention mask (1, 1, S, S)
         """
         x = self.embed_tokens(input_ids)  # (B, S, H)
         for layer in self.layers:
-            x = layer(x, cos, sin)
+            x = layer(x, cos, sin, mask)
         x = self.norm(x)
         logits = self.lm_head(x)  # (B, S, V)
         return logits
@@ -834,10 +835,26 @@ def main():
     loss_fn = nn.CrossEntropyLoss()
 
     # Collect ONLY LoRA + SFM trainable params (freeze base model)
+    # NOTE: parameters_and_names() may not traverse dynamically-wrapped
+    # subcells in MS 2.2, so we collect params directly from model structure.
     train_params = []
-    for name, param in model.parameters_and_names():
-        if "lora_" in name or "sfm_" in name or "slot_" in name:
-            train_params.append(param)
+
+    # 1. LoRA params: walk base.layers[*].{q,k,v,o}_proj.{A, B, scaling}
+    base_model = model.base  # Qwen2LikeModel
+    for layer_idx in range(NUM_LAYERS):
+        layer = base_model.layers[layer_idx]
+        for proj_name in ["q_proj", "k_proj", "v_proj", "o_proj"]:
+            proj = getattr(layer, proj_name, None)
+            if proj is not None and isinstance(proj, LoRALinear):
+                train_params.extend([proj.A, proj.B])
+
+    # 2. SFM params: walk sfm_layer_{7,14,21,27}.slot_bank.*
+    for idx in sfm_idx:
+        adapter = getattr(model, f"sfm_layer_{idx}", None)
+        if adapter is not None:
+            for p in adapter.slot_bank.get_parameters():
+                train_params.append(p)
+
     if rank_id == 0:
         train_total = sum(p.size for p in train_params)
         log(f"Trainable param groups: {len(train_params)} "
