@@ -420,7 +420,7 @@ def build_sfm_enhanced_model(base_model: nn.Cell, sfm_adapters: list,
     generated_construct = ns["construct"]
 
     def __init__(self_inner, base_model_inner, adapters_inner):
-        super(SFMEnhancedModel, self_inner).__init__()
+        nn.Cell.__init__(self_inner)
         self_inner.base = base_model_inner
         for idx in sfm_set:
             setattr(self_inner, f"sfm_layer_{idx}", None)
@@ -719,14 +719,18 @@ def main():
         return
 
     # ---- Self-bootstrap: spawn worker processes for multi-NPU ----
-    # If RANK_ID is not set, no external launcher (msrun/mpirun) is managing
-    # us.  Spawn NPU_COUNT workers ourselves; this process becomes rank 0.
-    if os.getenv('RANK_ID') is None:
+    # OpenI sets RANK_ID=0 but only launches 1 process.  Check RANK_SIZE to
+    # detect whether an external launcher (msrun/mpirun) is managing us.
+    _rank_size_str = os.getenv('RANK_SIZE')
+    _need_bootstrap = (_rank_size_str is None or int(_rank_size_str) <= 1)
+    if _need_bootstrap:
         num_workers = args.npu_count if args.npu_count > 0 else 4
-        os.environ['RANK_ID'] = '0'
-        os.environ['DEVICE_ID'] = '0'
         os.environ['RANK_SIZE'] = str(num_workers)
-        log(f"Self-bootstrapping {num_workers} NPUs (this process = rank 0)")
+        # RANK_ID may already be 0 (set by OpenI) — keep it
+        if os.getenv('RANK_ID') is None:
+            os.environ['RANK_ID'] = '0'
+            os.environ['DEVICE_ID'] = '0'
+        log(f"Self-bootstrapping {num_workers} NPUs (rank 0)")
         import subprocess as _sp
         for i in range(1, num_workers):
             env = os.environ.copy()
