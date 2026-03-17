@@ -21,6 +21,7 @@ import os
 import sys
 import time
 import math
+import gc
 import argparse
 
 # Ascend 910 tuning env vars — MUST be set before import mindspore
@@ -201,7 +202,6 @@ class TransformerBlock(nn.Cell):
 
     def __init__(self, world_size: int = 1):
         super().__init__()
-        self.recompute = True  # gradient checkpointing: free activations after fwd
         ws = world_size
         _mp = ws > 1  # model parallel enabled
 
@@ -302,7 +302,13 @@ class Qwen2LikeModel(nn.Cell):
         self.layers = nn.CellList(
             [TransformerBlock(world_size) for _ in range(NUM_LAYERS)])
         self.norm = RMSNorm(HIDDEN_DIM)
-        self.lm_head = _fp16_dense(HIDDEN_DIM, VOCAB_SIZE)
+        # Column-parallel lm_head: split vocab dim across NPUs.
+        # Saves ~800 MB per NPU (1.09 GB / 4 ≈ 273 MB).
+        # SEMI_AUTO_PARALLEL auto-inserts AllGather before unsharded loss.
+        if world_size > 1:
+            self.lm_head = _sharded_dense(HIDDEN_DIM, VOCAB_SIZE, (1, 1), (ws, 1))
+        else:
+            self.lm_head = _fp16_dense(HIDDEN_DIM, VOCAB_SIZE)
 
     def construct(self, input_ids: Tensor, cos: Tensor, sin: Tensor, mask: Tensor) -> Tensor:
         """Forward pass. Returns logits (B, S, V).
@@ -407,10 +413,16 @@ class SFMSlotBank(nn.Cell):
 
         self.layer_norm = RMSNorm(hidden_dim)
 
-        # Gated recurrent update (replicated — small output)
+        # Gated recurrent update (replicated — small output, explicit shard for layout)
         self.W_alpha = _fp16_dense(hidden_dim, slot_dim, has_bias=True)
         self.W_beta = _fp16_dense(hidden_dim, slot_dim, has_bias=True)
         self.W_v = _fp16_dense(hidden_dim, slot_dim, has_bias=True)
+        if world_size > 1:
+            # Explicit data-parallel shard: prevents "has not tensor layout" warnings
+            # and ensures parallel optimizer handles these correctly
+            self.W_alpha.matmul.shard(((1, 1), (1, 1)))
+            self.W_beta.matmul.shard(((1, 1), (1, 1)))
+            self.W_v.matmul.shard(((1, 1), (1, 1)))
         self.scale = Tensor(slot_dim ** -0.5, ms.float16)
 
         # NOTE: Attention uses functional ops.matmul() (batched 4D) not
@@ -598,12 +610,12 @@ def create_data_loader(batch_size: int, seq_len: int, num_samples: int = 100):
 # ===========================================================================
 
 CONFIGS = [
-    {"name": "A", "batch_size": 1, "seq_len": 2048},
-    {"name": "B", "batch_size": 2, "seq_len": 2048},
-    {"name": "C", "batch_size": 4, "seq_len": 2048},
-    {"name": "D", "batch_size": 2, "seq_len": 4096},
-    {"name": "E", "batch_size": 4, "seq_len": 1024},
-    {"name": "F", "batch_size": 1, "seq_len": 8192},
+    {"name": "E", "batch_size": 4, "seq_len": 1024},   # smallest attn (S²=1M)
+    {"name": "A", "batch_size": 1, "seq_len": 2048},   # S²=4M
+    {"name": "B", "batch_size": 2, "seq_len": 2048},   # S²=4M
+    {"name": "C", "batch_size": 4, "seq_len": 2048},   # S²=4M
+    {"name": "D", "batch_size": 2, "seq_len": 4096},   # S²=16M
+    {"name": "F", "batch_size": 1, "seq_len": 8192},   # S²=64M
 ]
 WARMUP = 5
 MEASURE = 15
@@ -644,13 +656,17 @@ def run_one_config(model, optimizer, loss_fn, cfg: dict, rank: int, world_size: 
     labels_trimmed = labels[:, 1:].reshape(-1,)  # (B*(S-1),)
 
     # Build training cell (new instance per config for different seq_len)
-    train_net = SFMForwardLossCell(model, loss_fn, cos, sin, causal_mask)
-    train_step = nn.TrainOneStepCell(train_net, optimizer)
-    train_step.set_train()
-
-    log(f"  Config {cfg['name']}: B={B}, S={S}, tok/step={tok:,}")
+    # Initialized to None so finally block is safe even if creation OOMs
+    train_net = None
+    train_step = None
 
     try:
+        train_net = SFMForwardLossCell(model, loss_fn, cos, sin, causal_mask)
+        train_step = nn.TrainOneStepCell(train_net, optimizer)
+        train_step.set_train()
+
+        log(f"  Config {cfg['name']}: B={B}, S={S}, tok/step={tok:,}")
+
         # Warmup
         for _ in range(WARMUP):
             train_step(input_trimmed, labels_trimmed)
@@ -676,6 +692,13 @@ def run_one_config(model, optimizer, loss_fn, cfg: dict, rank: int, world_size: 
             log(f"  Config {cfg['name']}: OOM (B={B}, S={S})")
             return None
         raise
+    finally:
+        # CRITICAL: free compiled graph before next config.
+        # GRAPH_MODE compiles forward+backward into a static graph that
+        # persists on the Cell object. Without explicit cleanup, each
+        # config's graph accumulates and cascading OOM occurs.
+        del train_step, train_net
+        gc.collect()
 
 
 # ===========================================================================
@@ -938,6 +961,12 @@ def main():
         log("Building Qwen2-like model...")
 
     model = Qwen2LikeModel(world_size=world_size)
+
+    # Enable gradient checkpointing on every transformer layer.
+    # This frees activations after each layer's forward pass and recomputes
+    # them during backward — reduces peak activation memory from ~18 GB to ~1 GB.
+    for layer in model.layers:
+        layer.recompute()
 
     if rank_id == 0:
         log("Injecting LoRA + SFM adapters...")
