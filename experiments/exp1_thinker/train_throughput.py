@@ -718,6 +718,24 @@ def main():
         run_local_test()
         return
 
+    # ---- Self-bootstrap: spawn worker processes for multi-NPU ----
+    # If RANK_ID is not set, no external launcher (msrun/mpirun) is managing
+    # us.  Spawn NPU_COUNT workers ourselves; this process becomes rank 0.
+    if os.getenv('RANK_ID') is None:
+        num_workers = args.npu_count if args.npu_count > 0 else 4
+        os.environ['RANK_ID'] = '0'
+        os.environ['DEVICE_ID'] = '0'
+        os.environ['RANK_SIZE'] = str(num_workers)
+        log(f"Self-bootstrapping {num_workers} NPUs (this process = rank 0)")
+        import subprocess as _sp
+        for i in range(1, num_workers):
+            env = os.environ.copy()
+            env['RANK_ID'] = str(i)
+            env['DEVICE_ID'] = str(i)
+            env['RANK_SIZE'] = str(num_workers)
+            log(f"  Spawning rank {i} (DEVICE_ID={i})...")
+            _sp.Popen([sys.executable] + sys.argv, env=env)
+
     # ---- Rank / world_size ----
     rank_id_str = os.getenv('RANK_ID')
     rank_id = int(rank_id_str) if rank_id_str is not None else 0
