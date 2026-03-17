@@ -67,29 +67,23 @@ def _try_import(name):
 
 
 # --- Check and install torch ---
+# mindspore_2_2_cann7_train has CANN 7.0.0 (toolkit 5.0.0).
+# Per torch_npu PyPI compatibility table:
+#   CANN 7.0.0 -> torch==2.1.0, torch_npu==2.1.0 (no .post suffix)
+#   All .postN versions (post3, post4, ...) are for CANN 8.x and will
+#   fail with "undefined symbol: aclGetDeviceCapability" on CANN 7.
 if _try_import("torch"):
     import torch
     print(f"[BOOT] torch {torch.__version__} (pre-installed)", flush=True)
 else:
-    print("[BOOT] torch not found, installing...", flush=True)
-    # Try multiple version combos for CANN 7 compatibility
-    installed = False
-    for attempt in [
-        ("torch", "torch_npu"),                              # latest
-        ("torch==2.1.0", "torch_npu"),                       # CANN 7 compat
-        ("torch==2.1.0", "torch_npu==2.1.0.post3"),         # exact CANN 7
-    ]:
-        if _pip_install(*attempt):
-            # Verify import
-            if _try_import("torch"):
-                import torch
-                print(f"[BOOT] torch {torch.__version__} installed OK", flush=True)
-                installed = True
-                break
-    if not installed:
-        print("[BOOT] FATAL: cannot install torch. "
+    print("[BOOT] torch not found, installing torch==2.1.0 "
+          "(required for CANN 7)...", flush=True)
+    if not _pip_install("torch==2.1.0"):
+        print("[BOOT] FATAL: cannot install torch==2.1.0. "
               "The image may be incompatible.", flush=True)
         sys.exit(1)
+    import torch
+    print(f"[BOOT] torch {torch.__version__} installed OK", flush=True)
 
 # --- Check and install torch_npu (skip on --local_test) ---
 if "--local_test" in sys.argv:
@@ -98,9 +92,11 @@ elif _try_import("torch_npu"):
     import torch_npu
     print(f"[BOOT] torch_npu {torch_npu.__version__} (pre-installed)", flush=True)
 else:
-    print("[BOOT] torch_npu not found, installing...", flush=True)
-    if not _pip_install("torch_npu"):
-        print("[BOOT] FATAL: cannot install torch_npu", flush=True)
+    print("[BOOT] torch_npu not found, installing torch_npu==2.1.0 "
+          "(required for CANN 7)...", flush=True)
+    if not _pip_install("torch_npu==2.1.0"):
+        print("[BOOT] FATAL: cannot install torch_npu==2.1.0. "
+              "Is CANN 7 installed on this image?", flush=True)
         sys.exit(1)
     import torch_npu
     print(f"[BOOT] torch_npu {torch_npu.__version__} installed OK", flush=True)
@@ -110,7 +106,7 @@ if _try_import("transformers"):
     print("[BOOT] transformers (pre-installed)", flush=True)
 else:
     print("[BOOT] transformers not found, installing...", flush=True)
-    if not _pip_install("transformers"):
+    if not _pip_install("transformers>=4.37.0,<4.47.0"):
         print("[BOOT] FATAL: cannot install transformers", flush=True)
         sys.exit(1)
     print("[BOOT] transformers installed OK", flush=True)
