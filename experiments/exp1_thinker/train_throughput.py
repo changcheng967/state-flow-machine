@@ -70,7 +70,7 @@ log(f"[BOOT] RANK_ID={os.getenv('RANK_ID', 'NOT SET')}")
 # Phase 1: Import MindSpore (pre-installed, zero pip)
 # ===========================================================================
 import mindspore as ms
-from mindspore import nn, ops, Tensor, Parameter
+from mindspore import nn, ops, Tensor, Parameter, recompute
 from mindspore.common.initializer import Normal, Zero, One, initializer
 import numpy as np
 
@@ -250,7 +250,7 @@ class Qwen2LikeModel(nn.Cell):
         """
         x = self.embed_tokens(input_ids)  # (B, S, H)
         for layer in self.layers:
-            x = layer(x, cos, sin, mask)
+            x = recompute(layer, x, cos, sin, mask)
         x = self.norm(x)
         logits = self.lm_head(x)  # (B, S, V)
         return logits
@@ -407,34 +407,37 @@ class SFMEnhancedModel(nn.Cell):
 
     def construct(self, input_ids: Tensor, cos: Tensor, sin: Tensor, mask: Tensor) -> Tensor:
         x = self.base.embed_tokens(input_ids)
-        x = self.base.layers[0](x, cos, sin, mask)
-        x = self.base.layers[1](x, cos, sin, mask)
-        x = self.base.layers[2](x, cos, sin, mask)
-        x = self.base.layers[3](x, cos, sin, mask)
-        x = self.base.layers[4](x, cos, sin, mask)
-        x = self.base.layers[5](x, cos, sin, mask)
-        x = self.base.layers[6](x, cos, sin, mask)
-        x, _ = self.sfm_layer_7(self.base.layers[7](x, cos, sin, mask))
-        x = self.base.layers[8](x, cos, sin, mask)
-        x = self.base.layers[9](x, cos, sin, mask)
-        x = self.base.layers[10](x, cos, sin, mask)
-        x = self.base.layers[11](x, cos, sin, mask)
-        x = self.base.layers[12](x, cos, sin, mask)
-        x = self.base.layers[13](x, cos, sin, mask)
-        x, _ = self.sfm_layer_14(self.base.layers[14](x, cos, sin, mask))
-        x = self.base.layers[15](x, cos, sin, mask)
-        x = self.base.layers[16](x, cos, sin, mask)
-        x = self.base.layers[17](x, cos, sin, mask)
-        x = self.base.layers[18](x, cos, sin, mask)
-        x = self.base.layers[19](x, cos, sin, mask)
-        x = self.base.layers[20](x, cos, sin, mask)
-        x, _ = self.sfm_layer_21(self.base.layers[21](x, cos, sin, mask))
-        x = self.base.layers[22](x, cos, sin, mask)
-        x = self.base.layers[23](x, cos, sin, mask)
-        x = self.base.layers[24](x, cos, sin, mask)
-        x = self.base.layers[25](x, cos, sin, mask)
-        x = self.base.layers[26](x, cos, sin, mask)
-        x, _ = self.sfm_layer_27(self.base.layers[27](x, cos, sin, mask))
+        # Gradient checkpointing: recompute() frees layer activations after
+        # forward and recomputes them during backward. Saves ~10x activation
+        # memory (from ~12GB to ~1GB for B=1,S=2048,28 layers).
+        x = recompute(self.base.layers[0], x, cos, sin, mask)
+        x = recompute(self.base.layers[1], x, cos, sin, mask)
+        x = recompute(self.base.layers[2], x, cos, sin, mask)
+        x = recompute(self.base.layers[3], x, cos, sin, mask)
+        x = recompute(self.base.layers[4], x, cos, sin, mask)
+        x = recompute(self.base.layers[5], x, cos, sin, mask)
+        x = recompute(self.base.layers[6], x, cos, sin, mask)
+        x, _ = self.sfm_layer_7(recompute(self.base.layers[7], x, cos, sin, mask))
+        x = recompute(self.base.layers[8], x, cos, sin, mask)
+        x = recompute(self.base.layers[9], x, cos, sin, mask)
+        x = recompute(self.base.layers[10], x, cos, sin, mask)
+        x = recompute(self.base.layers[11], x, cos, sin, mask)
+        x = recompute(self.base.layers[12], x, cos, sin, mask)
+        x = recompute(self.base.layers[13], x, cos, sin, mask)
+        x, _ = self.sfm_layer_14(recompute(self.base.layers[14], x, cos, sin, mask))
+        x = recompute(self.base.layers[15], x, cos, sin, mask)
+        x = recompute(self.base.layers[16], x, cos, sin, mask)
+        x = recompute(self.base.layers[17], x, cos, sin, mask)
+        x = recompute(self.base.layers[18], x, cos, sin, mask)
+        x = recompute(self.base.layers[19], x, cos, sin, mask)
+        x = recompute(self.base.layers[20], x, cos, sin, mask)
+        x, _ = self.sfm_layer_21(recompute(self.base.layers[21], x, cos, sin, mask))
+        x = recompute(self.base.layers[22], x, cos, sin, mask)
+        x = recompute(self.base.layers[23], x, cos, sin, mask)
+        x = recompute(self.base.layers[24], x, cos, sin, mask)
+        x = recompute(self.base.layers[25], x, cos, sin, mask)
+        x = recompute(self.base.layers[26], x, cos, sin, mask)
+        x, _ = self.sfm_layer_27(recompute(self.base.layers[27], x, cos, sin, mask))
         x = self.base.norm(x)
         logits = self.base.lm_head(x)
         return logits
