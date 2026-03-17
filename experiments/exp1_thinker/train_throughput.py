@@ -721,7 +721,8 @@ def main():
     # ---- Rank / world_size ----
     rank_id_str = os.getenv('RANK_ID')
     rank_id = int(rank_id_str) if rank_id_str is not None else 0
-    is_multi_card = rank_id_str is not None
+    rank_size_str = os.getenv('RANK_SIZE')
+    is_multi_card = (rank_id_str is not None or rank_size_str is not None)
 
     log(f"Rank {rank_id}, multi_card={is_multi_card}")
 
@@ -755,7 +756,9 @@ def main():
 
             # Model path (unused -- we build from scratch, but kept for compatibility)
             model_path = resolve_model_path(c2net_ctx, args)
-            world_size = args.npu_count if args.npu_count > 0 else 1
+            # world_size: prefer RANK_SIZE (set by msrun), then --npu_count arg
+            world_size = (int(rank_size_str) if rank_size_str
+                          else (args.npu_count if args.npu_count > 0 else 1))
 
             with open(_SYNC_FILE, "w") as f:
                 f.write(f"{output_path}\n{world_size}\n")
