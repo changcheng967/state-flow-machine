@@ -243,13 +243,11 @@ class TransformerBlock(nn.Cell):
 
         self.scale = Tensor(HEAD_DIM ** -0.5, ms.float16)
 
-        # Attention matmuls — stored as attributes for SEMI_AUTO_PARALLEL shard
-        self.attn_qk = ops.MatMul(transpose_b=True)
-        self.attn_out = ops.MatMul()
-        if _mp:
-            # Each NPU computes attention for its local heads only
-            self.attn_qk.shard(((1, ws, 1, 1), (1, ws, 1, 1)))
-            self.attn_out.shard(((1, ws, 1, 1), (1, ws, 1, 1)))
+        # NOTE: Attention matmuls use functional ops.matmul() (not the
+        # ops.MatMul primitive) because Ascend's MatMul primitive only
+        # supports 2D inputs. The functional form handles batched 4D tensors.
+        # In SEMI_AUTO_PARALLEL, unsharded ops inherit tensor layout
+        # from their sharded inputs (column-parallel Q/K/V projections).
 
     def construct(self, x: Tensor, cos: Tensor, sin: Tensor, mask: Tensor) -> Tensor:
         B, S, _ = x.shape
@@ -270,10 +268,10 @@ class TransformerBlock(nn.Cell):
         V = ops.tile(V, (1, NUM_KV_GROUPS, 1, 1))
 
         # Scaled dot-product attention (causal)
-        attn = self.attn_qk(Q, K) * self.scale
+        attn = ops.matmul(Q, K.transpose(0, 1, 3, 2)) * self.scale
         attn = attn + mask  # mask: (1, 1, S, S)
         attn = ops.softmax(attn, axis=-1)
-        out = self.attn_out(attn, V)  # (B, H, S, D)
+        out = ops.matmul(attn, V)  # (B, H, S, D)
         # (B, H, S, D) → (B, S, H*D)
         out = out.transpose(0, 2, 1, 3).reshape(B, S, -1)
         out = self.o_proj(out)
@@ -415,12 +413,9 @@ class SFMSlotBank(nn.Cell):
         self.W_v = _fp16_dense(hidden_dim, slot_dim, has_bias=True)
         self.scale = Tensor(slot_dim ** -0.5, ms.float16)
 
-        # Attention matmuls for SEMI_AUTO_PARALLEL
-        self.slot_attn_qk = ops.MatMul(transpose_b=True)
-        self.slot_attn_out = ops.MatMul()
-        if _mp:
-            self.slot_attn_qk.shard(((1, ws, 1, 1), (1, ws, 1, 1)))
-            self.slot_attn_out.shard(((1, ws, 1, 1), (1, ws, 1, 1)))
+        # NOTE: Attention uses functional ops.matmul() (batched 4D) not
+        # ops.MatMul primitive (2D only on Ascend). Unsharded ops
+        # inherit tensor layout from column-parallel projections.
 
     def construct(self, hidden_states: Tensor) -> tuple:
         """Returns (modified_hidden, new_slots)."""
@@ -433,9 +428,9 @@ class SFMSlotBank(nn.Cell):
         K = self.k_proj(slots).view(B, self.num_slots, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
         V = self.v_proj(slots).view(B, self.num_slots, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
 
-        attn = self.slot_attn_qk(Q, K) * self.scale
+        attn = ops.matmul(Q, K.transpose(0, 1, 3, 2)) * self.scale
         attn = ops.softmax(attn, axis=-1)
-        out = self.slot_attn_out(attn, V)
+        out = ops.matmul(attn, V)
         out = out.transpose(0, 2, 1, 3).reshape(B, S, -1)
         out = self.out_proj(out)
         modified = self.layer_norm(hidden_states + out)
