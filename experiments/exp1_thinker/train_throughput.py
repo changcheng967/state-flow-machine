@@ -74,6 +74,23 @@ from mindspore import nn, ops, Tensor, Parameter
 from mindspore.common.initializer import Normal, Zero, One, initializer
 import numpy as np
 
+# ---------------------------------------------------------------------------
+# Patch: MS 2.2 value_and_grad's internal @jit wrapper has __module__=None,
+# which crashes the GRAPH_MODE parser.  Patch CellNamespace to treat
+# None as '__main__' (the script module) instead of crashing.
+# ---------------------------------------------------------------------------
+import mindspore._extends.parse.namespace as _ns_mod
+_orig_cell_ns = _ns_mod.CellNamespace.__init__
+
+
+def _safe_cell_ns_init(self, name):
+    if name is None:
+        name = '__main__'
+    _orig_cell_ns(self, name)
+
+
+_ns_mod.CellNamespace.__init__ = _safe_cell_ns_init
+
 log(f"[BOOT] MindSpore {ms.__version__}")
 
 # ===========================================================================
