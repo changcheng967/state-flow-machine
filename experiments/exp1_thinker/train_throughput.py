@@ -146,13 +146,16 @@ def _build_rope_cache(seq_len: int, head_dim: int, base: float = 10000.0, dtype=
 
 
 def _apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
-    """Apply rotary embedding. x: (B, H, S, D). cos/sin: (S, D/2)."""
-    D = x.shape[-1]
-    x1 = x[..., :D // 2]
-    x2 = x[..., D // 2:]
-    # Reshape to broadcast with (B, H, S, D//2)
-    cos_s = cos.reshape(1, 1, cos.shape[0], D // 2)  # (1, 1, S, D/2)
-    sin_s = sin.reshape(1, 1, sin.shape[0], D // 2)
+    """Apply rotary embedding. x: (B, H, S, D). cos/sin: (S, D/2).
+
+    All shape constants (HEAD_DIM, HEAD_DIM//2) are Python ints so
+    AUTO_PARALLEL's strategy planner can determine shapes statically.
+    """
+    HD2 = HEAD_DIM // 2
+    x1 = x[..., :HD2]
+    x2 = x[..., HD2:]
+    cos_s = cos.expand_dims(0).expand_dims(0)  # (S, D/2) → (1, 1, S, D/2)
+    sin_s = sin.expand_dims(0).expand_dims(0)
     out1 = x1 * cos_s - x2 * sin_s
     out2 = x1 * sin_s + x2 * cos_s
     return ops.cat([out1, out2], axis=-1)
@@ -354,11 +357,12 @@ class SFMSlotBank(nn.Cell):
         modified = self.layer_norm(hidden_states + out)
 
         # Gated recurrent slot update
-        h = ops.mean(hidden_states, axis=1)  # (B, H)
-        a = ops.sigmoid(self.W_alpha(h))
+        # keep_dims=True avoids squeeze so AUTO_PARALLEL can track dims
+        h = ops.mean(hidden_states, axis=1, keep_dims=True)  # (B, 1, H)
+        a = ops.sigmoid(self.W_alpha(h))  # (B, 1, slot_dim)
         b = ops.sigmoid(self.W_beta(h))
         v = ops.tanh(self.W_v(h))
-        new_slots = a.reshape(B, 1, -1) * slots + b.reshape(B, 1, -1) * v.reshape(B, 1, -1)
+        new_slots = a * slots + b * v  # (B, 1, slot_dim) * (B, num_slots, slot_dim)
         return modified, new_slots
 
 
@@ -840,10 +844,10 @@ def main():
                        device_id=rank_id)
         ms.communication.init()
         ms.set_auto_parallel_context(
-            parallel_mode=ms.ParallelMode.DATA_PARALLEL,
+            parallel_mode=ms.ParallelMode.AUTO_PARALLEL,
             device_num=world_size,
             gradients_mean=True)
-        log(f"Rank {rank_id}: data parallel init OK ({world_size} NPUs)")
+        log(f"Rank {rank_id}: auto parallel init OK ({world_size} NPUs)")
     else:
         ms.set_context(mode=ms.GRAPH_MODE, device_target="Ascend", device_id=0)
         log(f"Rank {rank_id}: single-card Ascend mode")
