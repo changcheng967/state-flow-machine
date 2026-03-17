@@ -15,7 +15,7 @@ Usage:
 """
 
 # ===========================================================================
-# Phase 0: Imports + logging (pure stdlib)
+# Phase 0: Env vars + logging (pure stdlib, BEFORE MindSpore import)
 # ===========================================================================
 import os
 import sys
@@ -23,7 +23,13 @@ import time
 import math
 import argparse
 
+# Ascend 910 tuning env vars — MUST be set before import mindspore
 os.environ["PYTHONUNBUFFERED"] = "1"
+os.environ.setdefault("TASK_QUEUE_ENABLE", "2")
+os.environ.setdefault("CPU_AFFINITY_CONF", "1")
+os.environ.setdefault("ASCEND_GLOBAL_LOG_LEVEL", "3")  # ERROR only
+os.environ.setdefault("MS_COMPILER_CACHE_ENABLE", "1")  # cache compiled graphs
+os.environ.setdefault("MS_BUILD_PROCESS_NUM", "24")  # parallel op compilation
 try:
     sys.stdout.reconfigure(line_buffering=True)
     sys.stderr.reconfigure(line_buffering=True)
@@ -162,7 +168,7 @@ class TransformerBlock(nn.Cell):
 
         self.scale = Tensor(HEAD_DIM ** -0.5, ms.float16)
 
-    def construct(self, x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+    def construct(self, x: Tensor, cos: Tensor, sin: Tensor, mask: Tensor) -> Tensor:
         B, S, _ = x.shape
 
         # ---- Self-attention ----
@@ -175,17 +181,14 @@ class TransformerBlock(nn.Cell):
         Q = _apply_rotary_emb(Q, cos, sin)
         K = _apply_rotary_emb(K, cos, sin)
 
-        # GQA: expand K/V from NUM_KV_HEADS to NUM_HEADS
-        K = ops.repeat_interleave(K, NUM_KV_GROUPS, axis=0)  # (H, B, S, D)
-        V = ops.repeat_interleave(V, NUM_KV_GROUPS, axis=0)
+        # GQA: expand K/V from NUM_KV_HEADS to NUM_HEADS via tile
+        # ops.tile is more Cube-friendly than repeat_interleave
+        K = ops.tile(K, (NUM_KV_GROUPS, 1, 1, 1))  # (H, B, S, D)
+        V = ops.tile(V, (NUM_KV_GROUPS, 1, 1, 1))
 
         # Scaled dot-product attention (causal)
         attn = ops.matmul(Q, K.transpose(0, 1, 3, 2)) * self.scale  # (H, B, S, S)
-
-        # Causal mask
-        mask_shape = (1, 1, S, S)
-        mask_val = Tensor(np.triu(np.full((S, S), -1e4, dtype=np.float32), k=1), ms.float16)
-        attn = attn + mask_val.reshape(mask_shape)
+        attn = attn + mask  # mask: (1, 1, S, S) precomputed on NPU
         attn = ops.softmax(attn, axis=-1)
         out = ops.matmul(attn, V)  # (H, B, S, D)
         out = out.transpose(0, 2, 1, 3).reshape(B, S, -1)
@@ -384,36 +387,36 @@ class SFMEnhancedModel(nn.Cell):
         for idx, adapter in sfm_adapters:
             setattr(self, f"sfm_layer_{idx}", adapter)
 
-    def construct(self, input_ids: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+    def construct(self, input_ids: Tensor, cos: Tensor, sin: Tensor, mask: Tensor) -> Tensor:
         x = self.base.embed_tokens(input_ids)
-        x = self.base.layers[0](x, cos, sin)
-        x = self.base.layers[1](x, cos, sin)
-        x = self.base.layers[2](x, cos, sin)
-        x = self.base.layers[3](x, cos, sin)
-        x = self.base.layers[4](x, cos, sin)
-        x = self.base.layers[5](x, cos, sin)
-        x = self.base.layers[6](x, cos, sin)
-        x, _ = self.sfm_layer_7(self.base.layers[7](x, cos, sin))
-        x = self.base.layers[8](x, cos, sin)
-        x = self.base.layers[9](x, cos, sin)
-        x = self.base.layers[10](x, cos, sin)
-        x = self.base.layers[11](x, cos, sin)
-        x = self.base.layers[12](x, cos, sin)
-        x = self.base.layers[13](x, cos, sin)
-        x, _ = self.sfm_layer_14(self.base.layers[14](x, cos, sin))
-        x = self.base.layers[15](x, cos, sin)
-        x = self.base.layers[16](x, cos, sin)
-        x = self.base.layers[17](x, cos, sin)
-        x = self.base.layers[18](x, cos, sin)
-        x = self.base.layers[19](x, cos, sin)
-        x = self.base.layers[20](x, cos, sin)
-        x, _ = self.sfm_layer_21(self.base.layers[21](x, cos, sin))
-        x = self.base.layers[22](x, cos, sin)
-        x = self.base.layers[23](x, cos, sin)
-        x = self.base.layers[24](x, cos, sin)
-        x = self.base.layers[25](x, cos, sin)
-        x = self.base.layers[26](x, cos, sin)
-        x, _ = self.sfm_layer_27(self.base.layers[27](x, cos, sin))
+        x = self.base.layers[0](x, cos, sin, mask)
+        x = self.base.layers[1](x, cos, sin, mask)
+        x = self.base.layers[2](x, cos, sin, mask)
+        x = self.base.layers[3](x, cos, sin, mask)
+        x = self.base.layers[4](x, cos, sin, mask)
+        x = self.base.layers[5](x, cos, sin, mask)
+        x = self.base.layers[6](x, cos, sin, mask)
+        x, _ = self.sfm_layer_7(self.base.layers[7](x, cos, sin, mask))
+        x = self.base.layers[8](x, cos, sin, mask)
+        x = self.base.layers[9](x, cos, sin, mask)
+        x = self.base.layers[10](x, cos, sin, mask)
+        x = self.base.layers[11](x, cos, sin, mask)
+        x = self.base.layers[12](x, cos, sin, mask)
+        x = self.base.layers[13](x, cos, sin, mask)
+        x, _ = self.sfm_layer_14(self.base.layers[14](x, cos, sin, mask))
+        x = self.base.layers[15](x, cos, sin, mask)
+        x = self.base.layers[16](x, cos, sin, mask)
+        x = self.base.layers[17](x, cos, sin, mask)
+        x = self.base.layers[18](x, cos, sin, mask)
+        x = self.base.layers[19](x, cos, sin, mask)
+        x = self.base.layers[20](x, cos, sin, mask)
+        x, _ = self.sfm_layer_21(self.base.layers[21](x, cos, sin, mask))
+        x = self.base.layers[22](x, cos, sin, mask)
+        x = self.base.layers[23](x, cos, sin, mask)
+        x = self.base.layers[24](x, cos, sin, mask)
+        x = self.base.layers[25](x, cos, sin, mask)
+        x = self.base.layers[26](x, cos, sin, mask)
+        x, _ = self.sfm_layer_27(self.base.layers[27](x, cos, sin, mask))
         x = self.base.norm(x)
         logits = self.base.lm_head(x)
         return logits
@@ -491,6 +494,10 @@ def run_one_config(model, optimizer, loss_fn, cfg: dict, rank: int, world_size: 
     actual_len = S - 1
     cos, sin = _build_rope_cache(actual_len, HEAD_DIM)
 
+    # Precompute causal mask once on NPU (avoid numpy inside graph)
+    causal_np = np.triu(np.full((actual_len, actual_len), -1e4, dtype=np.float16), k=1)
+    causal_mask = Tensor(causal_np.reshape(1, 1, actual_len, actual_len))
+
     # Create synthetic data tensors (pinned for this config)
     np.random.seed(42)
     input_ids = Tensor(
@@ -498,13 +505,12 @@ def run_one_config(model, optimizer, loss_fn, cfg: dict, rank: int, world_size: 
     labels = input_ids.copy()
 
     # Labels for CE: shift by 1 (predict next token)
-    # input_ids: (B, S), labels: (B, S-1) = input_ids[:, 1:]
     input_trimmed = input_ids[:, :-1]
     labels_trimmed = labels[:, 1:].reshape(-1,)  # (B*(S-1),)
 
     # Define forward+loss function (functional style for value_and_grad)
     def forward_fn(inputs, lbls):
-        logits = model(inputs, cos, sin)  # (B, S-1, V) -- inputs is S-1 long
+        logits = model(inputs, cos, sin, causal_mask)  # (B, S-1, V)
         logits_flat = logits.reshape(-1, VOCAB_SIZE)
         loss = loss_fn(logits_flat, lbls)
         return loss, logits_flat
@@ -520,17 +526,16 @@ def run_one_config(model, optimizer, loss_fn, cfg: dict, rank: int, world_size: 
             _, grads = grad_fn(input_trimmed, labels_trimmed)
             optimizer(grads)
 
-        # Measure
-        elapsed = []
+        # Measure — time entire loop, single sync at end
+        t0 = time.time()
         for _ in range(MEASURE):
-            t0 = time.time()
             _, grads = grad_fn(input_trimmed, labels_trimmed)
             optimizer(grads)
-            # Ensure NPU ops complete (dummy sync via host callback)
-            _ = grads[0].asnumpy().shape if len(grads) > 0 else None
-            elapsed.append(time.time() - t0)
+        # Single NPU sync (device-to-host transfer of a small tensor)
+        _ = grads[0].asnumpy().shape if len(grads) > 0 else None
+        total_elapsed = time.time() - t0
 
-        avg_ms = sum(elapsed) / len(elapsed) * 1000
+        avg_ms = total_elapsed / MEASURE * 1000
         tps = tok / (avg_ms / 1000)
 
         # Memory info (best-effort)
@@ -636,7 +641,8 @@ def run_local_test():
     block = TransformerBlock()
     x = Tensor(np.random.randn(1, 8, HIDDEN_DIM).astype(np.float16))
     cos, sin = _build_rope_cache(8, HEAD_DIM)
-    out = block(x, cos, sin)
+    mask = Tensor(np.zeros((1, 1, 8, 8), dtype=np.float16))
+    out = block(x, cos, sin, mask)
     log(f"    TransformerBlock: {x.shape} -> {out.shape} [OK]")
 
     # Test LoRALinear
@@ -674,7 +680,8 @@ def run_local_test():
     enhanced = SFMEnhancedModel(base, sfm_list)
     input_ids = Tensor(np.random.randint(0, 100, (1, 8)).astype(np.int32))
     cos, sin = _build_rope_cache(8, HEAD_DIM)
-    logits = enhanced(input_ids, cos, sin)
+    mask = Tensor(np.zeros((1, 1, 8, 8), dtype=np.float16))
+    logits = enhanced(input_ids, cos, sin, mask)
     log(f"    SFMEnhancedModel: input (1,8) -> logits {logits.shape} [OK]")
 
     # Test training step (value_and_grad)
@@ -766,9 +773,7 @@ def main():
         log(f"Rank {rank_id}: world_size={world_size}")
 
     # ---- MindSpore context ----
-    os.environ.setdefault("TASK_QUEUE_ENABLE", "2")
-    os.environ.setdefault("CPU_AFFINITY_CONF", "1")
-    os.environ.setdefault("HCCL_OP_EXPANSION_MODE", "AIV")
+    # (Ascend env vars already set in Phase 0 before import)
 
     if is_multi_card and world_size > 1:
         ms.set_context(mode=ms.GRAPH_MODE, device_target="Ascend",
