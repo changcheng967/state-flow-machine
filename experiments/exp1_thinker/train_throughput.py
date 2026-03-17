@@ -4,94 +4,158 @@ train_throughput.py - OpenI Training Throughput Benchmark for SFM + LoRA
 Self-contained boot file for OpenI Train Task. Measures real training throughput
 (tokens/sec) of Qwen2.5-Coder-7B with LoRA + SFM adapters across NPUs in DDP.
 
+Designed for the mindspore_2_2_cann7_train image: installs PyTorch + torch_npu
+via pip at startup (container has internet + CANN 7 drivers, just needs packages).
+
 No imports from sfm/ — all architecture code is inline for OpenI portability.
+
+Usage:
+    # OpenI Train Task: set as boot file, no args needed
+    # Local test: python train_throughput.py --local_test
 """
 
 # ===========================================================================
-# STEP 0: Absolute first diagnostics (before anything that could fail)
+# Phase 0: Standard lib imports + diagnostics (NO torch yet)
 # ===========================================================================
 import os
 import sys
+import time
 
+print("=" * 60, flush=True)
+print("[BOOT] train_throughput.py starting", flush=True)
 print(f"[BOOT] Python {sys.version}", flush=True)
 print(f"[BOOT] CWD: {os.getcwd()}", flush=True)
 print(f"[BOOT] RANK_ID={os.getenv('RANK_ID', 'NOT SET')}", flush=True)
-print(f"[BOOT] PATH={os.getenv('PATH', 'NOT SET')[:200]}", flush=True)
 
 os.environ["PYTHONUNBUFFERED"] = "1"
 try:
     sys.stdout.reconfigure(line_buffering=True)
     sys.stderr.reconfigure(line_buffering=True)
-except Exception as e:
-    print(f"[BOOT] stdout.reconfigure failed (non-fatal): {e}", flush=True)
+except Exception:
+    pass
+
 
 # ===========================================================================
-# STEP 1: Check critical packages
+# Phase 1: Install PyTorch + torch_npu + transformers if missing
 # ===========================================================================
-print("[BOOT] Checking torch...", flush=True)
-try:
+
+def _pip_install(*packages):
+    """Install packages via pip with Tsinghua mirror. Streams output."""
+    import subprocess
+    mirror = "https://pypi.tuna.tsinghua.edu.cn/simple"
+    cmd = [sys.executable, "-m", "pip", "install"] + list(packages) + [
+        "-i", mirror, "--no-cache-dir", "-q"]
+    print(f"[PIP] {' '.join(packages)}", flush=True)
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    for line in iter(p.stdout.readline, b''):
+        text = line.decode('utf-8', errors='replace').strip()
+        if text:
+            print(f"  {text}", flush=True)
+    p.wait()
+    if p.returncode != 0:
+        print(f"[PIP] FAILED (exit code {p.returncode})", flush=True)
+    return p.returncode == 0
+
+
+def _try_import(name):
+    """Try importing a module. Returns True on success."""
+    try:
+        __import__(name)
+        return True
+    except ImportError:
+        return False
+
+
+# --- Check and install torch ---
+if _try_import("torch"):
     import torch
-    print(f"[BOOT] torch {torch.__version__} OK", flush=True)
-except ImportError as e:
-    print(f"[BOOT] FATAL: import torch failed: {e}", flush=True)
-    print("[BOOT] You need a PyTorch image. Select a PyTorch+NPU image on OpenI.", flush=True)
-    sys.exit(1)
+    print(f"[BOOT] torch {torch.__version__} (pre-installed)", flush=True)
+else:
+    print("[BOOT] torch not found, installing...", flush=True)
+    # Try multiple version combos for CANN 7 compatibility
+    installed = False
+    for attempt in [
+        ("torch", "torch_npu"),                              # latest
+        ("torch==2.1.0", "torch_npu"),                       # CANN 7 compat
+        ("torch==2.1.0", "torch_npu==2.1.0.post3"),         # exact CANN 7
+    ]:
+        if _pip_install(*attempt):
+            # Verify import
+            if _try_import("torch"):
+                import torch
+                print(f"[BOOT] torch {torch.__version__} installed OK", flush=True)
+                installed = True
+                break
+    if not installed:
+        print("[BOOT] FATAL: cannot install torch. "
+              "The image may be incompatible.", flush=True)
+        sys.exit(1)
 
-try:
-    import torch.nn as nn
-    import torch.nn.functional as F
-    print("[BOOT] torch.nn, torch.nn.functional OK", flush=True)
-except Exception as e:
-    print(f"[BOOT] FATAL: torch.nn import failed: {e}", flush=True)
-    sys.exit(1)
+# --- Check and install torch_npu (skip on --local_test) ---
+if "--local_test" in sys.argv:
+    print("[BOOT] Skipping torch_npu check (local test mode)", flush=True)
+elif _try_import("torch_npu"):
+    import torch_npu
+    print(f"[BOOT] torch_npu {torch_npu.__version__} (pre-installed)", flush=True)
+else:
+    print("[BOOT] torch_npu not found, installing...", flush=True)
+    if not _pip_install("torch_npu"):
+        print("[BOOT] FATAL: cannot install torch_npu", flush=True)
+        sys.exit(1)
+    import torch_npu
+    print(f"[BOOT] torch_npu {torch_npu.__version__} installed OK", flush=True)
 
-print("[BOOT] Checking transformers...", flush=True)
-try:
-    from transformers import AutoModelForCausalLM
-    print(f"[BOOT] transformers OK", flush=True)
-except ImportError:
+# --- Check and install transformers ---
+if _try_import("transformers"):
+    print("[BOOT] transformers (pre-installed)", flush=True)
+else:
     print("[BOOT] transformers not found, installing...", flush=True)
-    import subprocess
-    try:
-        subprocess.check_call([sys.executable, "-m", "pip", "install",
-                               "transformers", "-q"])
-        from transformers import AutoModelForCausalLM
-        print("[BOOT] transformers installed OK", flush=True)
-    except Exception as e:
-        print(f"[BOOT] FATAL: cannot install transformers: {e}", flush=True)
+    if not _pip_install("transformers"):
+        print("[BOOT] FATAL: cannot install transformers", flush=True)
         sys.exit(1)
+    print("[BOOT] transformers installed OK", flush=True)
 
-print("[BOOT] Checking c2net...", flush=True)
-try:
-    from c2net.context import prepare, upload_output
-    print("[BOOT] c2net OK", flush=True)
-except ImportError:
+# --- Check c2net ---
+if not _try_import("c2net"):
     print("[BOOT] c2net not found, installing...", flush=True)
-    import subprocess
-    try:
-        subprocess.check_call([sys.executable, "-m", "pip", "install",
-                               "-U", "c2net", "-q"])
-        from c2net.context import prepare, upload_output
-        print("[BOOT] c2net installed OK", flush=True)
-    except Exception as e:
-        print(f"[BOOT] FATAL: cannot install c2net: {e}", flush=True)
+    _pip_install("-U", "c2net")
+    if not _try_import("c2net"):
+        print("[BOOT] FATAL: cannot install c2net", flush=True)
         sys.exit(1)
+    print("[BOOT] c2net installed OK", flush=True)
 
-import time
+
+# ===========================================================================
+# Phase 2: Now safe to import torch ecosystem
+# ===========================================================================
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import argparse
 
+from c2net.context import prepare, upload_output
+
+_has_npu = _try_import("torch_npu")
+if _has_npu:
+    import torch_npu
+    print(f"[BOOT] All dependencies ready. "
+          f"torch={torch.__version__}, torch_npu={torch_npu.__version__}", flush=True)
+else:
+    print(f"[BOOT] torch={torch.__version__} ready "
+          f"(torch_npu skipped for local test)", flush=True)
+
+
 # ===========================================================================
-# STEP 2: Args (parse_known_args per OpenI docs to ignore --ckpt_url etc.)
+# Phase 3: Args
 # ===========================================================================
 parser = argparse.ArgumentParser(description="SFM+LoRA Throughput Benchmark")
 parser.add_argument("--model_path", type=str, default=None)
 parser.add_argument("--local_test", action="store_true")
-parser.add_argument("--npu_count", type=int, default=0,
-                    help="Override NPU count (0=auto-detect)")
+parser.add_argument("--npu_count", type=int, default=0)
 
 
 # ===========================================================================
-# STEP 3: Logging helper
+# Phase 4: Logging
 # ===========================================================================
 _log_file = None
 
@@ -107,7 +171,7 @@ def log(msg: str) -> None:
 
 
 # ===========================================================================
-# STEP 4: SFM Architecture Classes (self-contained)
+# Phase 5: SFM Architecture Classes
 # ===========================================================================
 
 class LoRALinear(nn.Module):
@@ -192,7 +256,7 @@ class SFMAdapter(nn.Module):
 
 
 # ===========================================================================
-# STEP 5: Injection
+# Phase 6: Injection
 # ===========================================================================
 
 def inject_lora(model: nn.Module, rank: int = 64, alpha: float = 16.0) -> int:
@@ -229,13 +293,12 @@ def count_params(model: nn.Module) -> tuple:
 
 
 # ===========================================================================
-# STEP 6: Model path resolution
+# Phase 7: Model path resolution
 # ===========================================================================
 
 def resolve_model_path(c2net_ctx, args):
     if args.model_path:
         return args.model_path
-
     pmp = getattr(c2net_ctx, "pretrain_model_path", None)
     if pmp and os.path.isdir(pmp):
         try:
@@ -255,7 +318,7 @@ def resolve_model_path(c2net_ctx, args):
 
 
 # ===========================================================================
-# STEP 7: Benchmark
+# Phase 8: Benchmark
 # ===========================================================================
 
 CONFIGS = [
@@ -271,10 +334,11 @@ MEASURE = 15
 
 
 def _sync():
-    try:
-        torch.npu.synchronize()
-    except AttributeError:
-        pass
+    if _has_npu:
+        try:
+            torch.npu.synchronize()
+        except AttributeError:
+            pass
 
 
 def run_one_config(model, optimizer, device, cfg, rank, world_size, dist):
@@ -385,7 +449,7 @@ def print_results(results, world_size, output_path):
 
 
 # ===========================================================================
-# STEP 8: Local test
+# Phase 9: Local test
 # ===========================================================================
 
 def run_local_test():
@@ -405,7 +469,7 @@ def run_local_test():
 
 
 # ===========================================================================
-# STEP 9: Main
+# Phase 10: Main
 # ===========================================================================
 
 def main():
@@ -416,7 +480,6 @@ def main():
         run_local_test()
         return
 
-    # --- Determine rank from OpenI env ---
     rank_id_str = os.getenv('RANK_ID')
     if rank_id_str is None:
         rank_id = 0
@@ -428,8 +491,7 @@ def main():
     log(f"Rank {rank_id}, multi_card={is_multi_card}")
 
     # ================================================================
-    # Phase 1: Data preparation (rank 0 only, others wait)
-    # Following the /cache/ sync pattern from OpenI multi-card docs
+    # Phase A: Data preparation (rank 0 only, others wait)
     # ================================================================
     _SYNC_FILE = "/cache/sfm_ready.txt"
     model_path = None
@@ -440,10 +502,10 @@ def main():
         log("Rank 0: calling c2net prepare()...")
         try:
             c2net_ctx = prepare()
-            log(f"Rank 0: prepare() returned OK")
-            log(f"  output_path:        {getattr(c2net_ctx, 'output_path', 'N/A')}")
-            log(f"  pretrain_model_path:{getattr(c2net_ctx, 'pretrain_model_path', 'N/A')}")
-            log(f"  dataset_path:       {getattr(c2net_ctx, 'dataset_path', 'N/A')}")
+            log(f"Rank 0: prepare() OK")
+            log(f"  output_path:         {getattr(c2net_ctx, 'output_path', 'N/A')}")
+            log(f"  pretrain_model_path: {getattr(c2net_ctx, 'pretrain_model_path', 'N/A')}")
+            log(f"  dataset_path:        {getattr(c2net_ctx, 'dataset_path', 'N/A')}")
 
             output_path = c2net_ctx.output_path
             os.makedirs(output_path, exist_ok=True)
@@ -451,45 +513,29 @@ def main():
 
             model_path = resolve_model_path(c2net_ctx, args)
             if not model_path:
-                log("ERROR: no model path found. Check model config on OpenI.")
+                log("ERROR: no model path found.")
                 with open(_SYNC_FILE, "w") as f:
                     f.write("ERROR\n")
                 sys.exit(1)
 
-            # Detect NPU count BEFORE device isolation
+            # Detect NPU count
             try:
-                import torch_npu
                 detected = torch.npu.device_count()
-                log(f"Rank 0: torch_npu OK, device_count={detected}")
-            except ImportError as e:
-                log(f"Rank 0: torch_npu import FAILED: {e}")
-                log("  Trying pip install torch_npu...")
-                import subprocess
-                try:
-                    subprocess.check_call([sys.executable, "-m", "pip",
-                                           "install", "torch_npu", "-q"])
-                    import torch_npu
-                    detected = torch.npu.device_count()
-                    log(f"Rank 0: torch_npu installed OK, device_count={detected}")
-                except Exception as e2:
-                    log(f"Rank 0: cannot install torch_npu: {e2}")
-                    detected = 1
+                log(f"Rank 0: NPU count={detected}")
+            except Exception as e:
+                log(f"Rank 0: torch.npu.device_count() failed: {e}")
+                detected = 1
 
             world_size = args.npu_count if args.npu_count > 0 else detected
-            log(f"Rank 0: model={model_path}, npus={world_size}")
+            log(f"Rank 0: model={model_path}, world_size={world_size}")
 
-            # Write sync file for other ranks
             with open(_SYNC_FILE, "w") as f:
-                f.write(f"{output_path}\n")
-                f.write(f"{model_path}\n")
-                f.write(f"{world_size}\n")
-
-            log("Rank 0: preparation done, sync file written.")
+                f.write(f"{output_path}\n{model_path}\n{world_size}\n")
+            log("Rank 0: sync file written.")
 
         except Exception as e:
             import traceback
-            tb = traceback.format_exc()
-            log(f"Rank 0: prepare FAILED:\n{tb}")
+            log(f"Rank 0: prepare FAILED:\n{traceback.format_exc()}")
             try:
                 with open(_SYNC_FILE, "w") as f:
                     f.write(f"ERROR: {e}\n")
@@ -498,17 +544,15 @@ def main():
             sys.exit(1)
 
     else:
-        # Other ranks: wait for rank 0 (per OpenI docs /cache/ pattern)
-        log(f"Rank {rank_id}: waiting for rank 0 preparation...")
+        log(f"Rank {rank_id}: waiting for rank 0...")
         waited = 0
         while not os.path.exists(_SYNC_FILE):
             time.sleep(1)
             waited += 1
-            if waited > 300:  # 5 min timeout
-                log(f"Rank {rank_id}: timeout waiting for rank 0")
+            if waited > 600:
+                log(f"Rank {rank_id}: timeout (10 min)")
                 sys.exit(1)
 
-    # All ranks: read sync file
     if rank_id != 0:
         with open(_SYNC_FILE, "r") as f:
             output_path = f.readline().strip()
@@ -516,10 +560,10 @@ def main():
             world_size = int(f.readline().strip())
         os.makedirs(output_path, exist_ok=True)
         _log_file = os.path.join(output_path, "training.log")
-        log(f"Rank {rank_id}: paths loaded. Model={model_path}, NPUs={world_size}")
+        log(f"Rank {rank_id}: model={model_path}, world_size={world_size}")
 
     # ================================================================
-    # Phase 2: Ascend env + device setup
+    # Phase B: Device setup
     # ================================================================
     os.environ.setdefault("TASK_QUEUE_ENABLE", "2")
     os.environ.setdefault("CPU_AFFINITY_CONF", "1")
@@ -528,17 +572,9 @@ def main():
     os.environ.setdefault("MASTER_PORT", "29500")
     os.environ["ASCEND_RT_VISIBLE_DEVICES"] = str(rank_id)
 
-    log(f"Rank {rank_id}: ASCEND_RT_VISIBLE_DEVICES={rank_id}")
-
-    try:
-        import torch_npu
-    except ImportError:
-        log(f"Rank {rank_id}: FATAL torch_npu not available")
-        sys.exit(1)
-
     device = torch.device("npu:0")
     torch.npu.set_device(device)
-    log(f"Rank {rank_id}: device=npu:0 set")
+    log(f"Rank {rank_id}: npu:0 ready")
 
     if rank_id == 0:
         log(f"torch={torch.__version__}, torch_npu={torch_npu.__version__}")
@@ -549,43 +585,37 @@ def main():
             log(f"HBM info: {e}")
 
     # ================================================================
-    # Phase 3: DDP init
+    # Phase C: DDP
     # ================================================================
     import torch.distributed as dist
 
     if world_size > 1:
-        log(f"Rank {rank_id}: init DDP (rank={rank_id}, world={world_size})...")
         try:
-            dist.init_process_group(
-                backend="hccl",
-                rank=rank_id,
-                world_size=world_size,
-            )
-            log(f"Rank {rank_id}: DDP OK")
+            dist.init_process_group(backend="hccl",
+                                    rank=rank_id, world_size=world_size)
+            log(f"Rank {rank_id}: DDP OK (hccl, {world_size} NPUs)")
         except Exception as e:
-            log(f"Rank {rank_id}: DDP init failed: {e}")
-            if rank_id == 0:
-                log("Falling back to single-card mode.")
+            log(f"Rank {rank_id}: DDP failed: {e}, falling back to single-card")
             world_size = 1
 
     # ================================================================
-    # Phase 4: Load model
+    # Phase D: Load model
     # ================================================================
     if rank_id == 0:
         log(f"Loading model: {model_path}")
 
+    from transformers import AutoModelForCausalLM
     model = AutoModelForCausalLM.from_pretrained(
         model_path, torch_dtype=torch.float16, trust_remote_code=True)
     model = model.to(device)
 
     if world_size > 1:
         dist.barrier()
-
     if rank_id == 0:
         log("Model loaded on all ranks.")
 
     # ================================================================
-    # Phase 5: Freeze + inject
+    # Phase E: Freeze + inject
     # ================================================================
     for p in model.parameters():
         p.requires_grad = False
@@ -613,11 +643,10 @@ def main():
             f"({100*trainable/total:.2f}%)")
 
     # ================================================================
-    # Phase 6: DDP wrap + optimizer
+    # Phase F: DDP wrap + optimizer
     # ================================================================
     if world_size > 1:
-        ddp = nn.parallel.DistributedDataParallel(
-            model, device_ids=[0], output_device=0)
+        ddp = nn.parallel.DistributedDataParallel(model, device_ids=[0], output_device=0)
     else:
         ddp = model
 
@@ -628,7 +657,7 @@ def main():
         dist.barrier()
 
     # ================================================================
-    # Phase 7: Benchmark
+    # Phase G: Benchmark
     # ================================================================
     if rank_id == 0:
         log("")
@@ -640,11 +669,11 @@ def main():
 
     results = []
     for cfg in CONFIGS:
-        results.append(
-            run_one_config(ddp, optimizer, device, cfg, rank_id, world_size, dist))
+        results.append(run_one_config(ddp, optimizer, device, cfg,
+                                      rank_id, world_size, dist))
 
     # ================================================================
-    # Phase 8: Results + upload
+    # Phase H: Results + upload
     # ================================================================
     if rank_id == 0:
         print_results(results, world_size, output_path)
@@ -655,9 +684,6 @@ def main():
         except Exception as e:
             log(f"Upload failed (non-fatal): {e}")
 
-    # ================================================================
-    # Phase 9: Cleanup
-    # ================================================================
     if world_size > 1:
         dist.barrier()
         dist.destroy_process_group()
