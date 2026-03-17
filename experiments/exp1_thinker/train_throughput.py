@@ -388,57 +388,50 @@ def inject_sfm_adapters(model: nn.Cell, hidden_dim: int,
     return adapters
 
 
-class SFMEnhancedModel(nn.Cell):
-    """Model wrapper that applies SFM adapters at specified layers.
+def build_sfm_enhanced_model(base_model: nn.Cell, sfm_adapters: list,
+                             num_layers: int) -> nn.Cell:
+    """Build SFMEnhancedModel with a construct() generated for the given num_layers.
 
-    Uses named attributes (not CellDict) for GRAPH_MODE compatibility.
-    SFM indices must be [7, 14, 21, 27] — hardcoded in construct.
+    GRAPH_MODE requires a static construct method — we generate the source
+    at class-creation time so any num_layers works.
     """
+    sfm_set = {idx for idx, _ in sfm_adapters}
 
-    def __init__(self, base_model: nn.Cell, sfm_adapters: list):
-        super().__init__()
-        self.base = base_model
-        # Store each adapter as a named attribute for GRAPH_MODE
-        self.sfm_layer_7 = None
-        self.sfm_layer_14 = None
-        self.sfm_layer_21 = None
-        self.sfm_layer_27 = None
-        for idx, adapter in sfm_adapters:
-            setattr(self, f"sfm_layer_{idx}", adapter)
+    # Build construct() body as source code
+    lines = ["        x = self.base.embed_tokens(input_ids)"]
+    for i in range(num_layers):
+        call = f"self.base.layers[{i}](x, cos, sin, mask)"
+        if i in sfm_set:
+            lines.append(f"        x, _ = self.sfm_layer_{i}({call})")
+        else:
+            lines.append(f"        x = {call}")
+    lines.append("        x = self.base.norm(x)")
+    lines.append("        logits = self.base.lm_head(x)")
+    lines.append("        return logits")
 
-    def construct(self, input_ids: Tensor, cos: Tensor, sin: Tensor, mask: Tensor) -> Tensor:
-        x = self.base.embed_tokens(input_ids)
-        x = self.base.layers[0](x, cos, sin, mask)
-        x = self.base.layers[1](x, cos, sin, mask)
-        x = self.base.layers[2](x, cos, sin, mask)
-        x = self.base.layers[3](x, cos, sin, mask)
-        x = self.base.layers[4](x, cos, sin, mask)
-        x = self.base.layers[5](x, cos, sin, mask)
-        x = self.base.layers[6](x, cos, sin, mask)
-        x, _ = self.sfm_layer_7(self.base.layers[7](x, cos, sin, mask))
-        x = self.base.layers[8](x, cos, sin, mask)
-        x = self.base.layers[9](x, cos, sin, mask)
-        x = self.base.layers[10](x, cos, sin, mask)
-        x = self.base.layers[11](x, cos, sin, mask)
-        x = self.base.layers[12](x, cos, sin, mask)
-        x = self.base.layers[13](x, cos, sin, mask)
-        x, _ = self.sfm_layer_14(self.base.layers[14](x, cos, sin, mask))
-        x = self.base.layers[15](x, cos, sin, mask)
-        x = self.base.layers[16](x, cos, sin, mask)
-        x = self.base.layers[17](x, cos, sin, mask)
-        x = self.base.layers[18](x, cos, sin, mask)
-        x = self.base.layers[19](x, cos, sin, mask)
-        x = self.base.layers[20](x, cos, sin, mask)
-        x, _ = self.sfm_layer_21(self.base.layers[21](x, cos, sin, mask))
-        x = self.base.layers[22](x, cos, sin, mask)
-        x = self.base.layers[23](x, cos, sin, mask)
-        x = self.base.layers[24](x, cos, sin, mask)
-        x = self.base.layers[25](x, cos, sin, mask)
-        x = self.base.layers[26](x, cos, sin, mask)
-        x, _ = self.sfm_layer_27(self.base.layers[27](x, cos, sin, mask))
-        x = self.base.norm(x)
-        logits = self.base.lm_head(x)
-        return logits
+    construct_src = (
+        "def construct(self, input_ids, cos, sin, mask):\n"
+        + "\n".join(lines)
+    )
+
+    # exec the generated construct into a namespace, then extract it
+    ns = {"Tensor": Tensor, "nn": nn}
+    exec(construct_src, ns)  # noqa: S102
+    generated_construct = ns["construct"]
+
+    def __init__(self_inner, base_model_inner, adapters_inner):
+        super(SFMEnhancedModel, self_inner).__init__()
+        self_inner.base = base_model_inner
+        for idx in sfm_set:
+            setattr(self_inner, f"sfm_layer_{idx}", None)
+        for idx, adapter in adapters_inner:
+            setattr(self_inner, f"sfm_layer_{idx}", adapter)
+
+    cls = type("SFMEnhancedModel", (nn.Cell,), {
+        "__init__": __init__,
+        "construct": generated_construct,
+    })
+    return cls(base_model, sfm_adapters)
 
 
 def count_params(cell: nn.Cell) -> tuple:
@@ -694,9 +687,11 @@ def run_local_test():
     # Test SFMEnhancedModel
     log("  Testing SFMEnhancedModel...")
     base = Qwen2LikeModel()
-    sfm_list = [(7, SFMAdapter(3584)), (14, SFMAdapter(3584)),
-                (21, SFMAdapter(3584)), (27, SFMAdapter(3584))]
-    enhanced = SFMEnhancedModel(base, sfm_list)
+    sfm_list = [(NUM_LAYERS // 4, SFMAdapter(3584)),
+                (NUM_LAYERS // 2, SFMAdapter(3584)),
+                (3 * NUM_LAYERS // 4, SFMAdapter(3584)),
+                (NUM_LAYERS - 1, SFMAdapter(3584))]
+    enhanced = build_sfm_enhanced_model(base, sfm_list, NUM_LAYERS)
     input_ids = Tensor(np.random.randint(0, 100, (1, 8)).astype(np.int32))
     cos, sin = _build_rope_cache(8, HEAD_DIM)
     mask = Tensor(np.zeros((1, 1, 8, 8), dtype=np.float16))
@@ -799,9 +794,10 @@ def main():
                        device_id=rank_id)
         ms.communication.init()
         ms.set_auto_parallel_context(
-            parallel_mode=ms.ParallelMode.DATA_PARALLEL,
+            parallel_mode=ms.ParallelMode.AUTO_PARALLEL,
+            device_num=world_size,
             gradients_mean=True)
-        log(f"Rank {rank_id}: data parallel init OK ({world_size} NPUs)")
+        log(f"Rank {rank_id}: auto parallel init OK ({world_size} NPUs)")
     else:
         ms.set_context(mode=ms.GRAPH_MODE, device_target="Ascend", device_id=0)
         log(f"Rank {rank_id}: single-card Ascend mode")
@@ -820,8 +816,8 @@ def main():
                3 * NUM_LAYERS // 4, NUM_LAYERS - 1]  # [7, 14, 21, 27]
     sfm_adapters = [(idx, SFMAdapter(HIDDEN_DIM, slot_dim=256)) for idx in sfm_idx]
 
-    # Wrap in SFM-enhanced model
-    model = SFMEnhancedModel(model, sfm_adapters)
+    # Wrap in SFM-enhanced model (dynamically generated construct for GRAPH_MODE)
+    model = build_sfm_enhanced_model(model, sfm_adapters, NUM_LAYERS)
 
     if rank_id == 0:
         total, trainable = count_params(model)
