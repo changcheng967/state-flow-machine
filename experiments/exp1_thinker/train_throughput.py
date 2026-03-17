@@ -521,11 +521,15 @@ def run_one_config(model, optimizer, loss_fn, cfg: dict, rank: int, world_size: 
     labels_trimmed = labels[:, 1:].reshape(-1,)  # (B*(S-1),)
 
     # Define forward+loss function (functional style for value_and_grad)
+    # NOTE: closure functions have __module__=None, which breaks MindSpore's
+    # GRAPH_MODE parser.  Explicitly set it before value_and_grad.
     def forward_fn(inputs, lbls):
         logits = model(inputs, cos, sin, causal_mask)  # (B, S-1, V)
         logits_flat = logits.reshape(-1, VOCAB_SIZE)
         loss = loss_fn(logits_flat, lbls)
         return loss, logits_flat
+
+    forward_fn.__module__ = '__main__'
 
     grad_fn = ms.value_and_grad(forward_fn, None, optimizer.parameters, has_aux=True)
     model.set_train()
