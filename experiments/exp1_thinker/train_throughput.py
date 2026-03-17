@@ -108,13 +108,21 @@ def _try_import(name):
 _is_local_test = "--local_test" in sys.argv
 
 if _is_local_test or _RANK_ID == 0:
+    _install_ok = True
+
+    # Check if torch/torch_npu are already working (not corrupted)
     if _try_import("torch") and (_is_local_test or _try_import("torch_npu")):
         import torch
-        log(f"[BOOT] torch {torch.__version__} (pre-installed)")
+        log(f"[BOOT] torch {torch.__version__} (pre-installed, working)")
         if _try_import("torch_npu"):
             import torch_npu
-            log(f"[BOOT] torch_npu {torch_npu.__version__} (pre-installed)")
+            log(f"[BOOT] torch_npu {torch_npu.__version__} (pre-installed, working)")
     else:
+        # Previous runs may have corrupted torch/torch_npu (parallel pip).
+        # Uninstall first to ensure a clean state.
+        log("[BOOT] Cleaning up any corrupted torch/torch_npu from previous runs...")
+        _pip_install("uninstall", "torch", "torch_npu", "-y", timeout=60)
+
         # Try CANN 7 compatible versions first, then latest as fallback
         installed = False
         for attempt_name, torch_spec, npu_spec in [
@@ -148,45 +156,60 @@ if _is_local_test or _RANK_ID == 0:
                 log(f"[BOOT]   (CANN version mismatch, trying next)")
         if not installed:
             log("[BOOT] FATAL: no working torch+torch_npu combination found.")
-            sys.exit(1)
+            _install_ok = False
 
     # Install transformers + c2net (rank 0 only)
-    if not _try_import("transformers"):
+    if _install_ok and not _try_import("transformers"):
         log("[BOOT] Installing transformers...")
         if not _pip_install("transformers"):
             log("[BOOT] FATAL: cannot install transformers")
-            sys.exit(1)
-        log("[BOOT] transformers installed OK")
-    else:
-        log("[BOOT] transformers (pre-installed)")
+            _install_ok = False
+        else:
+            log("[BOOT] transformers installed OK")
 
-    if not _try_import("c2net"):
+    if _install_ok and not _try_import("c2net"):
         log("[BOOT] Installing c2net...")
         _pip_install("-U", "c2net")
         if not _try_import("c2net"):
             log("[BOOT] FATAL: cannot install c2net")
-            sys.exit(1)
-        log("[BOOT] c2net installed OK")
+            _install_ok = False
+        else:
+            log("[BOOT] c2net installed OK")
 
-    # Signal other ranks that install is complete
+    # ALWAYS write done file (even on failure) so other ranks don't hang
     if not _is_local_test:
         try:
             with open(_INSTALL_DONE, "w") as f:
-                f.write("done\n")
-            log(f"[BOOT] Rank 0: install complete, wrote {_INSTALL_DONE}")
+                f.write("done\n" if _install_ok else "FAILED\n")
+            status = "SUCCESS" if _install_ok else "FAILED"
+            log(f"[BOOT] Rank 0: install {status}, wrote {_INSTALL_DONE}")
         except Exception as e:
             log(f"[BOOT] Rank 0: failed to write done file: {e}")
+
+    if not _install_ok:
+        sys.exit(1)
 else:
     # Non-zero ranks: wait for rank 0 to finish installing
     log(f"[BOOT] Rank {_RANK_ID}: waiting for rank 0 to finish pip install...")
     waited = 0
     while not os.path.exists(_INSTALL_DONE):
-        time.sleep(2)
-        waited += 2
+        time.sleep(5)
+        waited += 5
+        if waited % 30 == 0:
+            log(f"[BOOT] Rank {_RANK_ID}: still waiting ({waited}s)...")
         if waited > 900:
             log(f"[BOOT] Rank {_RANK_ID}: pip install wait TIMEOUT (15 min)")
             sys.exit(1)
-    log(f"[BOOT] Rank {_RANK_ID}: rank 0 install complete ({waited}s)")
+    # Check if rank 0 succeeded or failed
+    try:
+        with open(_INSTALL_DONE, "r") as f:
+            status = f.read().strip()
+    except Exception:
+        status = "unknown"
+    if status == "FAILED":
+        log(f"[BOOT] Rank {_RANK_ID}: rank 0 install FAILED, exiting")
+        sys.exit(1)
+    log(f"[BOOT] Rank {_RANK_ID}: rank 0 install OK ({waited}s)")
 
 
 # ===========================================================================
