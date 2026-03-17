@@ -494,6 +494,24 @@ MEASURE = 15
 # Phase 14: Single-config benchmark (functional-style training)
 # ===========================================================================
 
+# Module-level forward function for value_and_grad — must be at module scope
+# so that __module__='__main__' (MS 2.2 GRAPH_MODE parser requirement).
+# Per-config state is passed via module-level globals set in run_one_config().
+_fwd_model = None
+_fwd_loss_fn = None
+_fwd_cos = None
+_fwd_sin = None
+_fwd_mask = None
+
+
+def _forward_fn(inputs, lbls):
+    """Forward + loss. Uses module-level globals set by run_one_config."""
+    logits = _fwd_model(inputs, _fwd_cos, _fwd_sin, _fwd_mask)
+    logits_flat = logits.reshape(-1, VOCAB_SIZE)
+    loss = _fwd_loss_fn(logits_flat, lbls)
+    return loss, logits_flat
+
+
 def run_one_config(model, optimizer, loss_fn, cfg: dict, rank: int, world_size: int) -> dict:
     """Run throughput benchmark for one (batch_size, seq_len) config.
 
@@ -520,18 +538,16 @@ def run_one_config(model, optimizer, loss_fn, cfg: dict, rank: int, world_size: 
     input_trimmed = input_ids[:, :-1]
     labels_trimmed = labels[:, 1:].reshape(-1,)  # (B*(S-1),)
 
-    # Define forward+loss function (functional style for value_and_grad)
-    # NOTE: closure functions have __module__=None, which breaks MindSpore's
-    # GRAPH_MODE parser.  Explicitly set it before value_and_grad.
-    def forward_fn(inputs, lbls):
-        logits = model(inputs, cos, sin, causal_mask)  # (B, S-1, V)
-        logits_flat = logits.reshape(-1, VOCAB_SIZE)
-        loss = loss_fn(logits_flat, lbls)
-        return loss, logits_flat
+    # Set module-level globals for _forward_fn (defined at module scope so
+    # __module__='__main__' — MS 2.2 GRAPH_MODE parser requires this)
+    global _fwd_model, _fwd_loss_fn, _fwd_cos, _fwd_sin, _fwd_mask
+    _fwd_model = model
+    _fwd_loss_fn = loss_fn
+    _fwd_cos = cos
+    _fwd_sin = sin
+    _fwd_mask = causal_mask
 
-    forward_fn.__module__ = '__main__'
-
-    grad_fn = ms.value_and_grad(forward_fn, None, optimizer.parameters, has_aux=True)
+    grad_fn = ms.value_and_grad(_forward_fn, None, optimizer.parameters, has_aux=True)
     model.set_train()
 
     log(f"  Config {cfg['name']}: B={B}, S={S}, tok/step={tok:,}")
