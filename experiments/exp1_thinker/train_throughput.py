@@ -840,10 +840,10 @@ def main():
                        device_id=rank_id)
         ms.communication.init()
         ms.set_auto_parallel_context(
-            parallel_mode=ms.ParallelMode.AUTO_PARALLEL,
+            parallel_mode=ms.ParallelMode.DATA_PARALLEL,
             device_num=world_size,
             gradients_mean=True)
-        log(f"Rank {rank_id}: auto parallel init OK ({world_size} NPUs)")
+        log(f"Rank {rank_id}: data parallel init OK ({world_size} NPUs)")
     else:
         ms.set_context(mode=ms.GRAPH_MODE, device_target="Ascend", device_id=0)
         log(f"Rank {rank_id}: single-card Ascend mode")
