@@ -390,65 +390,83 @@ def inject_lora(model: nn.Cell, rank: int = 64, alpha: float = 16.0) -> int:
     return count
 
 
-def inject_sfm_adapters(model: nn.Cell, hidden_dim: int,
-                        indices: list) -> list:
-    """Inject SFM adapters at specified layer indices.
+# ===========================================================================
+# Phase 10.5: SFM-Enhanced Model (static construct for GRAPH_MODE)
+# ===========================================================================
 
-    We rebuild the forward pass by inserting SFM calls inside
-    a wrapper cell, since MindSpore doesn't support hooks.
-    Returns list of (index, adapter) pairs.
+class SFMEnhancedModel(nn.Cell):
+    """Qwen2LikeModel wrapped with SFM adapters at specific layers.
+
+    Construct is fully unrolled (no exec/type hacks) so that
+    inspect.getsourcelines() can trace it in GRAPH_MODE.
     """
-    adapters = []
-    for idx in indices:
-        adapter = SFMAdapter(hidden_dim, slot_dim=256)
-        adapters.append((idx, adapter))
-    return adapters
+
+    def __init__(self, base_model: nn.Cell, sfm_adapters: list):
+        super().__init__()
+        self.base = base_model
+        for idx, adapter in sfm_adapters:
+            setattr(self, f"sfm_layer_{idx}", adapter)
+
+    def construct(self, input_ids, cos, sin, mask):
+        x = self.base.embed_tokens(input_ids)
+        x = self.base.layers[0](x, cos, sin, mask)
+        x = self.base.layers[1](x, cos, sin, mask)
+        x = self.base.layers[2](x, cos, sin, mask)
+        x = self.base.layers[3](x, cos, sin, mask)
+        x = self.base.layers[4](x, cos, sin, mask)
+        x = self.base.layers[5](x, cos, sin, mask)
+        x = self.base.layers[6](x, cos, sin, mask)
+        x = self.base.layers[7](x, cos, sin, mask)
+        x, _ = self.sfm_layer_7(x)
+        x = self.base.layers[8](x, cos, sin, mask)
+        x = self.base.layers[9](x, cos, sin, mask)
+        x = self.base.layers[10](x, cos, sin, mask)
+        x = self.base.layers[11](x, cos, sin, mask)
+        x = self.base.layers[12](x, cos, sin, mask)
+        x = self.base.layers[13](x, cos, sin, mask)
+        x = self.base.layers[14](x, cos, sin, mask)
+        x, _ = self.sfm_layer_14(x)
+        x = self.base.layers[15](x, cos, sin, mask)
+        x = self.base.layers[16](x, cos, sin, mask)
+        x = self.base.layers[17](x, cos, sin, mask)
+        x = self.base.layers[18](x, cos, sin, mask)
+        x = self.base.layers[19](x, cos, sin, mask)
+        x = self.base.layers[20](x, cos, sin, mask)
+        x = self.base.layers[21](x, cos, sin, mask)
+        x, _ = self.sfm_layer_21(x)
+        x = self.base.layers[22](x, cos, sin, mask)
+        x = self.base.layers[23](x, cos, sin, mask)
+        x = self.base.layers[24](x, cos, sin, mask)
+        x = self.base.layers[25](x, cos, sin, mask)
+        x = self.base.layers[26](x, cos, sin, mask)
+        x = self.base.layers[27](x, cos, sin, mask)
+        x, _ = self.sfm_layer_27(x)
+        x = self.base.norm(x)
+        logits = self.base.lm_head(x)
+        return logits
 
 
-def build_sfm_enhanced_model(base_model: nn.Cell, sfm_adapters: list,
-                             num_layers: int) -> nn.Cell:
-    """Build SFMEnhancedModel with a construct() generated for the given num_layers.
+class SFMForwardLossCell(nn.Cell):
+    """Forward pass + cross-entropy loss in a single Cell.
 
-    GRAPH_MODE requires a static construct method — we generate the source
-    at class-creation time so any num_layers works.
+    cos/sin/mask are stored as attributes so the construct()
+    is static and traceable by GRAPH_MODE's inspect.getsourcelines().
     """
-    sfm_set = {idx for idx, _ in sfm_adapters}
 
-    # Build construct() body as source code
-    lines = ["        x = self.base.embed_tokens(input_ids)"]
-    for i in range(num_layers):
-        call = f"self.base.layers[{i}](x, cos, sin, mask)"
-        if i in sfm_set:
-            lines.append(f"        x, _ = self.sfm_layer_{i}({call})")
-        else:
-            lines.append(f"        x = {call}")
-    lines.append("        x = self.base.norm(x)")
-    lines.append("        logits = self.base.lm_head(x)")
-    lines.append("        return logits")
+    def __init__(self, model: nn.Cell, loss_fn: nn.Cell,
+                 cos: Tensor, sin: Tensor, mask: Tensor):
+        super().__init__()
+        self.model = model
+        self.loss_fn = loss_fn
+        self.cos = cos
+        self.sin = sin
+        self.mask = mask
 
-    construct_src = (
-        "def construct(self, input_ids, cos, sin, mask):\n"
-        + "\n".join(lines)
-    )
-
-    # exec the generated construct into a namespace, then extract it
-    ns = {"Tensor": Tensor, "nn": nn}
-    exec(construct_src, ns)  # noqa: S102
-    generated_construct = ns["construct"]
-
-    def __init__(self_inner, base_model_inner, adapters_inner):
-        nn.Cell.__init__(self_inner)
-        self_inner.base = base_model_inner
-        for idx in sfm_set:
-            setattr(self_inner, f"sfm_layer_{idx}", None)
-        for idx, adapter in adapters_inner:
-            setattr(self_inner, f"sfm_layer_{idx}", adapter)
-
-    cls = type("SFMEnhancedModel", (nn.Cell,), {
-        "__init__": __init__,
-        "construct": generated_construct,
-    })
-    return cls(base_model, sfm_adapters)
+    def construct(self, inputs: Tensor, labels: Tensor) -> Tensor:
+        logits = self.model(inputs, self.cos, self.sin, self.mask)
+        logits_flat = logits.reshape(-1, VOCAB_SIZE)
+        loss = self.loss_fn(logits_flat, labels)
+        return loss
 
 
 def count_params(cell: nn.Cell) -> tuple:
@@ -508,29 +526,15 @@ MEASURE = 15
 
 
 # ===========================================================================
-# Phase 14: Single-config benchmark (functional-style training)
+# Phase 14: Single-config benchmark (nn.Cell-based training)
 # ===========================================================================
-
-# Module-level forward function for value_and_grad — must be at module scope
-# so that __module__='__main__' (MS 2.2 GRAPH_MODE parser requirement).
-# Per-config state is passed via module-level globals set in run_one_config().
-_fwd_model = None
-_fwd_loss_fn = None
-_fwd_cos = None
-_fwd_sin = None
-_fwd_mask = None
-
-
-def _forward_fn(inputs, lbls):
-    """Forward + loss. Uses module-level globals set by run_one_config."""
-    logits = _fwd_model(inputs, _fwd_cos, _fwd_sin, _fwd_mask)
-    logits_flat = logits.reshape(-1, VOCAB_SIZE)
-    loss = _fwd_loss_fn(logits_flat, lbls)
-    return loss, logits_flat
-
 
 def run_one_config(model, optimizer, loss_fn, cfg: dict, rank: int, world_size: int) -> dict:
     """Run throughput benchmark for one (batch_size, seq_len) config.
+
+    Uses nn.TrainOneStepCell (Cell-based) instead of ms.value_and_grad
+    (function-based) for GRAPH_MODE compatibility — Cell construct methods
+    are traceable via inspect.getsourcelines() but dynamic functions are not.
 
     Returns result dict or None on OOM.
     """
@@ -555,52 +559,32 @@ def run_one_config(model, optimizer, loss_fn, cfg: dict, rank: int, world_size: 
     input_trimmed = input_ids[:, :-1]
     labels_trimmed = labels[:, 1:].reshape(-1,)  # (B*(S-1),)
 
-    # Set module-level globals for _forward_fn (defined at module scope so
-    # __module__='__main__' — MS 2.2 GRAPH_MODE parser requires this)
-    global _fwd_model, _fwd_loss_fn, _fwd_cos, _fwd_sin, _fwd_mask
-    _fwd_model = model
-    _fwd_loss_fn = loss_fn
-    _fwd_cos = cos
-    _fwd_sin = sin
-    _fwd_mask = causal_mask
-
-    grad_fn = ms.value_and_grad(_forward_fn, None, optimizer.parameters, has_aux=True)
-    model.set_train()
+    # Build training cell (new instance per config for different seq_len)
+    train_net = SFMForwardLossCell(model, loss_fn, cos, sin, causal_mask)
+    train_step = nn.TrainOneStepCell(train_net, optimizer)
+    train_step.set_train()
 
     log(f"  Config {cfg['name']}: B={B}, S={S}, tok/step={tok:,}")
 
     try:
         # Warmup
         for _ in range(WARMUP):
-            _, grads = grad_fn(input_trimmed, labels_trimmed)
-            optimizer(grads)
+            train_step(input_trimmed, labels_trimmed)
 
-        # Measure — time entire loop, single sync at end
+        # Measure
         t0 = time.time()
         for _ in range(MEASURE):
-            _, grads = grad_fn(input_trimmed, labels_trimmed)
-            optimizer(grads)
-        # Single NPU sync (device-to-host transfer of a small tensor)
-        _ = grads[0].asnumpy().shape if len(grads) > 0 else None
+            train_step(input_trimmed, labels_trimmed)
         total_elapsed = time.time() - t0
 
         avg_ms = total_elapsed / MEASURE * 1000
         tps = tok / (avg_ms / 1000)
 
-        # Memory info (best-effort)
-        peak = 0.0
-        try:
-            from mindspore import context
-            # MindSpore doesn't expose per-step peak easily; report 0
-            peak = 0.0
-        except Exception:
-            pass
-
         return {
             "name": cfg["name"], "batch_size": B, "seq_len": S,
             "tok": tok, "avg_ms": avg_ms,
             "tps_dev": tps, "tps_total": tps * world_size,
-            "peak": peak, "free": 0.0,
+            "peak": 0.0, "free": 0.0,
         }
     except RuntimeError as e:
         msg = str(e).lower()
@@ -728,7 +712,7 @@ def run_local_test():
                 (NUM_LAYERS // 2, SFMAdapter(3584)),
                 (3 * NUM_LAYERS // 4, SFMAdapter(3584)),
                 (NUM_LAYERS - 1, SFMAdapter(3584))]
-    enhanced = build_sfm_enhanced_model(base, sfm_list, NUM_LAYERS)
+    enhanced = SFMEnhancedModel(base, sfm_list)
     input_ids = Tensor(np.random.randint(0, 100, (1, 8)).astype(np.int32))
     cos, sin = _build_rope_cache(8, HEAD_DIM)
     mask = Tensor(np.zeros((1, 1, 8, 8), dtype=np.float16))
@@ -878,8 +862,8 @@ def main():
                3 * NUM_LAYERS // 4, NUM_LAYERS - 1]  # [7, 14, 21, 27]
     sfm_adapters = [(idx, SFMAdapter(HIDDEN_DIM, slot_dim=256)) for idx in sfm_idx]
 
-    # Wrap in SFM-enhanced model (dynamically generated construct for GRAPH_MODE)
-    model = build_sfm_enhanced_model(model, sfm_adapters, NUM_LAYERS)
+    # Wrap in SFM-enhanced model (static construct for GRAPH_MODE)
+    model = SFMEnhancedModel(model, sfm_adapters)
 
     if rank_id == 0:
         total, trainable = count_params(model)
@@ -888,31 +872,32 @@ def main():
         log(f"Params: {total:,} total, {trainable:,} trainable "
             f"({100 * trainable / total:.2f}%)")
 
-    # All params are already FP16 — no to_float needed
+    # ---- Freeze base model, keep LoRA + SFM trainable ----
+    for p in model.get_parameters():
+        p.requires_grad = False
+
+    # Unfreeze LoRA A/B params
+    for layer_idx in range(NUM_LAYERS):
+        layer = model.base.layers[layer_idx]
+        for proj_name in ["q_proj", "k_proj", "v_proj", "o_proj"]:
+            proj = getattr(layer, proj_name, None)
+            if proj is not None and isinstance(proj, LoRALinear):
+                proj.A.requires_grad = True
+                proj.B.requires_grad = True
+
+    # Unfreeze SFM params
+    for idx in sfm_idx:
+        adapter = getattr(model, f"sfm_layer_{idx}", None)
+        if adapter is not None:
+            for p in adapter.get_parameters():
+                p.requires_grad = True
 
     # ---- Loss + optimizer ----
     loss_fn = nn.CrossEntropyLoss()
 
-    # Collect ONLY LoRA + SFM trainable params (freeze base model)
-    # NOTE: parameters_and_names() may not traverse dynamically-wrapped
-    # subcells in MS 2.2, so we collect params directly from model structure.
-    train_params = []
-
-    # 1. LoRA params: walk base.layers[*].{q,k,v,o}_proj.{A, B, scaling}
-    base_model = model.base  # Qwen2LikeModel
-    for layer_idx in range(NUM_LAYERS):
-        layer = base_model.layers[layer_idx]
-        for proj_name in ["q_proj", "k_proj", "v_proj", "o_proj"]:
-            proj = getattr(layer, proj_name, None)
-            if proj is not None and isinstance(proj, LoRALinear):
-                train_params.extend([proj.A, proj.B])
-
-    # 2. SFM params: walk sfm_layer_{7,14,21,27}.slot_bank.*
-    for idx in sfm_idx:
-        adapter = getattr(model, f"sfm_layer_{idx}", None)
-        if adapter is not None:
-            for p in adapter.slot_bank.get_parameters():
-                train_params.append(p)
+    # trainable_params() returns LoRA + SFM params in the same order
+    # that nn.TrainOneStepCell's GradOperation will compute gradients
+    train_params = list(model.trainable_params())
 
     if rank_id == 0:
         train_total = sum(p.size for p in train_params)
