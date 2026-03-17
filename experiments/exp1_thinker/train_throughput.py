@@ -306,7 +306,7 @@ class Qwen2LikeModel(nn.Cell):
         # Saves ~800 MB per NPU (1.09 GB / 4 ≈ 273 MB).
         # SEMI_AUTO_PARALLEL auto-inserts AllGather before unsharded loss.
         if world_size > 1:
-            self.lm_head = _sharded_dense(HIDDEN_DIM, VOCAB_SIZE, (1, 1), (ws, 1))
+            self.lm_head = _sharded_dense(HIDDEN_DIM, VOCAB_SIZE, (1, 1), (world_size, 1))
         else:
             self.lm_head = _fp16_dense(HIDDEN_DIM, VOCAB_SIZE)
 
