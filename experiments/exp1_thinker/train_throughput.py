@@ -962,8 +962,14 @@ def main():
     # (Ascend env vars already set in Phase 0 before import)
 
     if is_multi_card and world_size > 1:
+        # jit_level O0: skip optional graph optimizations (fusion, algebraic
+        # simplification). Compilation ~3x faster; execution slightly slower
+        # (conservative throughput numbers). Parallel strategy planning
+        # (required for correctness) is preserved.
+        from mindspore import JitConfig
         ms.set_context(mode=ms.GRAPH_MODE, device_target="Ascend",
-                       device_id=rank_id)
+                       device_id=rank_id,
+                       jit_config=JitConfig(jit_level="O0"))
         ms.communication.init()
         ms.set_auto_parallel_context(
             parallel_mode=ms.ParallelMode.SEMI_AUTO_PARALLEL,
