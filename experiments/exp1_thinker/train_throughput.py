@@ -71,7 +71,7 @@ log(f"[BOOT] RANK_ID={os.getenv('RANK_ID', 'NOT SET')}")
 # Phase 1: Import MindSpore (pre-installed, zero pip)
 # ===========================================================================
 import mindspore as ms
-from mindspore import nn, ops, Tensor, Parameter, lazy_inline
+from mindspore import nn, ops, Tensor, Parameter
 from mindspore.common.initializer import Normal, Zero, One, initializer
 import numpy as np
 
@@ -198,17 +198,9 @@ def _sharded_dense(in_channels: int, out_channels: int,
 # ===========================================================================
 
 class TransformerBlock(nn.Cell):
-    """Single transformer layer with GQA, RoPE, SwiGLU FFN. All FP16.
+    """Single transformer layer with GQA, RoPE, SwiGLU FFN. All FP16."""
 
-    @lazy_inline enables subgraph reuse across all 28 instances: the
-    compiler compiles the TransformerBlock subgraph ONCE and shares it,
-    reducing graph compilation from ~13 min to ~2-3 min per config.
-    Requires that no attributes change after __init__.
-    """
-
-    @lazy_inline
-    def __init__(self, world_size: int = 1, lora_rank: int = 0,
-                 lora_alpha: float = 0.0):
+    def __init__(self, world_size: int = 1):
         super().__init__()
         ws = world_size
         _mp = ws > 1  # model parallel enabled
@@ -250,15 +242,6 @@ class TransformerBlock(nn.Cell):
         self.ffn_norm = RMSNorm(HIDDEN_DIM)
 
         self.scale = Tensor(HEAD_DIM ** -0.5, ms.float16)
-
-        # LoRA injection INSIDE __init__ so @lazy_inline can capture the
-        # final attribute state.  LoRALinear is defined below (line ~327)
-        # but Python resolves the name at call-time, not def-time.
-        if lora_rank > 0:
-            for proj_name in ("q_proj", "k_proj", "v_proj", "o_proj"):
-                base = getattr(self, proj_name)
-                setattr(self, proj_name,
-                        LoRALinear(base, lora_rank, lora_alpha, ws))
 
         # NOTE: Attention matmuls use functional ops.matmul() (not the
         # ops.MatMul primitive) because Ascend's MatMul primitive only
@@ -309,8 +292,7 @@ class TransformerBlock(nn.Cell):
 class Qwen2LikeModel(nn.Cell):
     """~6.4B param model matching Qwen2.5-Coder-7B dimensions. All FP16."""
 
-    def __init__(self, world_size: int = 1, lora_rank: int = 0,
-                 lora_alpha: float = 0.0):
+    def __init__(self, world_size: int = 1):
         super().__init__()
         self.embed_tokens = nn.Embedding(VOCAB_SIZE, HIDDEN_DIM)
         # Override embedding table to FP16
@@ -318,8 +300,7 @@ class Qwen2LikeModel(nn.Cell):
             initializer(Normal(0.02), (VOCAB_SIZE, HIDDEN_DIM), ms.float16),
             name="embedding_table")
         self.layers = nn.CellList(
-            [TransformerBlock(world_size, lora_rank, lora_alpha)
-             for _ in range(NUM_LAYERS)])
+            [TransformerBlock(world_size) for _ in range(NUM_LAYERS)])
         self.norm = RMSNorm(HIDDEN_DIM)
         self.lm_head = _fp16_dense(HIDDEN_DIM, VOCAB_SIZE)
 
@@ -470,12 +451,8 @@ class SFMSlotBank(nn.Cell):
 
 
 class SFMAdapter(nn.Cell):
-    """Wrapper that applies SFMSlotBank.
+    """Wrapper that applies SFMSlotBank."""
 
-    @lazy_inline shares compiled subgraph across the 4 adapter instances.
-    """
-
-    @lazy_inline
     def __init__(self, hidden_dim: int = 3584, slot_dim: int = 256,
                  world_size: int = 1):
         super().__init__()
@@ -962,14 +939,8 @@ def main():
     # (Ascend env vars already set in Phase 0 before import)
 
     if is_multi_card and world_size > 1:
-        # jit_level O0: skip optional graph optimizations (fusion, algebraic
-        # simplification). Compilation ~3x faster; execution slightly slower
-        # (conservative throughput numbers). Parallel strategy planning
-        # (required for correctness) is preserved.
-        from mindspore import JitConfig
         ms.set_context(mode=ms.GRAPH_MODE, device_target="Ascend",
-                       device_id=rank_id,
-                       jit_config=JitConfig(jit_level="O0"))
+                       device_id=rank_id)
         ms.communication.init()
         ms.set_auto_parallel_context(
             parallel_mode=ms.ParallelMode.SEMI_AUTO_PARALLEL,
@@ -985,7 +956,7 @@ def main():
     if rank_id == 0:
         log("Building Qwen2-like model...")
 
-    model = Qwen2LikeModel(world_size=world_size, lora_rank=64, lora_alpha=16.0)
+    model = Qwen2LikeModel(world_size=world_size)
 
     # Enable gradient checkpointing on every transformer layer.
     # This frees activations after each layer's forward pass and recomputes
@@ -994,12 +965,9 @@ def main():
         layer.recompute()
 
     if rank_id == 0:
-        log("Model built with built-in LoRA (rank=64, alpha=16, @lazy_inline)")
+        log("Injecting LoRA + SFM adapters...")
 
-    # Count LoRA projections
-    lora_n = sum(1 for layer in model.layers
-                 for name in ("q_proj", "k_proj", "v_proj", "o_proj")
-                 if isinstance(getattr(layer, name, None), LoRALinear))
+    lora_n = inject_lora(model, rank=64, alpha=16, world_size=world_size)
     sfm_idx = [NUM_LAYERS // 4, NUM_LAYERS // 2,
                3 * NUM_LAYERS // 4, NUM_LAYERS - 1]  # [7, 14, 21, 27]
     sfm_adapters = [(idx, SFMAdapter(HIDDEN_DIM, slot_dim=256,
