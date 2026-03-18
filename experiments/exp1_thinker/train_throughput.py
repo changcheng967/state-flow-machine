@@ -309,9 +309,8 @@ class LoRALinear(nn.Cell):
         self.lora_b = ops.MatMul(transpose_b=True)  # hidden @ B.T
 
     def construct(self, x: Tensor) -> Tensor:
-        # base: (B, S, in_f) -> (B, S, out_f) — frozen, stop gradient
-        # to prevent ~12.8 GB gradient allocation for frozen weights
-        base_out = ops.stop_gradient(self.base(x))
+        # base: (B, S, in_f) -> (B, S, out_f)
+        base_out = self.base(x)
         # lora: Ascend MatMul requires 2D inputs — reshape to (B*S, in_f)
         x_shape = x.shape
         x_2d = x.reshape(-1, x_shape[-1])
@@ -878,7 +877,8 @@ def main():
 
     if is_multi_card and world_size > 1:
         ms.set_context(mode=ms.GRAPH_MODE, device_target="Ascend",
-                       device_id=rank_id)
+                       device_id=rank_id,
+                       memory_optimize_level='O1')  # SOMAS: reuse tensor memory
         ms.communication.init()
         ms.set_auto_parallel_context(
             parallel_mode=ms.ParallelMode.DATA_PARALLEL,
@@ -886,7 +886,8 @@ def main():
             device_num=world_size)
         log(f"Rank {rank_id}: data parallel init OK ({world_size} NPUs)")
     else:
-        ms.set_context(mode=ms.GRAPH_MODE, device_target="Ascend", device_id=0)
+        ms.set_context(mode=ms.GRAPH_MODE, device_target="Ascend", device_id=0,
+                       memory_optimize_level='O1')  # SOMAS: reuse tensor memory
         log(f"Rank {rank_id}: single-card Ascend mode")
 
     # ---- Build model ----
