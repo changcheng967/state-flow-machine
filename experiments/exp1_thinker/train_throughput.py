@@ -29,7 +29,7 @@ os.environ["PYTHONUNBUFFERED"] = "1"
 os.environ.setdefault("TASK_QUEUE_ENABLE", "2")
 os.environ.setdefault("CPU_AFFINITY_CONF", "1")
 os.environ.setdefault("ASCEND_GLOBAL_LOG_LEVEL", "3")  # ERROR only
-os.environ.setdefault("MS_COMPILER_CACHE_ENABLE", "0")  # cache incompatible with @lazy_inline in MS 2.2
+os.environ.setdefault("MS_COMPILER_CACHE_ENABLE", "1")  # cache compiled graphs
 os.environ.setdefault("MS_BUILD_PROCESS_NUM", "24")  # parallel op compilation
 try:
     sys.stdout.reconfigure(line_buffering=True)
@@ -611,8 +611,8 @@ CONFIGS = [
     {"name": "D", "batch_size": 2, "seq_len": 4096},   # S²=16M
     {"name": "F", "batch_size": 1, "seq_len": 8192},   # S²=64M
 ]
-WARMUP = 2
-MEASURE = 5
+WARMUP = 5
+MEASURE = 15
 
 
 # ===========================================================================
@@ -661,11 +661,9 @@ def run_one_config(model, optimizer, loss_fn, cfg: dict, rank: int, world_size: 
 
         log(f"  Config {cfg['name']}: B={B}, S={S}, tok/step={tok:,}")
 
-        # Warmup (first call triggers GRAPH compilation + first execution)
-        t_compile_start = time.time()
+        # Warmup
         for _ in range(WARMUP):
             train_step(input_trimmed, labels_trimmed)
-        log(f"  Compile + warmup: {time.time() - t_compile_start:.0f}s")
 
         # Measure
         t0 = time.time()
