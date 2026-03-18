@@ -29,8 +29,12 @@ os.environ["PYTHONUNBUFFERED"] = "1"
 os.environ.setdefault("TASK_QUEUE_ENABLE", "2")
 os.environ.setdefault("CPU_AFFINITY_CONF", "1")
 os.environ.setdefault("ASCEND_GLOBAL_LOG_LEVEL", "3")  # ERROR only
+os.environ.setdefault("GLOG_v", "0")  # suppress GLOG verbosity
+os.environ.setdefault("GLOG_logtostderr", "0")  # suppress GLOG to stderr
 os.environ.setdefault("MS_COMPILER_CACHE_ENABLE", "1")  # cache compiled graphs
+os.environ.setdefault("MS_COMPILER_CACHE_PATH", "/cache/sfm_graph_cache")  # OpenI writable dir
 os.environ.setdefault("MS_BUILD_PROCESS_NUM", "24")  # parallel op compilation
+os.environ.setdefault("MS_COMPILER_OP_LEVEL", "0")  # skip op fusion for faster compile
 try:
     sys.stdout.reconfigure(line_buffering=True)
     sys.stderr.reconfigure(line_buffering=True)
