@@ -36,6 +36,7 @@ os.environ.setdefault("MS_COMPILER_CACHE_ENABLE", "1")  # cache compiled graphs
 os.environ.setdefault("MS_COMPILER_CACHE_PATH", "/cache/sfm_graph_cache")  # OpenI writable dir
 os.environ.setdefault("MS_BUILD_PROCESS_NUM", "24")  # parallel op compilation
 os.environ.setdefault("MS_COMPILER_OP_LEVEL", "0")  # skip op fusion for faster compile
+os.environ["GRAPH_OP_RUN"] = "1"  # REQUIRED: enables memory_offload on Ascend
 try:
     sys.stdout.reconfigure(line_buffering=True)
     sys.stderr.reconfigure(line_buffering=True)
@@ -878,7 +879,8 @@ def main():
     if is_multi_card and world_size > 1:
         ms.set_context(mode=ms.GRAPH_MODE, device_target="Ascend",
                        device_id=rank_id,
-                       memory_optimize_level='O1')  # SOMAS: reuse tensor memory
+                       memory_offload='ON',
+                       max_device_memory='30GB')
         ms.communication.init()
         ms.set_auto_parallel_context(
             parallel_mode=ms.ParallelMode.DATA_PARALLEL,
@@ -887,8 +889,21 @@ def main():
         log(f"Rank {rank_id}: data parallel init OK ({world_size} NPUs)")
     else:
         ms.set_context(mode=ms.GRAPH_MODE, device_target="Ascend", device_id=0,
-                       memory_optimize_level='O1')  # SOMAS: reuse tensor memory
+                       memory_offload='ON',
+                       max_device_memory='30GB')
         log(f"Rank {rank_id}: single-card Ascend mode")
+
+    # Host RAM offload: swap idle params/activations to CPU when HBM is full
+    try:
+        ms.set_offload_context(offload_config={
+            "offload_param": "cpu",
+            "auto_offload": True,
+            "offload_cpu_size": "128GB",
+            "enable_pinned_mem": True,
+        })
+        log("Memory offload: ON (host RAM overflow)")
+    except (AttributeError, ValueError) as e:
+        log(f"Memory offload: not available ({e}), relying on recompute only")
 
     # ---- Build model ----
     if rank_id == 0:
