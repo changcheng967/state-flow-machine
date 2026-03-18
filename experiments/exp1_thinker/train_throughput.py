@@ -179,20 +179,6 @@ def _fp16_dense(in_channels: int, out_channels: int, has_bias: bool = False) -> 
     return d
 
 
-def _sharded_dense(in_channels: int, out_channels: int,
-                   in_strategy: tuple, weight_strategy: tuple,
-                   has_bias: bool = False) -> nn.Dense:
-    """Create FP16 Dense with shard strategy on internal matmul.
-
-    SEMI_AUTO_PARALLEL: shard the Dense's matmul so weights are distributed
-    across NPUs.  in_strategy/weight_strategy describe how each matmul input
-    is split (tuple of ints per dimension, value = number of shards).
-    """
-    d = _fp16_dense(in_channels, out_channels, has_bias)
-    d.matmul.shard((in_strategy, weight_strategy))
-    return d
-
-
 # ===========================================================================
 # Phase 6: Transformer Block (MHA + SwiGLU FFN + RMSNorm)
 # ===========================================================================
@@ -200,41 +186,19 @@ def _sharded_dense(in_channels: int, out_channels: int,
 class TransformerBlock(nn.Cell):
     """Single transformer layer with GQA, RoPE, SwiGLU FFN. All FP16."""
 
-    def __init__(self, world_size: int = 1):
+    def __init__(self):
         super().__init__()
-        ws = world_size
-        _mp = ws > 1  # model parallel enabled
 
         # Attention projections — FP16 weights
-        if _mp:
-            # Column-parallel: split output dim across NPUs
-            self.q_proj = _sharded_dense(HIDDEN_DIM, NUM_HEADS * HEAD_DIM,
-                                         (1, 1), (ws, 1))
-            self.k_proj = _sharded_dense(HIDDEN_DIM, NUM_KV_HEADS * HEAD_DIM,
-                                         (1, 1), (ws, 1))
-            self.v_proj = _sharded_dense(HIDDEN_DIM, NUM_KV_HEADS * HEAD_DIM,
-                                         (1, 1), (ws, 1))
-            # Row-parallel: split input dim across NPUs (AllReduce)
-            self.o_proj = _sharded_dense(NUM_HEADS * HEAD_DIM, HIDDEN_DIM,
-                                         (1, ws), (1, ws))
-        else:
-            self.q_proj = _fp16_dense(HIDDEN_DIM, NUM_HEADS * HEAD_DIM)
-            self.k_proj = _fp16_dense(HIDDEN_DIM, NUM_KV_HEADS * HEAD_DIM)
-            self.v_proj = _fp16_dense(HIDDEN_DIM, NUM_KV_HEADS * HEAD_DIM)
-            self.o_proj = _fp16_dense(NUM_HEADS * HEAD_DIM, HIDDEN_DIM)
+        self.q_proj = _fp16_dense(HIDDEN_DIM, NUM_HEADS * HEAD_DIM)
+        self.k_proj = _fp16_dense(HIDDEN_DIM, NUM_KV_HEADS * HEAD_DIM)
+        self.v_proj = _fp16_dense(HIDDEN_DIM, NUM_KV_HEADS * HEAD_DIM)
+        self.o_proj = _fp16_dense(NUM_HEADS * HEAD_DIM, HIDDEN_DIM)
 
         # FFN (SwiGLU)
-        if _mp:
-            self.gate_proj = _sharded_dense(HIDDEN_DIM, INTERMEDIATE_DIM,
-                                            (1, 1), (ws, 1))
-            self.up_proj = _sharded_dense(HIDDEN_DIM, INTERMEDIATE_DIM,
-                                          (1, 1), (ws, 1))
-            self.down_proj = _sharded_dense(INTERMEDIATE_DIM, HIDDEN_DIM,
-                                            (1, ws), (1, ws))
-        else:
-            self.gate_proj = _fp16_dense(HIDDEN_DIM, INTERMEDIATE_DIM)
-            self.up_proj = _fp16_dense(HIDDEN_DIM, INTERMEDIATE_DIM)
-            self.down_proj = _fp16_dense(INTERMEDIATE_DIM, HIDDEN_DIM)
+        self.gate_proj = _fp16_dense(HIDDEN_DIM, INTERMEDIATE_DIM)
+        self.up_proj = _fp16_dense(HIDDEN_DIM, INTERMEDIATE_DIM)
+        self.down_proj = _fp16_dense(INTERMEDIATE_DIM, HIDDEN_DIM)
 
         # Norms
         self.input_norm = RMSNorm(HIDDEN_DIM)
@@ -246,8 +210,6 @@ class TransformerBlock(nn.Cell):
         # NOTE: Attention matmuls use functional ops.matmul() (not the
         # ops.MatMul primitive) because Ascend's MatMul primitive only
         # supports 2D inputs. The functional form handles batched 4D tensors.
-        # In SEMI_AUTO_PARALLEL, unsharded ops inherit tensor layout
-        # from their sharded inputs (column-parallel Q/K/V projections).
 
     def construct(self, x: Tensor, cos: Tensor, sin: Tensor, mask: Tensor) -> Tensor:
         B, S, _ = x.shape
@@ -292,7 +254,7 @@ class TransformerBlock(nn.Cell):
 class Qwen2LikeModel(nn.Cell):
     """~6.4B param model matching Qwen2.5-Coder-7B dimensions. All FP16."""
 
-    def __init__(self, world_size: int = 1):
+    def __init__(self):
         super().__init__()
         self.embed_tokens = nn.Embedding(VOCAB_SIZE, HIDDEN_DIM)
         # Override embedding table to FP16
@@ -300,7 +262,7 @@ class Qwen2LikeModel(nn.Cell):
             initializer(Normal(0.02), (VOCAB_SIZE, HIDDEN_DIM), ms.float16),
             name="embedding_table")
         self.layers = nn.CellList(
-            [TransformerBlock(world_size) for _ in range(NUM_LAYERS)])
+            [TransformerBlock() for _ in range(NUM_LAYERS)])
         self.norm = RMSNorm(HIDDEN_DIM)
         self.lm_head = _fp16_dense(HIDDEN_DIM, VOCAB_SIZE)
 
@@ -327,8 +289,7 @@ class Qwen2LikeModel(nn.Cell):
 class LoRALinear(nn.Cell):
     """LoRA: output = base(x) + (xA^T B^T) * scale."""
 
-    def __init__(self, base: nn.Dense, rank: int = 64, alpha: float = 16.0,
-                 world_size: int = 1):
+    def __init__(self, base: nn.Dense, rank: int = 64, alpha: float = 16.0):
         super().__init__()
         self.base = base
         self.scaling = Tensor(alpha / rank, ms.float16)
@@ -338,15 +299,9 @@ class LoRALinear(nn.Cell):
         self.A = Parameter(initializer(Normal(0.02), (rank, in_f), ms.float16), name="lora_A")
         self.B = Parameter(initializer(Zero(), (out_f, rank), ms.float16), name="lora_B")
 
-        # Stored matmul ops for SEMI_AUTO_PARALLEL sharding
+        # Stored matmul ops for Ascend 2D matmul
         self.lora_a = ops.MatMul(transpose_b=True)  # x @ A.T
         self.lora_b = ops.MatMul(transpose_b=True)  # hidden @ B.T
-
-        if world_size > 1:
-            # A matmul: replicated (LoRA rank is small, no benefit from splitting)
-            self.lora_a.shard(((1, 1), (1, 1)))
-            # B matmul: column-parallel (split out_f across NPUs, matching base)
-            self.lora_b.shard(((1, 1), (world_size, 1)))
 
     def construct(self, x: Tensor) -> Tensor:
         # base: (B, S, in_f) -> (B, S, out_f)
@@ -377,51 +332,32 @@ class SFMSlotBank(nn.Cell):
     16 slots x 256d. All params FP16."""
 
     def __init__(self, hidden_dim: int = 3584, slot_dim: int = 256,
-                 num_slots: int = 16, num_heads: int = 4, world_size: int = 1):
+                 num_slots: int = 16, num_heads: int = 4):
         super().__init__()
         self.slot_dim = slot_dim
         self.num_slots = num_slots
         self.num_heads = num_heads
         self.head_dim = slot_dim
-        ws = world_size
-        _mp = ws > 1
 
         self.slot_vectors = Parameter(
             initializer(Normal(0.02), (num_slots, slot_dim), ms.float16), name="slot_vectors")
 
         # Cross-attention projections
-        if _mp:
-            self.q_proj = _sharded_dense(hidden_dim, num_heads * slot_dim,
-                                         (1, 1), (ws, 1))
-            self.k_proj = _sharded_dense(slot_dim, num_heads * slot_dim,
-                                         (1, 1), (ws, 1))
-            self.v_proj = _sharded_dense(slot_dim, num_heads * slot_dim,
-                                         (1, 1), (ws, 1))
-            self.out_proj = _sharded_dense(num_heads * slot_dim, hidden_dim,
-                                           (1, ws), (1, ws))
-        else:
-            self.q_proj = _fp16_dense(hidden_dim, num_heads * slot_dim)
-            self.k_proj = _fp16_dense(slot_dim, num_heads * slot_dim)
-            self.v_proj = _fp16_dense(slot_dim, num_heads * slot_dim)
-            self.out_proj = _fp16_dense(num_heads * slot_dim, hidden_dim)
+        self.q_proj = _fp16_dense(hidden_dim, num_heads * slot_dim)
+        self.k_proj = _fp16_dense(slot_dim, num_heads * slot_dim)
+        self.v_proj = _fp16_dense(slot_dim, num_heads * slot_dim)
+        self.out_proj = _fp16_dense(num_heads * slot_dim, hidden_dim)
 
         self.layer_norm = RMSNorm(hidden_dim)
 
-        # Gated recurrent update (replicated — small output, explicit shard for layout)
+        # Gated recurrent update
         self.W_alpha = _fp16_dense(hidden_dim, slot_dim, has_bias=True)
         self.W_beta = _fp16_dense(hidden_dim, slot_dim, has_bias=True)
         self.W_v = _fp16_dense(hidden_dim, slot_dim, has_bias=True)
-        if world_size > 1:
-            # Explicit data-parallel shard: prevents "has not tensor layout" warnings
-            # and ensures parallel optimizer handles these correctly
-            self.W_alpha.matmul.shard(((1, 1), (1, 1)))
-            self.W_beta.matmul.shard(((1, 1), (1, 1)))
-            self.W_v.matmul.shard(((1, 1), (1, 1)))
         self.scale = Tensor(slot_dim ** -0.5, ms.float16)
 
         # NOTE: Attention uses functional ops.matmul() (batched 4D) not
-        # ops.MatMul primitive (2D only on Ascend). Unsharded ops
-        # inherit tensor layout from column-parallel projections.
+        # ops.MatMul primitive (2D only on Ascend).
 
     def construct(self, hidden_states: Tensor) -> tuple:
         """Returns (modified_hidden, new_slots)."""
@@ -453,10 +389,9 @@ class SFMSlotBank(nn.Cell):
 class SFMAdapter(nn.Cell):
     """Wrapper that applies SFMSlotBank."""
 
-    def __init__(self, hidden_dim: int = 3584, slot_dim: int = 256,
-                 world_size: int = 1):
+    def __init__(self, hidden_dim: int = 3584, slot_dim: int = 256):
         super().__init__()
-        self.slot_bank = SFMSlotBank(hidden_dim, slot_dim, world_size=world_size)
+        self.slot_bank = SFMSlotBank(hidden_dim, slot_dim)
 
     def construct(self, hidden_states: Tensor) -> tuple:
         return self.slot_bank(hidden_states)
@@ -466,15 +401,14 @@ class SFMAdapter(nn.Cell):
 # Phase 10: Injection helpers
 # ===========================================================================
 
-def inject_lora(model: nn.Cell, rank: int = 64, alpha: float = 16.0,
-                world_size: int = 1) -> int:
+def inject_lora(model: nn.Cell, rank: int = 64, alpha: float = 16.0) -> int:
     """Replace q/k/v/o projections in every transformer layer with LoRA."""
     count = 0
     for layer in model.layers:
         for name in ["q_proj", "k_proj", "v_proj", "o_proj"]:
             orig = getattr(layer, name, None)
             if orig is not None and not isinstance(orig, LoRALinear):
-                wrapped = LoRALinear(orig, rank, alpha, world_size)
+                wrapped = LoRALinear(orig, rank, alpha)
                 setattr(layer, name, wrapped)
                 count += 1
     return count
@@ -941,11 +875,10 @@ def main():
                        device_id=rank_id)
         ms.communication.init()
         ms.set_auto_parallel_context(
-            parallel_mode=ms.ParallelMode.SEMI_AUTO_PARALLEL,
-            device_num=world_size,
-            enable_parallel_optimizer=True,
-            dataset_strategy="full_batch")
-        log(f"Rank {rank_id}: semi-auto parallel init OK ({world_size} NPUs)")
+            parallel_mode=ms.ParallelMode.DATA_PARALLEL,
+            gradients_mean=True,
+            device_num=world_size)
+        log(f"Rank {rank_id}: data parallel init OK ({world_size} NPUs)")
     else:
         ms.set_context(mode=ms.GRAPH_MODE, device_target="Ascend", device_id=0)
         log(f"Rank {rank_id}: single-card Ascend mode")
@@ -954,7 +887,7 @@ def main():
     if rank_id == 0:
         log("Building Qwen2-like model...")
 
-    model = Qwen2LikeModel(world_size=world_size)
+    model = Qwen2LikeModel()
 
     # Enable gradient checkpointing on every transformer layer.
     # This frees activations after each layer's forward pass and recomputes
@@ -965,11 +898,10 @@ def main():
     if rank_id == 0:
         log("Injecting LoRA + SFM adapters...")
 
-    lora_n = inject_lora(model, rank=64, alpha=16, world_size=world_size)
+    lora_n = inject_lora(model, rank=64, alpha=16)
     sfm_idx = [NUM_LAYERS // 4, NUM_LAYERS // 2,
                3 * NUM_LAYERS // 4, NUM_LAYERS - 1]  # [7, 14, 21, 27]
-    sfm_adapters = [(idx, SFMAdapter(HIDDEN_DIM, slot_dim=256,
-                                      world_size=world_size))
+    sfm_adapters = [(idx, SFMAdapter(HIDDEN_DIM, slot_dim=256))
                     for idx in sfm_idx]
 
     # Wrap in SFM-enhanced model (static construct for GRAPH_MODE)
