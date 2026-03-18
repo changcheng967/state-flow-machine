@@ -29,8 +29,7 @@ os.environ["PYTHONUNBUFFERED"] = "1"
 os.environ.setdefault("TASK_QUEUE_ENABLE", "2")
 os.environ.setdefault("CPU_AFFINITY_CONF", "1")
 os.environ.setdefault("ASCEND_GLOBAL_LOG_LEVEL", "3")  # ERROR only
-os.environ.setdefault("MS_COMPILER_CACHE_ENABLE", "1")  # cache compiled graphs
-os.environ.setdefault("MS_COMPILER_CACHE_PATH", "/cache/sfm_compile_cache")
+os.environ.setdefault("MS_COMPILER_CACHE_ENABLE", "0")  # cache incompatible with @lazy_inline in MS 2.2
 os.environ.setdefault("MS_BUILD_PROCESS_NUM", "24")  # parallel op compilation
 try:
     sys.stdout.reconfigure(line_buffering=True)
@@ -885,7 +884,6 @@ def main():
             env['RANK_ID'] = str(i)
             env['DEVICE_ID'] = str(i)
             env['RANK_SIZE'] = str(num_workers)
-            env['MS_COMPILER_CACHE_PATH'] = '/cache/sfm_compile_cache'
             log(f"  Spawning rank {i} (DEVICE_ID={i})...")
             _sp.Popen([sys.executable] + sys.argv, env=env)
 
