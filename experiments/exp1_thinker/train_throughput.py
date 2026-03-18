@@ -22,6 +22,8 @@ import sys
 import time
 import math
 import gc
+import warnings
+warnings.filterwarnings("ignore")  # suppress numpy subnormal warnings on Ascend
 import argparse
 
 # Ascend 910 tuning env vars — MUST be set before import mindspore
@@ -307,8 +309,9 @@ class LoRALinear(nn.Cell):
         self.lora_b = ops.MatMul(transpose_b=True)  # hidden @ B.T
 
     def construct(self, x: Tensor) -> Tensor:
-        # base: (B, S, in_f) -> (B, S, out_f)
-        base_out = self.base(x)
+        # base: (B, S, in_f) -> (B, S, out_f) — frozen, stop gradient
+        # to prevent ~12.8 GB gradient allocation for frozen weights
+        base_out = ops.stop_gradient(self.base(x))
         # lora: Ascend MatMul requires 2D inputs — reshape to (B*S, in_f)
         x_shape = x.shape
         x_2d = x.reshape(-1, x_shape[-1])
