@@ -44,10 +44,10 @@ logs/
 *.pth
 *.ckpt
 
-# Generated data
-*.npy
-*.jsonl
-*.bin
+# Data
+data/
+*.json
+!package.json
 
 # OS
 .DS_Store
@@ -62,6 +62,4 @@ Thumbs.db
 .pytest_cache/
 .coverage
 htmlcov/
-
-# CLAUDE.md is local only
 CLAUDE.md
