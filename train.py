@@ -681,7 +681,7 @@ def _find_data_files(base: str) -> list:
     return sorted(found)
 
 
-def _try_load_byte_tokenizer(pretrain_path: str) -> dict | None:
+def _try_load_byte_tokenizer(pretrain_path: str):
     """Try to build a vocab mapping from tokenizer.json."""
     tok_path = None
     for cand in [
@@ -759,7 +759,7 @@ def _tokenize_texts(texts: list, token_to_id: dict, seq_len: int) -> np.ndarray:
 
 
 def load_dataset(dataset_path: str, seq_len: int,
-               pretrain_path: str) -> np.ndarray | None:
+               pretrain_path: str):
     """Load and tokenise the OpenThoughts-114k dataset.
 
     Returns (num_chunks, seq_len) int32 array, or None on failure.
