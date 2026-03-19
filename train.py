@@ -992,28 +992,10 @@ def main():
     log(f"Trainable after freeze: {trainable_p2:,}")
 
     # ── Load pretrained weights ────────────────────────────────────────────────
+    # All workers load from safetensors in parallel (avoids ckpt race condition
+    # on network filesystem — save/load dance caused DecodeError).
     if model_dir:
-        if rank_id == 0:
-            success = load_pretrained_weights(model, model_dir, rank_id)
-            if success:
-                ckpt_path = os.path.join(CKPT_DIR, "hf_converted.ckpt")
-                ms.save_checkpoint(model, ckpt_path)
-                log(f"Saved converted ckpt to {ckpt_path}")
-                signal = os.path.join(CKPT_DIR, ".ready")
-                open(signal, "w").close()
-        else:
-            ckpt_path = os.path.join(CKPT_DIR, "hf_converted.ckpt")
-            signal = os.path.join(CKPT_DIR, ".ready")
-            waited = 0
-            while not os.path.exists(signal) and waited < 300:
-                time.sleep(1)
-                waited += 1
-            if os.path.exists(ckpt_path):
-                log(f"Loading converted ckpt from {ckpt_path}")
-                ms.load_checkpoint(ckpt_path, model)
-            else:
-                log("WARNING: timed out waiting for weight conversion — "
-                    "using random init")
+        load_pretrained_weights(model, model_dir, rank_id)
     else:
         log("WARNING: no pretrained weights found — using random init")
 
