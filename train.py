@@ -1,14 +1,14 @@
-"""train.py — SFM-enhanced Qwen2.5-Coder-1.5B training on 4x Ascend 910.
+"""train.py — SFM-enhanced Qwen2.5-Coder-7B training on 4x Ascend 910.
 
 Single-file, self-contained training script for OpenI.  Runs unattended for up to
-2 hours and produces results with ZERO human interaction.  Only MindSpore 2.2
+10 hours and produces results with ZERO human interaction.  Only MindSpore 2.2
 (pre-installed) and Python stdlib are used — no pip installs.
 
 Architecture
 -----------
-* Qwen2.5-Coder-1.5B backbone (frozen, ~1.5B params)
+* Qwen2.5-Coder-7B backbone (frozen, ~7B params)
 * LoRA rank=32 alpha=64 on all attention + FFN projections
-* SFM Slot Banks (8 slots) at layers 6, 13, 20, 27
+* SFM Slot Banks (8 slots) at layers 7, 15, 23, 31
 * DATA_PARALLEL across 4 NPUs (fallback to single-device)
 * Gradient checkpointing (recompute) on every transformer layer
 * SOMAS memory optimisation (memory_optimize_level=O1)
@@ -106,40 +106,40 @@ if not OUTPUT_PATH or not os.path.isdir(OUTPUT_PATH):
 CKPT_DIR = os.path.join(OUTPUT_PATH, "checkpoints")
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SECTION 2 — Constants (Qwen2.5-Coder-1.5B config.json values)
+# SECTION 2 — Constants (Qwen2.5-Coder-7B config.json values)
 # ═══════════════════════════════════════════════════════════════════════════
 
 VOCAB_SIZE = 151936
-HIDDEN_SIZE = 1536
-NUM_LAYERS = 28
-NUM_HEADS = 12
-NUM_KV_HEADS = 2
-INTERMEDIATE_SIZE = 8960
+HIDDEN_SIZE = 3584
+NUM_LAYERS = 32
+NUM_HEADS = 28
+NUM_KV_HEADS = 4
+INTERMEDIATE_SIZE = 18944
 HEAD_DIM = 128                 # HIDDEN_SIZE // NUM_HEADS
-NUM_GROUPS = 6                 # NUM_HEADS // NUM_KV_HEADS
+NUM_GROUPS = 7                 # NUM_HEADS // NUM_KV_HEADS
 RMS_NORM_EPS = 1e-6
 ROPE_THETA = 1000000.0
 MAX_SEQ_LEN = 2048
 MAX_POSITION = 32768
-TIE_WORD_EMBEDDINGS = True
+TIE_WORD_EMBEDDINGS = False    # 7B does NOT tie embeddings
 
 # LoRA
 LORA_RANK = 32
 LORA_ALPHA = 64
 
-# SFM
+# SFM — insert at 1/4, 1/2, 3/4, and end of 32 layers (0-indexed)
 SFM_NUM_SLOTS = 8
-SFM_LAYERS = {6, 13, 20, 27}  # 0-indexed
+SFM_LAYERS = {7, 15, 23, 31}
 
 # Training
-BATCH_SIZE = 16                # per-device, fallback to 8
+BATCH_SIZE = 8                 # 7B is larger, start at 8
 SEQ_LEN = 2048
-LEARNING_RATE = 2e-4
-MIN_LR = 2e-5
-WARMUP_STEPS = 100
+LEARNING_RATE = 1e-4           # slightly lower for 7B
+MIN_LR = 1e-5
+WARMUP_STEPS = 150             # slightly longer warmup for 7B
 WEIGHT_DECAY = 0.01
 MAX_GRAD_NORM = 1.0
-TIME_LIMIT = 7000              # seconds (< 2 h with buffer)
+TIME_LIMIT = 36000             # 10 hours generous limit (unlimited task)
 
 # Infrastructure
 RANK_SIZE = 4
@@ -289,7 +289,7 @@ def _hf_to_ms_name(hf_name: str) -> str:
     if hf_name == "norm.weight":
         return "norm.weight"
     if hf_name == "lm_head.weight":
-        return None
+        return "lm_head_weight"
     if not hf_name.startswith("layers."):
         return None
     parts = hf_name.split(".")
@@ -615,7 +615,7 @@ class TransformerBlock(nn.Cell):
 
 
 class Thinker1Model(nn.Cell):
-    """Qwen2.5-Coder-1.5B backbone with LoRA + SFM adapters."""
+    """Qwen2.5-Coder backbone with LoRA + SFM adapters."""
 
     def __init__(self):
         super().__init__()
@@ -624,6 +624,17 @@ class Thinker1Model(nn.Cell):
             TransformerBlock(i) for i in range(NUM_LAYERS)
         ])
         self.norm = RMSNorm(HIDDEN_SIZE)
+        if TIE_WORD_EMBEDDINGS:
+            # Tied embeddings: reuse embedding table as lm_head
+            self.lm_head = None
+        else:
+            # Untied: separate lm_head weight (frozen backbone)
+            self.lm_head = ms.Parameter(
+                ms.Tensor(np.random.randn(VOCAB_SIZE, HIDDEN_SIZE).astype(
+                    np.float16) * 0.02),
+                name="lm_head_weight",
+            )
+            self.lm_head.requires_grad = False
         self.matmul = ops.MatMul(transpose_b=True)
 
     def construct(self, input_ids: Tensor) -> Tensor:
@@ -632,7 +643,10 @@ class Thinker1Model(nn.Cell):
             h = layer(h)
         h = self.norm(h)
         h2 = h.reshape((-1, HIDDEN_SIZE))
-        logits = self.matmul(h2, self.embedding.embedding_table)
+        if TIE_WORD_EMBEDDINGS:
+            logits = self.matmul(h2, self.embedding.embedding_table)
+        else:
+            logits = self.matmul(h2, self.lm_head)
         return logits.reshape(h.shape[0], h.shape[1], VOCAB_SIZE)
 
 
@@ -705,16 +719,17 @@ def _find_data_files(base: str) -> list:
 
 
 def _try_load_byte_tokenizer(pretrain_path: str):
-    """Try to build a vocab mapping from tokenizer.json."""
+    """Load BPE tokenizer from tokenizer.json.
+
+    Returns (vocab, merges, eos_token_id) or None on failure.
+    vocab: dict of token_string -> token_id
+    merges: list of "tokenA tokenB" strings in priority order
+    """
     tok_path = None
-    # Direct path first
-    for cand in [
-        os.path.join(pretrain_path, "tokenizer.json"),
-    ]:
+    for cand in [os.path.join(pretrain_path, "tokenizer.json")]:
         if os.path.isfile(cand):
             tok_path = cand
             break
-    # Recursive search (tokenizer may be in a subdirectory)
     if tok_path is None:
         results = glob.glob(os.path.join(pretrain_path, "**",
                                           "tokenizer.json"), recursive=True)
@@ -726,83 +741,229 @@ def _try_load_byte_tokenizer(pretrain_path: str):
         with open(tok_path) as f:
             tok_data = json.load(f)
         vocab = tok_data.get("model", {}).get("vocab", {})
+        merges_raw = tok_data.get("model", {}).get("merges", [])
         if not vocab:
             return None
+
+        # Build token -> id mapping (handle int/str IDs)
         token_to_id = {}
         for token, idx in vocab.items():
-            token_to_id[token] = idx
-        log(f"  Loaded BPE tokenizer: {len(token_to_id)} tokens from "
-            f"{tok_path}")
-        return token_to_id
+            token_to_id[token] = int(idx)
+
+        # Read added_tokens for special token IDs
+        added = tok_data.get("added_tokens", [])
+        eos_id = 151645  # Qwen2.5 default
+        bos_id = 151643
+        for entry in added:
+            if isinstance(entry, dict):
+                if entry.get("content") == "<|endoftext|>":
+                    eos_id = entry.get("id", eos_id)
+                elif entry.get("content") == "<|fim_prefix|>":
+                    bos_id = entry.get("id", bos_id)
+
+        log(f"  Loaded BPE tokenizer: {len(token_to_id)} vocab, "
+            f"{len(merges_raw)} merges from {tok_path}")
+        return token_to_id, merges_raw, eos_id
     except Exception as e:
         log(f"  Failed to parse tokenizer.json: {e}")
         return None
 
 
-def _tokenize_texts(texts: list, token_to_id: dict, seq_len: int) -> np.ndarray:
-    """Convert text strings to token-id chunks of fixed seq_len using BPE vocab.
-    Falls back to byte-level encoding if vocab is unavailable.
-    Returns (num_chunks, seq_len) int32 array.
-    """
-    byte_fallback = (token_to_id is None or len(token_to_id) < 100)
+# Pre-computed byte-to-unicode mapping (same as GPT-2 / Qwen2.5)
+def _bytes_to_unicode():
+    """Returns mapping from byte values (0-255) to unicode chars."""
+    bs = (list(range(ord("!"), ord("~") + 1))
+          + list(range(ord("¡"), ord("¬") + 1))
+          + list(range(ord("®"), ord("ÿ") + 1)))
+    cs = list(bs)
+    n = 0
+    for b in range(2**8):
+        if b not in bs:
+            bs.append(b)
+            cs.append(2**8 + n)
+            n += 1
+    return dict(zip(bs, [chr(c) for c in cs]))
 
-    if not byte_fallback:
-        # BPE tokenisation — try whole-word lookup, then character fallback
-        all_ids = []
-        unk_id = token_to_id.get("<unk>", 0)
-        for text in texts:
-            ids = [unk_id] * (2)  # BOS-like padding
-            words = text.split()
-            for word in words:
-                tid = token_to_id.get(word)
-                if tid is not None:
-                    ids.append(tid)
-                else:
-                    # Fallback: character-level greedy match
-                    i = 0
-                    while i < len(word):
-                        matched = False
-                        # Try longest match first
-                        for end in range(min(len(word), i + 20), i, -1):
-                            sub = word[i:end]
-                            if sub in token_to_id:
-                                ids.append(token_to_id[sub])
-                                i = end
-                                matched = True
-                                break
-                        if not matched:
-                            ids.append(unk_id)
-                            i += 1
-            ids.append(unk_id)  # EOS-like
-            all_ids.extend(ids)
-        all_ids = np.array(all_ids, dtype=np.int64)
-    else:
-        # Byte-level fallback
-        log("  Using byte-level tokenizer (no BPE vocab found)")
+_BYTE_UNICODE = None
+
+
+def _get_byte_unicode():
+    global _BYTE_UNICODE
+    if _BYTE_UNICODE is None:
+        _BYTE_UNICODE = _bytes_to_unicode()
+    return _BYTE_UNICODE
+
+
+def _get_byte_token(byte_val, vocab):
+    """Get the vocab token for a single byte value."""
+    b2u = _get_byte_unicode()
+    ch = b2u[byte_val]
+    if ch in vocab:
+        return vocab[ch]
+    # Try <0xHH> fallback
+    hex_tok = f"<0x{byte_val:02X}>"
+    if hex_tok in vocab:
+        return vocab[hex_tok]
+    # Try <0xhh> lowercase
+    hex_tok = f"<0x{byte_val:02x}>"
+    if hex_tok in vocab:
+        return vocab[hex_tok]
+    return 0  # UNK
+
+
+def tokenize_text(text, vocab, merge_priority):
+    """Tokenize a single text string using BPE.
+
+    Args:
+        text: input string
+        vocab: dict of token_string -> token_id
+        merge_priority: dict of (tokenA, tokenB) -> priority_index
+
+    Returns:
+        list of int token IDs
+    """
+    b2u = _get_byte_unicode()
+
+    # Pre-tokenize: split on whitespace, prepend Ġ (U+0120) after spaces
+    # Qwen2.5 uses regex pre-tokenization; we approximate with whitespace split
+    words = []
+    current = []
+    for ch in text:
+        if ch in (" ", "\t", "\n", "\r"):
+            if current:
+                words.append("".join(current))
+                current = []
+            # Space becomes Ġ prefix for the next word
+            if ch == " ":
+                words.append(None)  # sentinel: next word gets Ġ
+            elif ch == "\n":
+                words.append("\n")
+            elif ch == "\t":
+                words.append("\t")
+        else:
+            current.append(ch)
+    if current:
+        words.append("".join(current))
+
+    # Reconstruct: merge Ġ sentinels with following words
+    merged_words = []
+    i = 0
+    while i < len(words):
+        if words[i] is None and i + 1 < len(words) and words[i + 1] is not None:
+            merged_words.append("\u0120" + words[i + 1])
+            i += 2
+        elif words[i] is None:
+            merged_words.append("\u0120")  # trailing space
+            i += 1
+        else:
+            merged_words.append(words[i])
+            i += 1
+
+    token_ids = []
+    for word in merged_words:
+        # Convert each character to its byte-token representation
+        word_bytes = word.encode("utf-8", errors="replace")
+        # Map each byte to its unicode representation
+        tokens = []
+        for b in word_bytes:
+            ch = b2u[b]
+            tokens.append(ch)
+
+        # Apply BPE merges
+        while len(tokens) >= 2:
+            # Find the pair with lowest merge priority
+            best_pair = None
+            best_pri = float("inf")
+            for j in range(len(tokens) - 1):
+                pair = (tokens[j], tokens[j + 1])
+                pri = merge_priority.get(pair)
+                if pri is not None and pri < best_pri:
+                    best_pri = pri
+                    best_pair = pair
+                    best_idx = j
+            if best_pair is None:
+                break
+            # Merge the pair at best_idx
+            new_tokens = tokens[:best_idx]
+            new_tokens.append(best_pair[0] + best_pair[1])
+            new_tokens.extend(tokens[best_idx + 2:])
+            tokens = new_tokens
+
+        # Look up each final token in vocab
+        for tok in tokens:
+            tid = vocab.get(tok)
+            if tid is not None:
+                token_ids.append(tid)
+            else:
+                # Try byte fallback for unknown multi-byte tokens
+                for ch in tok:
+                    byte_val = ord(ch)
+                    if byte_val < 256:
+                        token_ids.append(_get_byte_token(byte_val, vocab))
+                    else:
+                        token_ids.append(0)
+
+    return token_ids
+
+
+def _tokenize_texts(texts, vocab, merges, eos_id, seq_len):
+    """Convert text strings to token-id chunks of fixed seq_len.
+
+    Args:
+        texts: list of text strings
+        vocab: dict of token_string -> token_id
+        merges: list of "tokenA tokenB" merge strings
+        eos_id: end-of-text token ID
+        seq_len: chunk length
+
+    Returns (num_chunks, seq_len) int32 array, or None on failure.
+    """
+    if vocab is None or len(vocab) < 100:
+        log("  WARNING: BPE vocab not available, using raw byte fallback")
+        log("  (This will produce poor training quality)")
         all_ids = np.zeros(0, dtype=np.int32)
         for text in texts:
             encoded = text.encode("utf-8", errors="replace")
-            all_ids = np.concatenate([all_ids, np.frombuffer(encoded,
-                                                             dtype=np.uint8).astype(np.int32)])
-        # Add BOS/EOS sentinel bytes (256 = outside ASCII range)
+            all_ids = np.concatenate([
+                all_ids,
+                np.frombuffer(encoded, dtype=np.uint8).astype(np.int32)])
         all_ids = np.concatenate([
-            np.full(2, 256, dtype=np.int64),  # BOS pair
+            np.full(2, 256, dtype=np.int32),
             all_ids,
-            np.full(1, 256, dtype=np.int64),  # EOS
+            np.full(1, 256, dtype=np.int32),
         ])
+    else:
+        # Build merge priority dict for O(1) lookup
+        merge_priority = {}
+        for idx, merge_str in enumerate(merges):
+            parts = merge_str.split(" ", 1)
+            if len(parts) == 2:
+                merge_priority[(parts[0], parts[1])] = idx
+
+        log(f"  Tokenizing {len(texts)} texts with BPE …")
+        t0 = time.time()
+        all_ids = []
+        for i, text in enumerate(texts):
+            ids = tokenize_text(text, vocab, merge_priority)
+            all_ids.extend(ids)
+            all_ids.append(eos_id)
+            if (i + 1) % 20000 == 0:
+                log(f"    {i + 1}/{len(texts)} done "
+                    f"({len(all_ids):,} tokens) …")
+        all_ids = np.array(all_ids, dtype=np.int32)
+        log(f"  BPE tokenization done in {time.time() - t0:.1f}s — "
+            f"{len(all_ids):,} tokens")
 
     total = len(all_ids)
-    # Trim to exact multiple of seq_len
     usable = (total // seq_len) * seq_len
     if usable < seq_len:
-        log("  WARNING: dataset too small for even one chunk, using random fallback")
+        log("  WARNING: dataset too small for even one chunk")
         return None
     trimmed = all_ids[:usable]
     chunks = trimmed.reshape(-1, seq_len)
     log(f"  {len(chunks)} chunks of {seq_len} tokens from "
-        f"{total:,} tokens "
-        f"(byte_fallback={byte_fallback})")
-    return chunks.astype(np.int32)
+        f"{total:,} tokens")
+    return chunks
 
 
 def load_dataset(dataset_path: str, seq_len: int,
@@ -882,9 +1043,13 @@ def load_dataset(dataset_path: str, seq_len: int,
     log(f"  After dedup: {len(texts)} unique samples")
 
     # Try BPE tokenizer
-    token_to_id = _try_load_byte_tokenizer(pretrain_path)
+    tok_result = _try_load_byte_tokenizer(pretrain_path)
+    if tok_result is not None:
+        vocab, merges, eos_id = tok_result
+    else:
+        vocab, merges, eos_id = None, None, 151645
 
-    return _tokenize_texts(texts, token_to_id, seq_len)
+    return _tokenize_texts(texts, vocab, merges, eos_id, seq_len)
 
 
 # Synthetic fallback dataset
@@ -1025,15 +1190,27 @@ def main():
         )
     else:
         max_steps = target_tokens_per_device // tokens_per_step_per_device + 10
-    actual_lr = LEARNING_RATE
     log(f"Target: {target_tokens_per_device:,} tokens/device, "
         f"{max_steps} steps, B={BATCH_SIZE} S={SEQ_LEN}, "
         f"real_data={use_real_data}")
 
     train_params = list(model.trainable_params())
+    # Cosine LR schedule with linear warmup
+    lr_schedule = []
+    for s in range(max_steps):
+        if s < WARMUP_STEPS:
+            lr = LEARNING_RATE * s / max(1, WARMUP_STEPS)
+        else:
+            progress = (s - WARMUP_STEPS) / max(1, max_steps - WARMUP_STEPS)
+            lr = MIN_LR + 0.5 * (LEARNING_RATE - MIN_LR) * (
+                1 + math.cos(math.pi * progress))
+        lr_schedule.append(lr)
+    log(f"LR schedule: warmup={WARMUP_STEPS}, "
+        f"lr=[{lr_schedule[0]:.2e}, {max(lr_schedule):.2e}, "
+        f"{lr_schedule[-1]:.2e}]")
     optimizer = nn.AdamWeightDecay(
         train_params,
-        learning_rate=Tensor(actual_lr, ms.float32),
+        learning_rate=lr_schedule,
         weight_decay=WEIGHT_DECAY,
         beta1=0.9,
         beta2=0.95,
@@ -1044,7 +1221,7 @@ def main():
     train_step = None
     actual_bs = BATCH_SIZE
 
-    for bs in [BATCH_SIZE, BATCH_SIZE // 2]:
+    for bs in [8, 4, 2]:
         try:
             log(f"Building training graph for B={bs} …")
             ts = TrainStep(forward_loss, optimizer, MAX_GRAD_NORM)
@@ -1128,7 +1305,7 @@ def main():
                 f"best={best_loss:.4f} | "
                 f"tok/s/dev={tps_dev:.0f} | "
                 f"tok/s/total={tps_total:.0f} | "
-                f"lr={actual_lr:.2e} | "
+                f"lr={lr_schedule[min(step, len(lr_schedule)-1)]:.2e} | "
                 f"elapsed={dt:.0f}s | "
                 f"tokens={total_tokens:,}")
 
@@ -1147,7 +1324,7 @@ def main():
         log(f"Final checkpoint saved")
 
     results = {
-        "model_name": "Thinker-1 (Qwen2.5-Coder-1.5B + LoRA + SFM)",
+        "model_name": "Thinker-1 (Qwen2.5-Coder-7B + LoRA + SFM)",
         "total_params": total_p,
         "trainable_params": trainable_p2,
         "batch_size": actual_bs,
