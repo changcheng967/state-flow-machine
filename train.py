@@ -139,7 +139,11 @@ MIN_LR = 1e-5
 WARMUP_STEPS = 150             # slightly longer warmup for 7B
 WEIGHT_DECAY = 0.01
 MAX_GRAD_NORM = 1.0
-TIME_LIMIT = 36000             # 10 hours generous limit (unlimited task)
+TIME_LIMIT = 86400             # 24h hard safety limit
+MIN_EPOCHS = 2                 # must complete at least 2 full passes
+CONVERGENCE_WINDOW = 200       # rolling average window
+CONVERGENCE_PATIENCE = 1000    # steps without improvement before stopping
+CONVERGENCE_THRESHOLD = 0.001  # 0.1% relative improvement required
 
 # Infrastructure
 RANK_SIZE = 4
@@ -1182,16 +1186,12 @@ def main():
 
     # ── Optimiser ────────────────────────────────────────────────────────
     tokens_per_step_per_device = BATCH_SIZE * SEQ_LEN
-    target_tokens_per_device = 125_000_000  # 500M / 4
+    # max_steps: generous upper bound for LR schedule (5 epochs over data)
     if use_real_data:
-        max_steps = min(
-            target_tokens_per_device // tokens_per_step_per_device + 10,
-            data_chunks.shape[0] // rank_size + 10,   # don't over-iterate data
-        )
+        max_steps = data_chunks.shape[0] * 5 // rank_size + 100
     else:
-        max_steps = target_tokens_per_device // tokens_per_step_per_device + 10
-    log(f"Target: {target_tokens_per_device:,} tokens/device, "
-        f"{max_steps} steps, B={BATCH_SIZE} S={SEQ_LEN}, "
+        max_steps = 500_000_000 // tokens_per_step_per_device + 100
+    log(f"LR schedule spans {max_steps} steps, B={BATCH_SIZE} S={SEQ_LEN}, "
         f"real_data={use_real_data}")
 
     train_params = list(model.trainable_params())
@@ -1258,21 +1258,34 @@ def main():
     best_loss = float("inf")
     t_start = time.time()
     tokens_per_step = actual_bs * SEQ_LEN
+    stop_reason = "not started"
+
+    # Convergence tracking
+    loss_history = []
+    best_rolling_avg = float("inf")
+    steps_without_improvement = 0
+    epochs_completed = 0
+    samples_seen = 0
+    total_samples = data_chunks.shape[0] if use_real_data else float("inf")
+    prev_best_rolling = float("inf")
 
     log("")
     log("=" * 60)
     log("TRAINING START")
     log("=" * 60)
+    if use_real_data:
+        log(f"Dataset: {total_samples:,} chunks, "
+            f"{total_samples * rank_size * actual_bs:,} total samples across ranks")
 
     while step < max_steps:
         elapsed = time.time() - t_start
         if elapsed > TIME_LIMIT:
-            log(f"Time limit reached ({elapsed:.0f}s > {TIME_LIMIT}s)")
+            stop_reason = f"hard time limit ({elapsed:.0f}s > {TIME_LIMIT}s)"
+            log(f"Time limit reached — {stop_reason}")
             break
 
         # Get next batch
         if use_real_data:
-            # Distribute chunks across ranks with modular indexing
             indices = [(step * actual_bs + rank_id * actual_bs + j) % data_chunks.shape[0]
                        for j in range(actual_bs)]
             batch_np = data_chunks[indices]
@@ -1286,16 +1299,49 @@ def main():
         except RuntimeError as e:
             msg = str(e).lower()
             if "out of memory" in msg or "alloc" in msg:
+                stop_reason = f"OOM at step {step}"
                 log(f"OOM at step {step}! Stopping training.")
                 break
             raise
 
         loss_float = float(loss_val.asnumpy())
         total_tokens += tokens_per_step * rank_size
+        samples_seen += actual_bs
         if loss_float < best_loss:
             best_loss = loss_float
 
         step += 1
+
+        # Track epochs
+        if use_real_data and samples_seen >= total_samples:
+            epochs_completed += 1
+            samples_seen -= total_samples
+            log(f"=== Epoch {epochs_completed} completed at step {step} ===")
+
+        # Convergence check (only after warmup and min epochs)
+        loss_history.append(loss_float)
+        if (len(loss_history) >= CONVERGENCE_WINDOW
+                and step > WARMUP_STEPS
+                and epochs_completed >= MIN_EPOCHS):
+            rolling_avg = sum(loss_history[-CONVERGENCE_WINDOW:]) / CONVERGENCE_WINDOW
+            if rolling_avg < best_rolling_avg * (1 - CONVERGENCE_THRESHOLD):
+                best_rolling_avg = rolling_avg
+                steps_without_improvement = 0
+                # Save best model checkpoint
+                if rank_id == 0 and rolling_avg < prev_best_rolling:
+                    ms.save_checkpoint(model, os.path.join(CKPT_DIR, "best.ckpt"))
+                    log(f"New best model saved (rolling_avg={rolling_avg:.4f})")
+                    prev_best_rolling = rolling_avg
+            else:
+                steps_without_improvement += 1
+
+            if (epochs_completed >= MIN_EPOCHS
+                    and steps_without_improvement >= CONVERGENCE_PATIENCE):
+                stop_reason = (f"converged (rolling_avg={rolling_avg:.4f}, "
+                               f"no improvement for {steps_without_improvement} steps, "
+                               f"{epochs_completed} epochs done)")
+                log(f"STOPPING: {stop_reason}")
+                break
 
         if step % 50 == 0 or step <= 3:
             dt = time.time() - t_start
@@ -1306,6 +1352,7 @@ def main():
                 f"tok/s/dev={tps_dev:.0f} | "
                 f"tok/s/total={tps_total:.0f} | "
                 f"lr={lr_schedule[min(step, len(lr_schedule)-1)]:.2e} | "
+                f"epoch={epochs_completed} | "
                 f"elapsed={dt:.0f}s | "
                 f"tokens={total_tokens:,}")
 
@@ -1337,6 +1384,9 @@ def main():
         "tokens_per_sec_total": round(tps_total_avg, 1),
         "final_loss": round(loss_float, 4) if 'loss_float' in dir() else None,
         "best_loss": round(best_loss, 4),
+        "best_rolling_avg": round(best_rolling_avg, 4) if best_rolling_avg < float("inf") else None,
+        "epochs_completed": epochs_completed,
+        "stop_reason": stop_reason,
         "data_parallel": use_dp,
         "used_real_data": use_real_data,
     }
