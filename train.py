@@ -232,6 +232,9 @@ def load_safetensors(filepath: str) -> dict:
         header = json.loads(f.read(header_size).decode("utf-8"))
         data_base = 8 + header_size
         for name, meta in header.items():
+            # Skip non-tensor metadata (e.g. "__metadata__")
+            if not isinstance(meta, dict) or "dtype" not in meta:
+                continue
             dtype_str = meta["dtype"]
             shape = tuple(meta["shape"])
             off0, off1 = meta["data_offsets"]
@@ -266,7 +269,7 @@ def _hf_to_ms_name(hf_name: str) -> str:
     if hf_name == "embed_tokens.weight":
         return "embedding.embedding_table"
     if hf_name == "norm.weight":
-        return "norm.weight"
+        return "norm.norm_weight"
     if hf_name == "lm_head.weight":
         return None
     if not hf_name.startswith("layers."):
@@ -298,9 +301,9 @@ def _hf_to_ms_name(hf_name: str) -> str:
     if rest == f"{_HF_MLP}.down_proj.weight":
         return f"{ms_layer}.feed_forward.w2.frozen_weight"
     if rest == f"{_HF_NORM1}.weight":
-        return f"{ms_layer}.attention_norm.weight"
+        return f"{ms_layer}.attention_norm.norm_weight"
     if rest == f"{_HF_NORM2}.weight":
-        return f"{ms_layer}.ffn_norm.weight"
+        return f"{ms_layer}.ffn_norm.norm_weight"
     return None
 
 
@@ -960,10 +963,12 @@ def main():
         f"({100*trainable_p/total_p:.2f}%)")
 
     # ── Freeze backbone, keep LoRA + SFM trainable ───────────────────────
+    # Freeze ALL params first, then selectively unfreeze adapters
     for p in model.get_parameters():
         p.requires_grad = False
-    for p in model.trainable_params():
-        p.requires_grad = True
+    for name, p in model.parameters_and_names():
+        if "lora_" in name or "sfm_bank" in name:
+            p.requires_grad = True
     trainable_p2 = sum(p.size for p in model.trainable_params())
     log(f"Trainable after freeze: {trainable_p2:,}")
 
