@@ -17,7 +17,10 @@ from mindspore import nn, ops
 from mindspore.common.initializer import Normal, One
 from mindspore.common.tensor import Tensor
 
-from .config import Thinker15BConfig
+try:
+    from .config import Thinker15BConfig
+except ImportError:
+    from config import Thinker15BConfig
 
 
 def _fp16_dense(in_ch: int, out_ch: int, has_bias: bool = False) -> nn.Dense:
