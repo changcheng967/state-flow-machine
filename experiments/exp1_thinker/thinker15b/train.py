@@ -327,8 +327,10 @@ class TransformerBlock(nn.Cell):
         K = self.k_proj(h).view(B, S, NH, HD).transpose(0, 2, 1, 3)
         V = self.v_proj(h).view(B, S, NH, HD).transpose(0, 2, 1, 3)
 
-        Q = Q * cos + ops.concat([-Q[..., HD:], Q[..., :HD]], -1) * sin
-        K = K * cos + ops.concat([-K[..., HD:], K[..., :HD]], -1) * sin
+        HD2 = HEAD_DIM // 2
+
+        Q = Q * cos + ops.concat([-Q[..., HD2:], Q[..., :HD2]], -1) * sin
+        K = K * cos + ops.concat([-K[..., HD2:], K[..., :HD2]], -1) * sin
 
         attn = ops.matmul(Q, K.transpose(0, 1, 3, 2)) * self.scale
         attn = attn + mask[:, :, :S, :S]
@@ -552,9 +554,10 @@ class ForwardLossCell(nn.Cell):
 
 
 class TrainStep(nn.Cell):
-    """Manual train step (no grad clipping — not available in MS 2.2)."""
+    """Manual train step with manual clip-by-global-norm."""
 
-    def __init__(self, forward_loss: ForwardLossCell, optimizer):
+    def __init__(self, forward_loss: ForwardLossCell, optimizer,
+                 max_grad_norm: float = MAX_GRAD_NORM):
         super().__init__()
         self.forward_loss = forward_loss
         self.optimizer = optimizer
@@ -562,13 +565,25 @@ class TrainStep(nn.Cell):
         self.grad_op = ops.GradOperation(get_by_list=True, sens_param=True)
         self.sens = Tensor([1.0], ms.float32)
         self.depend = ops.Depend()
+        self.max_norm = Tensor(max_grad_norm, ms.float32)
+        self.eps = Tensor(1e-6, ms.float32)
+        self.one = Tensor(1.0, ms.float32)
+        self.sqrt = ops.Sqrt()
+        self.minimum = ops.Minimum()
 
     @ms.jit
     def construct(self, input_ids: Tensor) -> Tensor:
         loss = self.forward_loss(input_ids)
         grads = self.grad_op(self.forward_loss, self.weights)(
             input_ids, self.sens)
-        status = self.optimizer(grads)
+        # Manual clip-by-global-norm
+        total_norm_sq = Tensor(0.0, ms.float32)
+        for g in grads:
+            total_norm_sq = total_norm_sq + ops.reduce_sum(g * g)
+        global_norm = self.sqrt(total_norm_sq + self.eps)
+        clip_coef = self.minimum(self.max_norm / global_norm, self.one)
+        clipped = tuple(g * clip_coef for g in grads)
+        status = self.optimizer(clipped)
         return self.depend(loss, status)
 
 
@@ -609,10 +624,10 @@ class GRPOTrainStep(nn.Cell):
         labels = input_ids[:, 1:]          # (B, S-1)
         B, S1, V = logits_t.shape
 
-        # Gather log probs for each label
-        labels_flat = labels.reshape((-1,))
+        # Gather log probs for each label (axis=1 = vocab dimension)
+        labels_flat = labels.reshape((-1, 1))
         logits_flat = logits_t.reshape((-1, V))
-        chosen_log_probs = self.gather(logits_flat, labels_flat, 0)
+        chosen_log_probs = self.gather(logits_flat, labels_flat, 1).reshape((-1,))
         chosen_log_probs = chosen_log_probs.reshape(B, S1)
 
         # Per-sample average log-prob (mean over sequence)
@@ -829,7 +844,7 @@ def main() -> None:
         log(f"GRPO samples: {len(grpo_samples)}")
 
     # Precompute RoPE + mask
-    S = MAX_SEQ_LEN - 1  # after label shift
+    S = MAX_SEQ_LEN
     inv_freq = 1.0 / (ROPE_THETA ** (
         np.arange(0, HEAD_DIM, 2, dtype=np.float32) / HEAD_DIM))
     t = np.arange(S, dtype=np.float32)
@@ -878,7 +893,7 @@ def main() -> None:
     for bs in [4, 2, 1]:
         try:
             log(f"Building training graph for B={bs} ...")
-            ts = TrainStep(forward_loss, optimizer)
+            ts = TrainStep(forward_loss, optimizer, MAX_GRAD_NORM)
             ts.set_train()
             dummy = Tensor(
                 np.random.randint(0, VOCAB_SIZE, (bs, MAX_SEQ_LEN)).astype(

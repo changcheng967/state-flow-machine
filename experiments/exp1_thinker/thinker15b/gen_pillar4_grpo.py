@@ -122,8 +122,9 @@ def gen_custom_question() -> list[dict]:
     else:
         var = random.choice(["x", "y", "z"])
         val = random.randint(1, 100)
-        question = f"What is the value of {var} after: {var} = {val}; {var} += {random.randint(1, 10)}?"
-        correct = str(val + random.randint(1, 10))
+        inc = random.randint(1, 10)
+        question = f"What is the value of {var} after: {var} = {val}; {var} += {inc}?"
+        correct = str(val + inc)
         wrong_options = [str(val), str(val - 1), str(val + 1)]
 
     group_size = random.randint(4, 6)

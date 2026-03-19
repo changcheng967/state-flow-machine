@@ -127,8 +127,9 @@ class TransformerBlock(nn.Cell):
         V = self.v_proj(h).view(B, S, NH, HD).transpose(0, 2, 1, 3)
 
         # RoPE
-        Q = Q * cos + ops.concat([-Q[..., HD:], Q[..., :HD]], axis=-1) * sin
-        K = K * cos + ops.concat([-K[..., HD:], K[..., :HD]], axis=-1) * sin
+        HD2 = self.HD // 2
+        Q = Q * cos + ops.concat([-Q[..., HD2:], Q[..., :HD2]], axis=-1) * sin
+        K = K * cos + ops.concat([-K[..., HD2:], K[..., :HD2]], axis=-1) * sin
 
         # Scaled dot-product attention (causal)
         attn = ops.matmul(Q, K.transpose(0, 1, 3, 2)) * self.scale
