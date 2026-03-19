@@ -1,10 +1,12 @@
-"""gen_pillar4_grpo.py — GRPO question-answer pairs with binary rewards.
+"""gen_pillar4_grpo.py — Self-verification training data (v2).
 
-Generates groups of 4-8 answers per question, each with a binary reward
-(1.0 = correct, 0.0 = incorrect). Used for Group Relative Policy
-Optimization (GRPO) training.
+v2: Generates attempt->fail->reason->fix cycles instead of simple QA pairs.
+Each sample teaches the model to verify its own output, identify errors,
+reason about corrections, and produce fixed code.
 
-Output: JSONL with "text" and "reward" fields.
+Format: <task>...<attempt_1>...<execute>...<reasoning>...<attempt_2>...<execute>...<done/>
+
+Output: JSONL with "text" field (no reward field — used as LM training data).
 
 Usage:
     python gen_pillar4_grpo.py --output pillar4.jsonl --samples 50000
@@ -18,157 +20,259 @@ import random
 import sys
 
 
-_MATH_QUESTIONS = [
-    ("What is 17 * 23?", ["391", "17 * 23 = 391", "The product is 391"], ["392", "393", "390", "400", "17 * 23 = 392"]),
-    ("What is the square root of 144?", ["12", "sqrt(144) = 12", "The square root is 12"], ["14", "11", "13", "10"]),
-    ("What is 2^10?", ["1024", "2 to the power of 10 is 1024"], ["512", "2048", "256", "1028"]),
-    ("What is 15% of 200?", ["30", "15% of 200 = 30"], ["25", "35", "20", "40"]),
-    ("What is the GCD of 48 and 36?", ["12", "GCD(48, 36) = 12"], ["6", "18", "24", "8"]),
-    ("What is 7! (7 factorial)?", ["5040", "7! = 5040"], ["720", "40320", "504", "50400"]),
-    ("What is 1001 in binary?", ["1111101001", "1001 in binary is 1111101001"], ["111101001", "11111001", "1100100001"]),
-    ("What is the sum of the first 100 natural numbers?", ["5050", "Sum = 100*101/2 = 5050"], ["5000", "5100", "505", "4950"]),
-    ("What is log2(1024)?", ["10", "log base 2 of 1024 = 10"], ["11", "8", "20", "100"]),
-    ("What is the LCM of 12 and 18?", ["36", "LCM(12, 18) = 36"], ["24", "72", "48", "18"]),
+_MATH_TASKS = [
+    {
+        "task": "Compute the factorial of 7.",
+        "wrong": "7! = 7 * 6 * 5 * 4 * 3 = 2520",
+        "execution_wrong": "Error: 2520 is incorrect. Missing the * 2 * 1 part.",
+        "reasoning": "I forgot to multiply by 2 and 1. Factorial means 7*6*5*4*3*2*1.",
+        "fixed": "7! = 7 * 6 * 5 * 4 * 3 * 2 * 1 = 5040",
+    },
+    {
+        "task": "What is the GCD of 48 and 36?",
+        "wrong": "GCD(48, 36) = 6",
+        "execution_wrong": "Error: 6 divides both but is not the greatest.",
+        "reasoning": "Let me check: 48 = 2^4 * 3, 36 = 2^2 * 3^2. Common: 2^2 * 3 = 12.",
+        "fixed": "GCD(48, 36) = 12. Both 48/12=4 and 36/12=3 are integers.",
+    },
+    {
+        "task": "What is the sum of the first 100 natural numbers?",
+        "wrong": "Sum = 100 * 99 / 2 = 4950",
+        "execution_wrong": "Error: Should use n*(n+1)/2, not n*(n-1)/2.",
+        "reasoning": "Formula is n*(n+1)/2 = 100*101/2. I used 99 instead of 101.",
+        "fixed": "Sum = 100 * 101 / 2 = 5050",
+    },
+    {
+        "task": "What is 15% of 200?",
+        "wrong": "15% of 200 = 200 * 0.15 = 25",
+        "execution_wrong": "Error: 200 * 0.15 = 30, not 25.",
+        "reasoning": "I calculated 200 * 0.125 instead of 200 * 0.15.",
+        "fixed": "15% of 200 = 200 * 0.15 = 30",
+    },
+    {
+        "task": "Convert 1001 from decimal to binary.",
+        "wrong": "1001 in binary = 111101001",
+        "execution_wrong": "Error: 111101001 in binary = 489, not 1001.",
+        "reasoning": "Let me recompute: 1001/2=500r1, 500/2=250r0, 250/2=125r0, 125/2=62r1, 62/2=31r0, 31/2=15r1, 15/2=7r1, 7/2=3r1, 3/2=1r1, 1/2=0r1.",
+        "fixed": "1001 in binary = 1111101001",
+    },
 ]
 
-_CODE_QUESTIONS = [
-    ("What does list(range(5)) produce?", ["[0, 1, 2, 3, 4]", "It produces [0, 1, 2, 3, 4]"], ["[1, 2, 3, 4, 5]", "[0, 1, 2, 3, 4, 5]", "[1, 2, 3, 4]"]),
-    ("What is the output of: 'hello'[1:4]?", ["'ell'", "It outputs 'ell'"], ["'hel'", "'ell '", "'ello'"]),
-    ("What does len({'a': 1, 'b': 2}) return?", ["2", "It returns 2"], ["1", "3", "4", "0"]),
-    ("What is the type of True in Python?", ["bool", "bool (subclass of int)", "It is of type bool"], ["int", "str", "NoneType", "TrueType"]),
-    ("What does [x**2 for x in range(4)] produce?", ["[0, 1, 4, 9]", "It produces [0, 1, 4, 9]"], ["[1, 4, 9, 16]", "[0, 2, 4, 6]", "[0, 1, 2, 3]"]),
-    ("What does ' '.join(['a', 'b', 'c']) return?", ["'a b c'", "It returns 'a b c'"], ["'abc'", "'a,b,c'", "'a  b  c'"]),
-    ("What is the result of 10 // 3?", ["3", "Integer division gives 3"], ["3.33", "4", "3.0", "0"]),
-    ("What does sorted([3, 1, 4, 1, 5]) return?", ["[1, 1, 3, 4, 5]", "[1, 1, 3, 4, 5]"], ["[3, 1, 4, 1, 5]", "[5, 4, 3, 1, 1]"]),
+
+_CODE_TASKS = [
+    {
+        "task": "Write a Python function that reverses a list in-place.",
+        "wrong": (
+            "def reverse_list(lst):\n"
+            "    return lst.reverse()"
+        ),
+        "execution_wrong": "Error: list.reverse() returns None, not the list.",
+        "reasoning": "reverse() modifies in-place and returns None. Should return the list after calling reverse().",
+        "fixed": (
+            "def reverse_list(lst):\n"
+            "    lst.reverse()\n"
+            "    return lst"
+        ),
+    },
+    {
+        "task": "Write a function that checks if a string is a palindrome.",
+        "wrong": (
+            "def is_palindrome(s):\n"
+            "    return s == s.reverse()"
+        ),
+        "execution_wrong": "Error: strings don't have a reverse() method. AttributeError.",
+        "reasoning": "Need to use slicing [::-1] instead of .reverse() which is a list method.",
+        "fixed": (
+            "def is_palindrome(s):\n"
+            "    return s == s[::-1]"
+        ),
+    },
+    {
+        "task": "Write a function to find the maximum element in a list.",
+        "wrong": (
+            "def find_max(lst):\n"
+            "    max_val = lst[0]\n"
+            "    for i in lst:\n"
+            "        if i > max_val:\n"
+            "            max_val = i\n"
+            "    return max_val"
+        ),
+        "execution_wrong": "Error: IndexError when lst is empty — lst[0] fails.",
+        "reasoning": "Need to handle the edge case of an empty list before accessing lst[0].",
+        "fixed": (
+            "def find_max(lst):\n"
+            "    if not lst:\n"
+            "        return None\n"
+            "    max_val = lst[0]\n"
+            "    for i in lst:\n"
+            "        if i > max_val:\n"
+            "            max_val = i\n"
+            "    return max_val"
+        ),
+    },
+    {
+        "task": "Write a function that counts vowels in a string.",
+        "wrong": (
+            "def count_vowels(s):\n"
+            "    count = 0\n"
+            "    for ch in s:\n"
+            "        if ch in 'aeiou':\n"
+            "            count += 1\n"
+            "    return count"
+        ),
+        "execution_wrong": "Error: count_vowels('HELLO') returns 1 instead of 2. Case sensitivity.",
+        "reasoning": "Need to convert to lowercase before checking, or include uppercase vowels.",
+        "fixed": (
+            "def count_vowels(s):\n"
+            "    count = 0\n"
+            "    for ch in s.lower():\n"
+            "        if ch in 'aeiou':\n"
+            "            count += 1\n"
+            "    return count"
+        ),
+    },
+    {
+        "task": "Write a function that removes duplicates from a list.",
+        "wrong": (
+            "def remove_dupes(lst):\n"
+            "    return list(set(lst))"
+        ),
+        "execution_wrong": "Error: remove_dupes([3,1,2,3]) returns [1,2,3] but order is not preserved.",
+        "reasoning": "set() doesn't preserve order. Should use dict.fromkeys() to preserve insertion order.",
+        "fixed": (
+            "def remove_dupes(lst):\n"
+            "    return list(dict.fromkeys(lst))"
+        ),
+    },
 ]
 
-_REASONING_QUESTIONS = [
-    ("If all roses are flowers and some flowers fade quickly, can we conclude that some roses fade quickly?",
-     ["No, we cannot conclude that", "This is a logical fallacy - some flowers fading doesn't mean some roses do"],
-     ["Yes, since roses are flowers", "No, but all roses must fade"]),
-    ("A bat and ball cost $1.10 total. The bat costs $1.00 more than the ball. How much does the ball cost?",
-     ["$0.05", "5 cents", "The ball costs $0.05"],
-     ["$0.10", "$0.15", "10 cents", "$1.00"]),
-    ("If it takes 5 machines 5 minutes to make 5 widgets, how long for 100 machines to make 100 widgets?",
-     ["5 minutes", "Each machine makes 1 widget in 5 minutes"],
-     ["100 minutes", "20 minutes", "1 minute", "500 minutes"]),
-    ("How many times do the hour and minute hands of a clock overlap in 12 hours?",
-     ["11", "They overlap 11 times in 12 hours"],
-     ["12", "10", "24", "22"]),
-    ("If you have 6 identical socks in a drawer (3 black, 3 white), what is the minimum number you must draw to guarantee a matching pair?",
-     ["2", "With 6 socks total, drawing 2 guarantees a pair by pigeonhole"],
-     ["3", "4", "6", "1"]),
-]
 
-_ALL_QUESTIONS = _MATH_QUESTIONS + _CODE_QUESTIONS + _REASONING_QUESTIONS
+def _gen_arithmetic_task() -> dict:
+    """Generate a procedural arithmetic self-verification task."""
+    a = random.randint(2, 100)
+    b = random.randint(2, 100)
+    op = random.choice(["+", "-", "*"])
+    correct = eval(f"{a} {op} {b}")
+    offset = random.choice([-2, -1, 1, 2, 5, -5, 10, -10])
+    wrong = correct + offset
+
+    return {
+        "task": f"What is {a} {op} {b}?",
+        "wrong": f"{a} {op} {b} = {wrong}",
+        "execution_wrong": f"Error: {a} {op} {b} = {correct}, not {wrong}.",
+        "reasoning": f"Let me recalculate: {a} {op} {b} = {correct}. I made an arithmetic error.",
+        "fixed": f"{a} {op} {b} = {correct}",
+    }
 
 
-def _gen_answer(question: str, correct: bool) -> str:
-    """Generate an answer for a question, correct or incorrect."""
-    # Find the matching question in our bank
-    for q, correct_answers, wrong_answers in _ALL_QUESTIONS:
-        if q == question:
-            if correct:
-                answer = random.choice(correct_answers)
-            else:
-                answer = random.choice(wrong_answers)
-            return f"Question: {question}\nAnswer: {answer}"
+def _gen_code_task() -> dict:
+    """Generate a procedural code self-verification task."""
+    tasks = [
+        {
+            "task": "Write a function that returns the average of a list of numbers.",
+            "gen_wrong": lambda: (
+                "def average(nums):\n"
+                "    return sum(nums) / len(nums)"
+            ),
+            "exec_wrong": "Error: ZeroDivisionError when nums is empty.",
+            "reasoning": "Need to check for empty list before dividing.",
+            "gen_fixed": lambda: (
+                "def average(nums):\n"
+                "    if not nums:\n"
+                "        return 0\n"
+                "    return sum(nums) / len(nums)"
+            ),
+        },
+        {
+            "task": "Write a function that flattens a nested list (one level deep).",
+            "gen_wrong": lambda: (
+                "def flatten(lst):\n"
+                "    result = []\n"
+                "    for item in lst:\n"
+                "        result.append(item)\n"
+                "    return result"
+            ),
+            "exec_wrong": "Error: flatten([[1,2],[3,4]]) returns [[1,2],[3,4]] instead of [1,2,3,4].",
+            "reasoning": "Need to extend instead of append to flatten one level.",
+            "gen_fixed": lambda: (
+                "def flatten(lst):\n"
+                "    result = []\n"
+                "    for item in lst:\n"
+                "        result.extend(item)\n"
+                "    return result"
+            ),
+        },
+    ]
+    return random.choice(tasks)
 
-    # Fallback for unknown questions
-    return f"Question: {question}\nAnswer: The answer is {random.randint(1, 100)}."
 
-
-def gen_grpo_group() -> list[dict]:
-    """Generate one GRPO group (4-8 answers per question)."""
-    question, _, _ = random.choice(_ALL_QUESTIONS)
-    group_size = random.randint(4, 8)
-
-    # At least one correct, at least one incorrect
-    n_correct = random.randint(1, max(1, group_size // 2))
-    n_incorrect = group_size - n_correct
-
-    samples = []
-    for _ in range(n_correct):
-        text = _gen_answer(question, correct=True)
-        samples.append({"text": text, "reward": 1.0})
-
-    for _ in range(n_incorrect):
-        text = _gen_answer(question, correct=False)
-        samples.append({"text": text, "reward": 0.0})
-
-    random.shuffle(samples)
-    return samples
-
-
-def gen_custom_question() -> list[dict]:
-    """Generate a GRPO group with a procedurally-created question."""
-    q_type = random.choice(["arithmetic", "logic", "code"])
-
-    if q_type == "arithmetic":
-        a, b = random.randint(2, 50), random.randint(2, 50)
-        op = random.choice(["+", "-", "*"])
-        question = f"What is {a} {op} {b}?"
-        correct = str(eval(f"{a} {op} {b}"))
-        wrong_options = [
-            str(int(correct) + random.choice([-2, -1, 1, 2, 5, 10, -5, -10])),
-            str(int(correct) + random.choice([-3, 3, 7, -7])),
-        ]
-    elif q_type == "logic":
-        n = random.randint(1, 10)
-        question = f"What is the {n}th prime number?"
-        primes = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29]
-        correct = str(primes[n - 1])
-        wrong_options = [str(p) for p in primes if p != primes[n - 1]][:3]
+def gen_self_verification_sample() -> str:
+    """Generate a single self-verification sample."""
+    # 50% template-based, 50% procedural
+    if random.random() < 0.5:
+        if random.random() < 0.5:
+            task_data = random.choice(_MATH_TASKS)
+        else:
+            task_data = random.choice(_CODE_TASKS)
     else:
-        var = random.choice(["x", "y", "z"])
-        val = random.randint(1, 100)
-        inc = random.randint(1, 10)
-        question = f"What is the value of {var} after: {var} = {val}; {var} += {inc}?"
-        correct = str(val + inc)
-        wrong_options = [str(val), str(val - 1), str(val + 1)]
+        if random.random() < 0.5:
+            task_data = _gen_arithmetic_task()
+        else:
+            task_data = _gen_code_task()
 
-    group_size = random.randint(4, 6)
-    n_correct = random.randint(1, max(1, group_size // 2))
-    n_incorrect = group_size - n_correct
-
-    samples = []
-    for _ in range(n_correct):
-        text = f"Question: {question}\nAnswer: {correct}"
-        samples.append({"text": text, "reward": 1.0})
-
-    for i in range(n_incorrect):
-        wrong = wrong_options[i % len(wrong_options)] if wrong_options else "0"
-        text = f"Question: {question}\nAnswer: {wrong}"
-        samples.append({"text": text, "reward": 0.0})
-
-    random.shuffle(samples)
-    return samples
+    parts = [
+        f"<task>",
+        task_data["task"],
+        f"</task>",
+        f"",
+        f"<attempt_1>",
+        task_data["wrong"],
+        f"</attempt_1>",
+        f"",
+        f"<execute>",
+        task_data["execution_wrong"],
+        f"</execute>",
+        f"",
+        f"<reasoning>",
+        task_data["reasoning"],
+        f"</reasoning>",
+        f"",
+        f"<attempt_2>",
+        task_data["fixed"],
+        f"</attempt_2>",
+        f"",
+        f"<execute>",
+        "Success.",
+        f"</execute>",
+        f"",
+        f"<done/>",
+    ]
+    return "\n".join(parts)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Generate pillar 4: GRPO pairs")
-    parser.add_argument("--output", default="pillar4.jsonl", help="Output JSONL file")
-    parser.add_argument("--groups", type=int, default=25000, help="Number of question groups")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser = argparse.ArgumentParser(
+        description="Generate pillar 4: self-verification data")
+    parser.add_argument("--output", default="pillar4.jsonl",
+                        help="Output JSONL file")
+    parser.add_argument("--samples", type=int, default=50000,
+                        help="Number of samples")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed")
     args = parser.parse_args()
 
     random.seed(args.seed)
-    print(f"Generating {args.groups} GRPO groups...", file=sys.stderr)
+    print(f"Generating {args.samples} self-verification samples...",
+          file=sys.stderr)
 
-    total_samples = 0
     with open(args.output, "w", encoding="utf-8") as f:
-        for i in range(args.groups):
-            if random.random() < 0.5:
-                samples = gen_grpo_group()
-            else:
-                samples = gen_custom_question()
-            for s in samples:
-                f.write(json.dumps(s, ensure_ascii=False) + "\n")
-                total_samples += 1
-            if (i + 1) % 10000 == 0:
-                print(f"  {i + 1}/{args.groups} groups ({total_samples} samples)", file=sys.stderr)
+        for i in range(args.samples):
+            text = gen_self_verification_sample()
+            f.write(json.dumps({"text": text}, ensure_ascii=False) + "\n")
+            if (i + 1) % 50000 == 0:
+                print(f"  {i + 1}/{args.samples}", file=sys.stderr)
 
-    print(f"Done: {args.groups} groups ({total_samples} samples) -> {args.output}", file=sys.stderr)
+    print(f"Done: {args.samples} samples -> {args.output}", file=sys.stderr)
 
 
 if __name__ == "__main__":

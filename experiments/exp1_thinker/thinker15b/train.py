@@ -1,17 +1,17 @@
-"""train.py — Thinker-1.5B from-scratch training with SFM.
+"""train.py — Thinker-1.5B v2 from-scratch training with SFM.
+
+v2 changes:
+  - Real GRU with reset gate for SFM slot bank
+  - Slot persistence across all 4 SFM layers
+  - Standard pre-norm TransformerBlock (removed post_attn_norm)
+  - Slot prediction via CE loss over 512-token slot vocabulary
+  - Initial slot vectors as learned parameter
+  - Multi-turn training with [TURN] separator
+  - FP16 params (FP32 master weights via AdamWeightDecay)
 
 Self-contained MindSpore 2.2 training script for OpenI (4x Ascend 910).
 All model classes are INLINED (not imported) because MS 2.2's
 inspect.getsourcelines() must trace within the same file for GRAPH_MODE.
-
-Architecture:
-- 24-layer decoder-only transformer (hidden=2048, 16 heads, SwiGLU)
-- 4x SFM slot banks at layers 5, 11, 17, 23
-- Custom ByteLevelBPE tokenizer (vocab=32000)
-- 4-pillar soft curriculum: traces + docs -> + trajectories -> + GRPO
-- GRPO with group-relative advantage weighting
-- Convergence-based stopping with 24h safety limit
-- OOM recovery: B=4->2->1
 """
 
 import os
@@ -36,7 +36,7 @@ try:
     with open("/cache/output/boot.log", "a") as _bf:
         _bf.write(
             f"[{_boot_ts}] pid={_boot_pid} rank={_boot_rank} "
-            f"thinker15b_started\n")
+            f"thinker15b_v2_started\n")
 except Exception:
     pass
 
@@ -105,11 +105,12 @@ MAX_SEQ_LEN = 4096
 RMS_NORM_EPS = 1e-6
 ROPE_THETA = 10000.0
 
-# SFM
+# SFM v2
 SFM_NUM_SLOTS = 16
 SFM_SLOT_DIM = 256
 SFM_NUM_HEADS = 4
 SFM_LAYERS = (5, 11, 17, 23)
+SFM_SLOT_VOCAB_SIZE = 512
 
 # Training
 BATCH_SIZE = 4
@@ -123,11 +124,10 @@ MIN_EPOCHS = 2
 CONVERGENCE_WINDOW = 200
 CONVERGENCE_PATIENCE = 1000
 CONVERGENCE_THRESHOLD = 0.001
-SLOT_PRED_WEIGHT = 0.1
+SLOT_PRED_WEIGHT = 0.15
 
-# GRPO
-GRPO_GROUP_SIZE = 4
-GRPO_WEIGHT = 0.15
+# Multi-turn
+MAX_TURNS = 4
 
 # Curriculum
 CURRICULUM_P3_START = 0.30
@@ -286,7 +286,10 @@ class RotaryEmbedding(nn.Cell):
 
 
 class TransformerBlock(nn.Cell):
-    """Single transformer layer: MHA (16 heads) + SwiGLU FFN + RMSNorm."""
+    """Single transformer layer: MHA + SwiGLU FFN + RMSNorm (pre-norm only).
+
+    v2: no post_attn_norm. Standard pre-norm: x = x + attn_out.
+    """
 
     def __init__(self) -> None:
         super().__init__()
@@ -300,7 +303,6 @@ class TransformerBlock(nn.Cell):
         self.v_proj = _fp16_dense(H, NH * HD)
         self.o_proj = _fp16_dense(NH * HD, H)
         self.input_norm = RMSNorm(H)
-        self.post_attn_norm = RMSNorm(H)
 
         self.gate_proj = _fp16_dense(H, A)
         self.up_proj = _fp16_dense(H, A)
@@ -338,7 +340,7 @@ class TransformerBlock(nn.Cell):
         out = ops.matmul(attn, V)
         out = out.transpose(0, 2, 1, 3).reshape(B, S, -1)
         out = self.o_proj(out)
-        x = x + self.post_attn_norm(out)
+        x = x + out  # v2: no post_attn_norm
 
         h = self.ffn_norm(x)
         gate = ops.silu(self.gate_proj(h))
@@ -348,8 +350,15 @@ class TransformerBlock(nn.Cell):
 
 
 class SFMSlotBank(nn.Cell):
-    """GRU-based State Slot Bank (16 slots x 256d).
+    """GRU-based State Slot Bank with real GRU (v2).
 
+    Real GRU with reset gate:
+      z = sigmoid(W_z * [slots; mean_hidden])
+      r = sigmoid(W_r * [slots; mean_hidden])
+      h_cand = tanh(W_h * [r * slots; mean_hidden])
+      new_slots = (1-z) * slots + z * h_cand
+
+    Cross-attention: Q from hidden, K/V from slots.
     Returns (modified_hidden, new_slots).
     """
 
@@ -361,31 +370,25 @@ class SFMSlotBank(nn.Cell):
         NH = SFM_NUM_HEADS
         self.head_dim = SD // NH
 
-        self.slot_vectors = ms.Parameter(
-            Tensor(np.random.randn(NS, SD).astype(np.float16) * 0.02),
-            name="slot_vectors")
-
         self.q_proj = _fp16_dense(H, NH * self.head_dim)
         self.k_proj = _fp16_dense(SD, NH * self.head_dim)
         self.v_proj = _fp16_dense(SD, NH * self.head_dim)
         self.out_proj = _fp16_dense(NH * self.head_dim, H)
         self.layer_norm = RMSNorm(H)
 
-        self.W_alpha = _fp16_dense(H, SD, has_bias=True)
-        self.W_beta = _fp16_dense(H, SD, has_bias=True)
-        self.W_v = _fp16_dense(H, SD, has_bias=True)
+        # Real GRU gates
+        gru_in = SD + H
+        self.W_z = _fp16_dense(gru_in, SD, has_bias=True)
+        self.W_r = _fp16_dense(gru_in, SD, has_bias=True)
+        self.W_h = _fp16_dense(gru_in, SD, has_bias=True)
 
         self.scale = Tensor(self.head_dim ** -0.5, ms.float16)
 
-    def construct(self, hidden_states: Tensor) -> tuple:
+    def construct(self, hidden_states: Tensor, slots: Tensor) -> tuple:
         B, S, _ = hidden_states.shape
         NS = SFM_NUM_SLOTS
         NH = SFM_NUM_HEADS
         HD = self.head_dim
-
-        slots = ops.broadcast_to(
-            self.slot_vectors.reshape(1, NS, SFM_SLOT_DIM),
-            (B, NS, SFM_SLOT_DIM))
 
         Q = self.q_proj(hidden_states).view(B, S, NH, HD).transpose(
             0, 2, 1, 3)
@@ -396,36 +399,64 @@ class SFMSlotBank(nn.Cell):
         attn = ops.softmax(attn, axis=-1)
         out = ops.matmul(attn, V)
         out = out.transpose(0, 2, 1, 3).reshape(B, S, -1)
-        out = self.out_proj(out)
-        modified = self.layer_norm(hidden_states + out)
+        read_content = self.out_proj(out)
 
+        modified = self.layer_norm(hidden_states + read_content)
+
+        # GRU update
         h_mean = ops.mean(hidden_states, axis=1, keep_dims=True)
-        alpha = ops.sigmoid(self.W_alpha(h_mean))
-        beta = ops.sigmoid(self.W_beta(h_mean))
-        v = ops.tanh(self.W_v(h_mean))
-        new_slots = alpha * slots + beta * v
+        h_mean_broad = ops.broadcast_to(
+            h_mean, (B, NS, HIDDEN_DIM))
+
+        gru_input = ops.concat([slots, h_mean_broad], axis=-1)
+
+        z = ops.sigmoid(self.W_z(gru_input))
+        r = ops.sigmoid(self.W_r(gru_input))
+        h_cand = ops.tanh(
+            self.W_h(ops.concat([r * slots, h_mean_broad], axis=-1)))
+        new_slots = (1.0 - z) * slots + z * h_cand
 
         return modified, new_slots
 
 
 class SlotPredictionHead(nn.Cell):
-    """Predict slot contents from hidden states (auxiliary loss)."""
+    """Predict slot contents discretized to slot vocabulary (v2 CE loss)."""
 
     def __init__(self) -> None:
         super().__init__()
-        self.pred_proj = _fp16_dense(HIDDEN_DIM,
-                                     SFM_NUM_SLOTS * SFM_SLOT_DIM)
+        self.proj = _fp16_dense(SFM_SLOT_DIM, SFM_SLOT_VOCAB_SIZE)
 
-    def construct(self, hidden_states: Tensor) -> Tensor:
-        h_mean = ops.mean(hidden_states, axis=1)
-        pred = self.pred_proj(h_mean)
-        return pred.view(h_mean.shape[0], SFM_NUM_SLOTS, SFM_SLOT_DIM)
+    def construct(self, slots: Tensor) -> Tensor:
+        """Returns (B, num_slots, slot_vocab_size) logits."""
+        return self.proj(slots)
+
+
+class SlotTokenizer(nn.Cell):
+    """Discretize slots to nearest slot vocabulary entry."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.vocab_vectors = ms.Parameter(
+            Tensor(np.random.randn(
+                SFM_SLOT_VOCAB_SIZE, SFM_SLOT_DIM).astype(
+                    np.float16) * 0.02),
+            name="slot_vocab_vectors",
+        )
+
+    def construct(self, slots: Tensor) -> Tensor:
+        """Returns (B, num_slots) integer IDs."""
+        slots_norm = slots / (ops.norm(slots, axis=-1, keep_dims=True) + 1e-8)
+        vocab_norm = self.vocab_vectors / (
+            ops.norm(self.vocab_vectors, axis=-1, keep_dims=True) + 1e-8)
+        sim = ops.matmul(slots_norm, vocab_norm.transpose(1, 0))
+        return ops.argmax(sim, axis=-1)
 
 
 class Thinker15BModel(nn.Cell):
-    """Full ~1.45B decoder-only LM with SFM slot banks.
+    """Full ~1.45B decoder-only LM with SFM slot banks (v2).
 
-    Construct is UNROLLED (no for-loops) for GRAPH_MODE safety.
+    Construct is UNROLLED for GRAPH_MODE safety.
+    Slot persistence across all 4 SFM layers.
     """
 
     def __init__(self) -> None:
@@ -438,6 +469,13 @@ class Thinker15BModel(nn.Cell):
             name="lm_head_weight")
         self.matmul = ops.MatMul(transpose_b=True)
 
+        # Initial slots — learned parameter
+        self.initial_slots = ms.Parameter(
+            Tensor(np.random.randn(1, SFM_NUM_SLOTS, SFM_SLOT_DIM).astype(
+                np.float16) * 0.02),
+            name="initial_slots")
+
+        # 24 transformer layers (unrolled)
         self.layer0 = TransformerBlock()
         self.layer1 = TransformerBlock()
         self.layer2 = TransformerBlock()
@@ -463,16 +501,21 @@ class Thinker15BModel(nn.Cell):
         self.layer22 = TransformerBlock()
         self.layer23 = TransformerBlock()
 
+        # 4 SFM banks at layers 5, 11, 17, 23
         self.sfm5 = SFMSlotBank()
         self.sfm5_pred = SlotPredictionHead()
+        self.sfm5_tok = SlotTokenizer()
         self.sfm11 = SFMSlotBank()
         self.sfm11_pred = SlotPredictionHead()
+        self.sfm11_tok = SlotTokenizer()
         self.sfm17 = SFMSlotBank()
         self.sfm17_pred = SlotPredictionHead()
+        self.sfm17_tok = SlotTokenizer()
         self.sfm23 = SFMSlotBank()
         self.sfm23_pred = SlotPredictionHead()
+        self.sfm23_tok = SlotTokenizer()
 
-        self.mse_loss = nn.MSELoss()
+        self.ce_loss = nn.CrossEntropyLoss()
 
     def construct(self, input_ids: Tensor, cos: Tensor, sin: Tensor,
                   mask: Tensor) -> tuple:
@@ -481,46 +524,63 @@ class Thinker15BModel(nn.Cell):
         x = self.embedding(input_ids).astype(ms.float16)
         total_slot_loss = Tensor(0.0, ms.float32)
 
+        # Initialize slots from learned param, broadcast
+        slots = ops.broadcast_to(
+            self.initial_slots,
+            (B, SFM_NUM_SLOTS, SFM_SLOT_DIM))
+
+        # Unrolled layers with slot persistence
         x = self.layer0(x, cos, sin, mask)
         x = self.layer1(x, cos, sin, mask)
         x = self.layer2(x, cos, sin, mask)
         x = self.layer3(x, cos, sin, mask)
         x = self.layer4(x, cos, sin, mask)
         x = self.layer5(x, cos, sin, mask)
-        x, slots5 = self.sfm5(x)
-        pred5 = self.sfm5_pred(x)
-        total_slot_loss = total_slot_loss + self.mse_loss(
-            pred5, slots5.astype(ms.float32))
+        x, slots = self.sfm5(x, slots)
+        pred5_logits = self.sfm5_pred(slots)
+        slot5_ids = self.sfm5_tok(slots)
+        total_slot_loss = total_slot_loss + self.ce_loss(
+            pred5_logits.reshape((-1, SFM_SLOT_VOCAB_SIZE)),
+            slot5_ids.reshape((-1,)))
+
         x = self.layer6(x, cos, sin, mask)
         x = self.layer7(x, cos, sin, mask)
         x = self.layer8(x, cos, sin, mask)
         x = self.layer9(x, cos, sin, mask)
         x = self.layer10(x, cos, sin, mask)
         x = self.layer11(x, cos, sin, mask)
-        x, slots11 = self.sfm11(x)
-        pred11 = self.sfm11_pred(x)
-        total_slot_loss = total_slot_loss + self.mse_loss(
-            pred11, slots11.astype(ms.float32))
+        x, slots = self.sfm11(x, slots)
+        pred11_logits = self.sfm11_pred(slots)
+        slot11_ids = self.sfm11_tok(slots)
+        total_slot_loss = total_slot_loss + self.ce_loss(
+            pred11_logits.reshape((-1, SFM_SLOT_VOCAB_SIZE)),
+            slot11_ids.reshape((-1,)))
+
         x = self.layer12(x, cos, sin, mask)
         x = self.layer13(x, cos, sin, mask)
         x = self.layer14(x, cos, sin, mask)
         x = self.layer15(x, cos, sin, mask)
         x = self.layer16(x, cos, sin, mask)
         x = self.layer17(x, cos, sin, mask)
-        x, slots17 = self.sfm17(x)
-        pred17 = self.sfm17_pred(x)
-        total_slot_loss = total_slot_loss + self.mse_loss(
-            pred17, slots17.astype(ms.float32))
+        x, slots = self.sfm17(x, slots)
+        pred17_logits = self.sfm17_pred(slots)
+        slot17_ids = self.sfm17_tok(slots)
+        total_slot_loss = total_slot_loss + self.ce_loss(
+            pred17_logits.reshape((-1, SFM_SLOT_VOCAB_SIZE)),
+            slot17_ids.reshape((-1,)))
+
         x = self.layer18(x, cos, sin, mask)
         x = self.layer19(x, cos, sin, mask)
         x = self.layer20(x, cos, sin, mask)
         x = self.layer21(x, cos, sin, mask)
         x = self.layer22(x, cos, sin, mask)
         x = self.layer23(x, cos, sin, mask)
-        x, slots23 = self.sfm23(x)
-        pred23 = self.sfm23_pred(x)
-        total_slot_loss = total_slot_loss + self.mse_loss(
-            pred23, slots23.astype(ms.float32))
+        x, slots = self.sfm23(x, slots)
+        pred23_logits = self.sfm23_pred(slots)
+        slot23_ids = self.sfm23_tok(slots)
+        total_slot_loss = total_slot_loss + self.ce_loss(
+            pred23_logits.reshape((-1, SFM_SLOT_VOCAB_SIZE)),
+            slot23_ids.reshape((-1,)))
 
         x = self.norm(x)
         h2 = x.reshape((-1, HIDDEN_DIM))
@@ -533,7 +593,7 @@ class Thinker15BModel(nn.Cell):
 
 
 class ForwardLossCell(nn.Cell):
-    """LM cross-entropy + slot prediction MSE loss."""
+    """LM cross-entropy + slot prediction CE loss."""
 
     def __init__(self, model: Thinker15BModel, cos: Tensor, sin: Tensor,
                  mask: Tensor):
@@ -576,7 +636,6 @@ class TrainStep(nn.Cell):
         loss = self.forward_loss(input_ids)
         grads = self.grad_op(self.forward_loss, self.weights)(
             input_ids, self.sens)
-        # Manual clip-by-global-norm
         total_norm_sq = Tensor(0.0, ms.float32)
         for g in grads:
             total_norm_sq = total_norm_sq + ops.reduce_sum(g * g)
@@ -587,62 +646,6 @@ class TrainStep(nn.Cell):
         return self.depend(loss, status)
 
 
-class GRPOTrainStep(nn.Cell):
-    """GRPO training step: per-sample log-probs + group-relative advantage.
-
-    Uses teacher forcing (not autoregressive generation) during
-    pre-training. Groups of samples share prompt prefix; binary
-    rewards from data.
-    """
-
-    def __init__(self, model: Thinker15BModel, cos: Tensor, sin: Tensor,
-                 mask: Tensor):
-        super().__init__()
-        self.model = model
-        self.cos = cos
-        self.sin = sin
-        self.mask = mask
-        self.log_softmax = ops.LogSoftmax(axis=-1)
-        self.gather = ops.Gather()
-
-    def construct(self, input_ids: Tensor, rewards: Tensor) -> Tensor:
-        """Compute GRPO loss.
-
-        Args:
-            input_ids: (B, S) token IDs.
-            rewards: (B,) binary rewards (1.0 or 0.0).
-
-        Returns:
-            GRPO loss scalar.
-        """
-        logits, slot_loss = self.model(input_ids, self.cos, self.sin,
-                                       self.mask)
-        log_probs = self.log_softmax(logits)  # (B, S, V)
-
-        # Per-token log-prob of actual next token (teacher forcing)
-        logits_t = log_probs[:, :-1, :]   # (B, S-1, V)
-        labels = input_ids[:, 1:]          # (B, S-1)
-        B, S1, V = logits_t.shape
-
-        # Gather log probs for each label (axis=1 = vocab dimension)
-        labels_flat = labels.reshape((-1, 1))
-        logits_flat = logits_t.reshape((-1, V))
-        chosen_log_probs = self.gather(logits_flat, labels_flat, 1).reshape((-1,))
-        chosen_log_probs = chosen_log_probs.reshape(B, S1)
-
-        # Per-sample average log-prob (mean over sequence)
-        sample_log_probs = ops.mean(chosen_log_probs, axis=1)  # (B,)
-
-        # Group-relative advantage: reward - group_mean
-        group_mean = ops.mean(rewards)
-        advantages = rewards - group_mean  # (B,)
-
-        # GRPO loss: -advantage * log_prob (weighted)
-        grpo_loss = -ops.mean(advantages * sample_log_probs)
-
-        return grpo_loss + SLOT_PRED_WEIGHT * slot_loss
-
-
 # ── Helpers ─────────────────────────────────────────────────────────
 
 
@@ -651,40 +654,9 @@ def count_params(model: nn.Cell) -> tuple:
     return total, total
 
 
-def load_safetensors(filepath: str) -> dict:
-    tensors = {}
-    with open(filepath, "rb") as f:
-        header_size = struct.unpack("<Q", f.read(8))[0]
-        header = json.loads(f.read(header_size).decode("utf-8"))
-        data_base = 8 + header_size
-        for name, meta in header.items():
-            if not isinstance(meta, dict) or "dtype" not in meta:
-                continue
-            dtype_str = meta["dtype"]
-            shape = tuple(meta["shape"])
-            off0, off1 = meta["data_offsets"]
-            f.seek(data_base + off0)
-            raw = f.read(off1 - off0)
-            if dtype_str == "F16":
-                arr = np.frombuffer(raw, dtype=np.float16).copy().reshape(
-                    shape)
-            elif dtype_str == "BF16":
-                u16 = np.frombuffer(raw, dtype=np.uint16).copy().reshape(
-                    shape)
-                arr = (u16.astype(np.uint32) << 16).view(np.float32)
-            elif dtype_str == "F32":
-                arr = np.frombuffer(raw, dtype=np.float32).copy().reshape(
-                    shape)
-            else:
-                raise ValueError(f"Unsupported dtype: {dtype_str}")
-            tensors[name] = arr
-    return tensors
-
-
 def _find_data_files(base: str) -> list:
     found = []
-    for ext in ("*.jsonl", "*.json", "*.parquet", "*.csv", "*.txt",
-                "*.npy"):
+    for ext in ("*.jsonl", "*.json", "*.parquet", "*.csv", "*.txt", "*.npy"):
         found.extend(
             glob.glob(os.path.join(base, "**", ext), recursive=True))
     return sorted(found)
@@ -714,7 +686,7 @@ def load_dataset(dataset_path: str, seq_len: int) -> tuple:
 
     Returns (chunks_array, grpo_list) where:
       - chunks_array: (N, seq_len) int32 or None
-      - grpo_list: list of {"text", "reward"} dicts for GRPO phase
+      - grpo_list: list of {"text", "reward"} dicts (v2: unused)
     """
     files = _find_data_files(dataset_path)
     log(f"  Found {len(files)} data file(s) in {dataset_path}")
@@ -722,7 +694,6 @@ def load_dataset(dataset_path: str, seq_len: int) -> tuple:
     chunks = None
     grpo_samples = []
 
-    # Try .npy first (pre-tokenized)
     npy_files = [f for f in files if f.endswith(".npy")]
     for nf in npy_files:
         try:
@@ -737,7 +708,6 @@ def load_dataset(dataset_path: str, seq_len: int) -> tuple:
         except Exception as e:
             log(f"  Failed to load {nf}: {e}")
 
-    # If no .npy, try raw text
     if chunks is None:
         texts = []
         for fp in files:
@@ -752,8 +722,6 @@ def load_dataset(dataset_path: str, seq_len: int) -> tuple:
                             if line:
                                 data = json.loads(line)
                                 texts.append(_extract_text(data))
-                                if "reward" in data:
-                                    grpo_samples.append(data)
                 elif fp.endswith(".json"):
                     with open(fp, "r", encoding="utf-8") as f:
                         data = json.load(f)
@@ -764,12 +732,11 @@ def load_dataset(dataset_path: str, seq_len: int) -> tuple:
                 log(f"    Error reading {fp}: {e}")
 
         if texts:
-            # Byte-level encoding fallback
             all_ids = []
             for text in texts:
                 for ch in text:
                     all_ids.append(min(ord(ch) % VOCAB_SIZE, VOCAB_SIZE - 1))
-                all_ids.append(VOCAB_SIZE - 1)  # EOS
+                all_ids.append(VOCAB_SIZE - 1)
             total = len(all_ids)
             usable = (total // seq_len) * seq_len
             if usable >= seq_len:
@@ -789,10 +756,9 @@ def main() -> None:
     device_id = int(os.environ.get("DEVICE_ID", rank_id))
 
     setup_logging(rank_id)
-    log(f"Thinker-1.5B training | rank={rank_id}/{rank_size} "
+    log(f"Thinker-1.5B v2 training | rank={rank_id}/{rank_size} "
         f"device={device_id}")
 
-    # Context
     ms.set_context(
         mode=ms.PYNATIVE_MODE,
         device_target="Ascend",
@@ -800,7 +766,6 @@ def main() -> None:
         memory_optimize_level="O1",
     )
 
-    # Data parallel
     use_dp = rank_size > 1
     if use_dp:
         try:
@@ -818,30 +783,24 @@ def main() -> None:
             use_dp = False
             rank_size = 1
 
-    # Build model
-    log("Building Thinker-1.5B model ...")
+    log("Building Thinker-1.5B v2 model ...")
     model = Thinker15BModel()
 
-    # Gradient checkpointing
     for i in range(NUM_LAYERS):
         getattr(model, f"layer{i}").recompute()
 
     total_p, _ = count_params(model)
     log(f"Total params: {total_p:,}")
 
-    # Load dataset
     log("Loading dataset ...")
     data_chunks, grpo_samples = load_dataset(DATASET_PATH, MAX_SEQ_LEN)
     use_real_data = data_chunks is not None
-    use_grpo = len(grpo_samples) > 0
 
     if use_real_data:
         log(f"Dataset: {data_chunks.shape[0]} chunks, "
             f"{data_chunks.shape[1]} tok/chunk")
     else:
         log("WARNING: no dataset — using random tokens")
-    if use_grpo:
-        log(f"GRPO samples: {len(grpo_samples)}")
 
     # Precompute RoPE + mask
     S = MAX_SEQ_LEN
@@ -876,7 +835,6 @@ def main() -> None:
         lr_schedule.append(lr)
     log(f"LR schedule: {max_steps} steps, warmup={WARMUP_STEPS}")
 
-    # Optimizer
     optimizer = nn.AdamWeightDecay(
         list(model.trainable_params()),
         learning_rate=lr_schedule,
@@ -885,7 +843,6 @@ def main() -> None:
         beta2=0.95,
     )
 
-    # Build forward loss cell
     forward_loss = ForwardLossCell(model, cos_t, sin_t, causal_mask)
     train_step = None
     actual_bs = BATCH_SIZE
@@ -918,15 +875,9 @@ def main() -> None:
         log("FATAL: all batch sizes OOM")
         return
 
-    # GRPO step
-    grpo_step = None
-    if use_grpo:
-        grpo_step = GRPOTrainStep(model, cos_t, sin_t, causal_mask)
-
     log(f"Training: B={actual_bs}, S={MAX_SEQ_LEN}, "
         f"{actual_bs * MAX_SEQ_LEN:,} tok/step/dev")
 
-    # Training loop
     step = 0
     total_tokens = 0
     best_loss = float("inf")
@@ -940,11 +891,10 @@ def main() -> None:
     samples_seen = 0
     total_samples = data_chunks.shape[0] if use_real_data else float("inf")
     prev_best_rolling = float("inf")
-    grpo_idx = 0
 
     log("")
     log("=" * 60)
-    log("TRAINING START")
+    log("TRAINING START (v2)")
     log("=" * 60)
 
     while step < max_steps:
@@ -954,54 +904,21 @@ def main() -> None:
             log(f"Time limit reached — {stop_reason}")
             break
 
-        # Soft curriculum: decide LM-only vs GRPO step
         step_frac = step / max(1, max_steps)
-        do_grpo = (use_grpo
-                   and step_frac >= CURRICULUM_P4_START
-                   and random.random() < 0.3)
 
         try:
-            if do_grpo and grpo_step is not None:
-                # GRPO step: teacher-forced log-probs + group-relative
-                group_ids = list(range(
-                    grpo_idx, min(grpo_idx + GRPO_GROUP_SIZE,
-                                  len(grpo_samples))))
-                if len(group_ids) < GRPO_GROUP_SIZE:
-                    grpo_idx = 0
-                    group_ids = list(range(GRPO_GROUP_SIZE))
-                grpo_idx += GRPO_GROUP_SIZE
-
-                # Encode GRPO texts (byte-level fallback)
-                group_samples = [grpo_samples[g] for g in group_ids[:GRPO_GROUP_SIZE]]
-                group_ids_list = []
-                rewards_list = []
-                for gs in group_samples:
-                    text = gs.get("text", "")
-                    ids = [min(ord(c) % VOCAB_SIZE, VOCAB_SIZE - 1)
-                           for c in text[:MAX_SEQ_LEN - 1]]
-                    ids += [VOCAB_SIZE - 1] * (MAX_SEQ_LEN - len(ids))
-                    group_ids_list.append(ids)
-                    rewards_list.append(float(gs.get("reward", 0.0)))
-
-                batch_np = np.array(group_ids_list, dtype=np.int32)
-                rewards_np = np.array(rewards_list, dtype=np.float32)
-                batch_tensor = Tensor(batch_np)
-                rewards_tensor = Tensor(rewards_np)
-                loss_val = grpo_step(batch_tensor, rewards_tensor)
+            if use_real_data:
+                indices = [
+                    (step * actual_bs + rank_id * actual_bs + j)
+                    % data_chunks.shape[0]
+                    for j in range(actual_bs)]
+                batch_np = data_chunks[indices]
             else:
-                # LM step
-                if use_real_data:
-                    indices = [
-                        (step * actual_bs + rank_id * actual_bs + j)
-                        % data_chunks.shape[0]
-                        for j in range(actual_bs)]
-                    batch_np = data_chunks[indices]
-                else:
-                    batch_np = np.random.randint(
-                        0, VOCAB_SIZE,
-                        (actual_bs, MAX_SEQ_LEN)).astype(np.int32)
-                batch_tensor = Tensor(batch_np)
-                loss_val = train_step(batch_tensor)
+                batch_np = np.random.randint(
+                    0, VOCAB_SIZE,
+                    (actual_bs, MAX_SEQ_LEN)).astype(np.int32)
+            batch_tensor = Tensor(batch_np)
+            loss_val = train_step(batch_tensor)
 
         except RuntimeError as e:
             msg = str(e).lower()
@@ -1024,7 +941,6 @@ def main() -> None:
             samples_seen -= total_samples
             log(f"=== Epoch {epochs_completed} completed at step {step} ===")
 
-        # Convergence check
         loss_history.append(loss_float)
         if (len(loss_history) >= CONVERGENCE_WINDOW
                 and step > WARMUP_STEPS
@@ -1057,11 +973,6 @@ def main() -> None:
             tps_dev = (tokens_per_step_actual / dt * step
                        if dt > 0 else 0)
             tps_total = tps_dev * rank_size
-            curriculum = "LM"
-            if do_grpo:
-                curriculum = "GRPO"
-            elif step_frac >= CURRICULUM_P3_START:
-                curriculum = "LM(+traj)"
             log(f"Step {step:>5d} | loss={loss_float:.4f} | "
                 f"best={best_loss:.4f} | "
                 f"tok/s/dev={tps_dev:.0f} | "
@@ -1069,8 +980,7 @@ def main() -> None:
                 f"lr={lr_schedule[min(step, len(lr_schedule)-1)]:.2e} | "
                 f"epoch={epochs_completed} | "
                 f"elapsed={dt:.0f}s | "
-                f"tokens={total_tokens:,} | "
-                f"cur={curriculum}")
+                f"tokens={total_tokens:,}")
 
         if rank_id == 0 and step % 1000 == 0 and step > 0:
             ckpt_path = os.path.join(CKPT_DIR, f"step_{step}.ckpt")
@@ -1085,7 +995,8 @@ def main() -> None:
         log("Final checkpoint saved")
 
     results = {
-        "model_name": "Thinker-1.5B (from-scratch + SFM)",
+        "model_name": "Thinker-1.5B v2 (from-scratch + SFM)",
+        "version": "v2",
         "total_params": total_p,
         "trainable_params": total_p,
         "batch_size": actual_bs,
@@ -1103,8 +1014,10 @@ def main() -> None:
         "stop_reason": stop_reason,
         "data_parallel": use_dp,
         "used_real_data": use_real_data,
-        "used_grpo": use_grpo,
-        "grpo_steps": max(0, step - int(max_steps * CURRICULUM_P4_START)),
+        "sfm_features": [
+            "real_gru", "slot_persistence", "pre_norm",
+            "slot_vocab_ce", "learned_initial_slots",
+        ],
     }
 
     results_path = os.path.join(OUTPUT_PATH, "results.json")
