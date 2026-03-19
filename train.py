@@ -24,7 +24,6 @@ import gc
 import glob
 import warnings
 
-# ── Bootstrap diagnostic (before anything else can fail) ──────────────────
 try:
     _boot_ts = time.strftime("%H:%M:%S")
     _boot_pid = os.getpid()
@@ -41,9 +40,6 @@ import subprocess
 
 warnings.filterwarnings("ignore")
 
-# ═══════════════════════════════════════════════════════════════════════════
-# SECTION 1 — Environment variables (BEFORE any MindSpore import)
-# ═══════════════════════════════════════════════════════════════════════════
 
 os.environ.update({
     "MS_COMPILER_CACHE_ENABLE": "1",
@@ -52,16 +48,12 @@ os.environ.update({
     "TASK_QUEUE_ENABLE": "2",
     "CPU_AFFINITY_CONF": "1",
     "ASCEND_GLOBAL_LOG_LEVEL": "3",      # errors only
-    "GLOG_v": "2",                         # warnings + errors
+    "GLOG_v": "2",
     "HCCL_CONNECT_TIMEOUT": "1800",
     "MS_COMPILER_OP_LEVEL": "0",
 })
 
-# ═══════════════════════════════════════════════════════════════════════════
-# SECTION 1b — c2net path discovery (OpenI platform)
-# ═══════════════════════════════════════════════════════════════════════════
 
-# Check if parent passed paths via env vars (from subprocess launcher)
 _PARENT_PASSED = os.environ.get("SFM_OUTPUT_PATH") is not None
 HAS_C2NET = False
 CODE_PATH = "/home/ma-user/work/code"
@@ -70,15 +62,13 @@ PRETRAIN_MODEL_PATH = "/home/ma-user/work/pretrainmodel"
 OUTPUT_PATH = "/home/ma-user/work/output"
 
 if _PARENT_PASSED:
-    # Paths already discovered by parent process
     OUTPUT_PATH = os.environ["SFM_OUTPUT_PATH"]
     DATASET_PATH = os.environ["SFM_DATASET_PATH"]
     PRETRAIN_MODEL_PATH = os.environ["SFM_PRETRAIN_PATH"]
     CODE_PATH = os.environ.get("SFM_CODE_PATH", CODE_PATH)
 else:
-    # Try c2net
     try:
-        from c2net.context import prepare, upload_output  # noqa: F401
+        from c2net.context import prepare, upload_output
         _ctx = prepare()
         CODE_PATH = _ctx.code_path
         DATASET_PATH = _ctx.dataset_path
@@ -92,7 +82,6 @@ else:
     except Exception:
         print("c2net not available — using default paths", flush=True)
 
-# Fallback: grampus sets LOCAL_* env vars if c2net didn't provide paths
 if not os.path.isdir(CODE_PATH) and os.environ.get("LOCAL_CODE_PATH"):
     CODE_PATH = os.environ["LOCAL_CODE_PATH"]
 if not os.path.isdir(DATASET_PATH) and os.environ.get("LOCAL_DATASET_PATH"):
@@ -102,12 +91,8 @@ if not os.path.isdir(PRETRAIN_MODEL_PATH) and os.environ.get("LOCAL_PRETRAIN_MOD
 if not OUTPUT_PATH or not os.path.isdir(OUTPUT_PATH):
     OUTPUT_PATH = os.environ.get("LOCAL_OUTPUT_PATH", "/cache/output")
 
-# Derive working dirs from discovered paths
 CKPT_DIR = os.path.join(OUTPUT_PATH, "checkpoints")
 
-# ═══════════════════════════════════════════════════════════════════════════
-# SECTION 2 — Constants (Qwen2.5-Coder-7B config.json values)
-# ═══════════════════════════════════════════════════════════════════════════
 
 VOCAB_SIZE = 151936
 HIDDEN_SIZE = 3584
@@ -115,15 +100,14 @@ NUM_LAYERS = 32
 NUM_HEADS = 28
 NUM_KV_HEADS = 4
 INTERMEDIATE_SIZE = 18944
-HEAD_DIM = 128                 # HIDDEN_SIZE // NUM_HEADS
-NUM_GROUPS = 7                 # NUM_HEADS // NUM_KV_HEADS
+HEAD_DIM = 128
+NUM_GROUPS = 7
 RMS_NORM_EPS = 1e-6
 ROPE_THETA = 1000000.0
 MAX_SEQ_LEN = 2048
 MAX_POSITION = 32768
-TIE_WORD_EMBEDDINGS = False    # 7B does NOT tie embeddings
+TIE_WORD_EMBEDDINGS = False
 
-# LoRA
 LORA_RANK = 32
 LORA_ALPHA = 64
 
@@ -131,26 +115,21 @@ LORA_ALPHA = 64
 SFM_NUM_SLOTS = 8
 SFM_LAYERS = {7, 15, 23, 31}
 
-# Training
-BATCH_SIZE = 8                 # 7B is larger, start at 8
+BATCH_SIZE = 8
 SEQ_LEN = 2048
-LEARNING_RATE = 1e-4           # slightly lower for 7B
+LEARNING_RATE = 1e-4
 MIN_LR = 1e-5
-WARMUP_STEPS = 150             # slightly longer warmup for 7B
+WARMUP_STEPS = 150
 WEIGHT_DECAY = 0.01
 MAX_GRAD_NORM = 1.0
-TIME_LIMIT = 86400             # 24h hard safety limit
-MIN_EPOCHS = 2                 # must complete at least 2 full passes
-CONVERGENCE_WINDOW = 200       # rolling average window
-CONVERGENCE_PATIENCE = 1000    # steps without improvement before stopping
-CONVERGENCE_THRESHOLD = 0.001  # 0.1% relative improvement required
+TIME_LIMIT = 86400
+MIN_EPOCHS = 2
+CONVERGENCE_WINDOW = 200
+CONVERGENCE_PATIENCE = 1000
+CONVERGENCE_THRESHOLD = 0.001
 
-# Infrastructure
 RANK_SIZE = 4
 
-# ═══════════════════════════════════════════════════════════════════════════
-# SECTION 3 — Logging
-# ═══════════════════════════════════════════════════════════════════════════
 
 _log_fh = None                  # per-worker file handle
 
@@ -175,9 +154,6 @@ def setup_logging(rank_id: int) -> None:
     _log_fh = open(path, "a")
     log(f"Logging to {path}")
 
-# ═══════════════════════════════════════════════════════════════════════════
-# SECTION 4 — Multi-NPU launcher (parent process, no MindSpore)
-# ═══════════════════════════════════════════════════════════════════════════
 
 def is_main_process() -> bool:
     return os.environ.get("RANK_ID") is None and "--worker" not in sys.argv
@@ -212,7 +188,6 @@ def launch_distributed() -> None:
         fh.close()
         log(f"Worker (pid={p.pid}) exited with code {p.returncode}")
 
-    # Collect results from rank 0
     results_path = os.path.join(OUTPUT_PATH, "results.json")
     if os.path.exists(results_path):
         with open(results_path) as f:
@@ -223,7 +198,6 @@ def launch_distributed() -> None:
         for k, v in results.items():
             log(f"  {k}: {v}")
 
-    # Upload via c2net
     if HAS_C2NET:
         try:
             upload_output()
@@ -232,18 +206,13 @@ def launch_distributed() -> None:
             log(f"upload_output() failed: {e}")
 
 
-# ── Fork gate ──────────────────────────────────────────────────────────────
 if is_main_process():
     launch_distributed()
     sys.exit(0)
 
-# Worker process — print early diagnostic
 print(f"[worker] RANK_ID={os.environ.get('RANK_ID')}, "
       f"OUTPUT_PATH={OUTPUT_PATH}, PID={os.getpid()}", flush=True)
 
-# ═══════════════════════════════════════════════════════════════════════════
-# SECTION 5 — Safetensors reader (pure Python, no pip package)
-# ═══════════════════════════════════════════════════════════════════════════
 
 def load_safetensors(filepath: str) -> dict:
     """Read a .safetensors file and return {name: np.ndarray}."""
@@ -274,9 +243,6 @@ def load_safetensors(filepath: str) -> dict:
             tensors[name] = arr
     return tensors
 
-# ═══════════════════════════════════════════════════════════════════════════
-# SECTION 6 — Weight conversion (HF → MindSpore)
-# ═══════════════════════════════════════════════════════════════════════════
 
 _HF_ATT = "self_attn"
 _HF_MLP = "mlp"
@@ -337,17 +303,14 @@ def find_model_dir(base_path: str) -> str:
     if not os.path.isdir(base_path):
         return None
 
-    # Check base_path itself
     if glob.glob(os.path.join(base_path, "*.safetensors")):
         return base_path
 
-    # Check immediate subdirectories
     for d in sorted(os.listdir(base_path)):
         sub = os.path.join(base_path, d)
         if os.path.isdir(sub) and glob.glob(os.path.join(sub, "*.safetensors")):
             return sub
 
-    # Recursive search (max depth 2 more)
     for root, dirs, _files in os.walk(base_path):
         depth = root[len(base_path):].count(os.sep)
         if depth > 3:
@@ -404,9 +367,6 @@ def load_pretrained_weights(model, model_dir: str, rank_id: int) -> bool:
     log(f"  Weights loaded successfully")
     return True
 
-# ═══════════════════════════════════════════════════════════════════════════
-# SECTION 7 — Model architecture  (UNCHANGED)
-# ═══════════════════════════════════════════════════════════════════════════
 
 import numpy as np
 import mindspore as ms
@@ -629,10 +589,8 @@ class Thinker1Model(nn.Cell):
         ])
         self.norm = RMSNorm(HIDDEN_SIZE)
         if TIE_WORD_EMBEDDINGS:
-            # Tied embeddings: reuse embedding table as lm_head
             self.lm_head = None
         else:
-            # Untied: separate lm_head weight (frozen backbone)
             self.lm_head = ms.Parameter(
                 ms.Tensor(np.random.randn(VOCAB_SIZE, HIDDEN_SIZE).astype(
                     np.float16) * 0.02),
@@ -680,6 +638,7 @@ class TrainStep(nn.Cell):
         self.depend = ops.Depend()
         self.clip_grad = nn.ClipByGlobalNorm(max_norm=max_grad_norm)
 
+    @ms.jit
     def construct(self, input_ids: Tensor) -> Tensor:
         loss = self.forward_loss(input_ids)
         grads = self.grad_op(self.forward_loss, self.weights)(input_ids, self.sens)
@@ -687,13 +646,9 @@ class TrainStep(nn.Cell):
         status = self.optimizer(clipped)
         return self.depend(loss, status)
 
-# ═══════════════════════════════════════════════════════════════════════════
-# SECTION 8 — Dataset loading (OpenThoughts-114k or synthetic fallback)
-# ═══════════════════════════════════════════════════════════════════════════
 
 def _extract_text(row: dict) -> str:
     """Extract text content from a dataset row (various schema formats)."""
-    # Chat / conversations format
     for key in ("messages", "conversations"):
         if key in row:
             parts = row[key]
@@ -702,7 +657,6 @@ def _extract_text(row: dict) -> str:
                     m.get("content", m.get("text", "")) for m in parts
                     if isinstance(m, dict)
                 )
-    # Field-based formats
     for pair in [("output", "input"), ("response", "instruction"),
                   ("solution", "problem"), ("answer", "question"),
                   ("content", "text")]:
@@ -749,12 +703,10 @@ def _try_load_byte_tokenizer(pretrain_path: str):
         if not vocab:
             return None
 
-        # Build token -> id mapping (handle int/str IDs)
         token_to_id = {}
         for token, idx in vocab.items():
             token_to_id[token] = int(idx)
 
-        # Read added_tokens for special token IDs
         added = tok_data.get("added_tokens", [])
         eos_id = 151645  # Qwen2.5 default
         bos_id = 151643
@@ -804,11 +756,9 @@ def _get_byte_token(byte_val, vocab):
     ch = b2u[byte_val]
     if ch in vocab:
         return vocab[ch]
-    # Try <0xHH> fallback
     hex_tok = f"<0x{byte_val:02X}>"
     if hex_tok in vocab:
         return vocab[hex_tok]
-    # Try <0xhh> lowercase
     hex_tok = f"<0x{byte_val:02x}>"
     if hex_tok in vocab:
         return vocab[hex_tok]
@@ -849,7 +799,6 @@ def tokenize_text(text, vocab, merge_priority):
     if current:
         words.append("".join(current))
 
-    # Reconstruct: merge Ġ sentinels with following words
     merged_words = []
     i = 0
     while i < len(words):
@@ -865,9 +814,7 @@ def tokenize_text(text, vocab, merge_priority):
 
     token_ids = []
     for word in merged_words:
-        # Convert each character to its byte-token representation
         word_bytes = word.encode("utf-8", errors="replace")
-        # Map each byte to its unicode representation
         tokens = []
         for b in word_bytes:
             ch = b2u[b]
@@ -875,7 +822,6 @@ def tokenize_text(text, vocab, merge_priority):
 
         # Apply BPE merges
         while len(tokens) >= 2:
-            # Find the pair with lowest merge priority
             best_pair = None
             best_pri = float("inf")
             for j in range(len(tokens) - 1):
@@ -887,13 +833,11 @@ def tokenize_text(text, vocab, merge_priority):
                     best_idx = j
             if best_pair is None:
                 break
-            # Merge the pair at best_idx
             new_tokens = tokens[:best_idx]
             new_tokens.append(best_pair[0] + best_pair[1])
             new_tokens.extend(tokens[best_idx + 2:])
             tokens = new_tokens
 
-        # Look up each final token in vocab
         for tok in tokens:
             tid = vocab.get(tok)
             if tid is not None:
@@ -981,8 +925,8 @@ def load_dataset(dataset_path: str, seq_len: int,
     if not files:
         return None
 
-    # Read all rows
     texts = []
+
     for fp in files:
         log(f"  Reading {os.path.basename(fp)} …")
         try:
@@ -1042,11 +986,9 @@ def load_dataset(dataset_path: str, seq_len: int,
 
     log(f"  Extracted {len(texts)} text samples")
 
-    # Deduplicate and filter empty
     texts = list(set(t for t in texts if len(t.strip()) > 10))
     log(f"  After dedup: {len(texts)} unique samples")
 
-    # Try BPE tokenizer
     tok_result = _try_load_byte_tokenizer(pretrain_path)
     if tok_result is not None:
         vocab, merges, eos_id = tok_result
@@ -1056,7 +998,6 @@ def load_dataset(dataset_path: str, seq_len: int,
     return _tokenize_texts(texts, vocab, merges, eos_id, seq_len)
 
 
-# Synthetic fallback dataset
 class RandomTokenDataset:
     """Synthetic random-token dataset for throughput measurement."""
 
@@ -1070,9 +1011,6 @@ class RandomTokenDataset:
     def __getitem__(self, idx):
         return np.random.randint(0, VOCAB_SIZE, (self.seq_len,)).astype(np.int32)
 
-# ═══════════════════════════════════════════════════════════════════════════
-# SECTION 9 — Main training loop
-# ═══════════════════════════════════════════════════════════════════════════
 
 def count_params(model: nn.Cell):
     total = sum(p.size for p in model.get_parameters())
@@ -1083,7 +1021,6 @@ def count_params(model: nn.Cell):
 def main():
     t0_global = time.time()
 
-    # ── Rank / device ────────────────────────────────────────────────────
     rank_id = int(os.environ.get("RANK_ID", "0"))
     rank_size = int(os.environ.get("RANK_SIZE", "1"))
     device_id = int(os.environ.get("DEVICE_ID", "0"))
@@ -1097,36 +1034,31 @@ def main():
     log(f"CWD: {os.getcwd()}")
     log("")
 
-    # ── Print discovered paths ──────────────────────────────────────────────
     log(f"CODE_PATH:     {CODE_PATH}")
     log(f"DATASET_PATH:  {DATASET_PATH}")
     log(f"PRETRAIN_PATH: {PRETRAIN_MODEL_PATH}")
     log(f"OUTPUT_PATH:   {OUTPUT_PATH}")
     log("")
 
-    # List dataset directory contents
     if os.path.isdir(DATASET_PATH):
         entries = sorted(os.listdir(DATASET_PATH))[:20]
         log(f"DATASET dir contents: {entries}")
     else:
         log("DATASET_PATH does not exist")
 
-    # Find pretrained model
     model_dir = find_model_dir(PRETRAIN_MODEL_PATH)
     if model_dir:
         log(f"Model weights found at: {model_dir}")
     else:
         log(f"WARNING: no .safetensors found under {PRETRAIN_MODEL_PATH}")
 
-    # ── MindSpore context ────────────────────────────────────────────────
     ms.set_context(
-        mode=ms.GRAPH_MODE,
+        mode=ms.PYNATIVE_MODE,
         device_target="Ascend",
         device_id=device_id,
         memory_optimize_level="O1",
     )
 
-    # ── Data-parallel init (best-effort, fallback to single) ───────────
     use_dp = rank_size > 1
     if use_dp:
         try:
@@ -1144,7 +1076,6 @@ def main():
             use_dp = False
             rank_size = 1
 
-    # ── Build model ──────────────────────────────────────────────────────
     log("Building Thinker-1 model …")
     model = Thinker1Model()
 
@@ -1155,8 +1086,6 @@ def main():
     log(f"Total params: {total_p:,}  |  Trainable: {trainable_p:,}  "
         f"({100*trainable_p/total_p:.2f}%)")
 
-    # ── Freeze backbone, keep LoRA + SFM trainable ───────────────────────
-    # Freeze ALL params first, then selectively unfreeze adapters
     for p in model.get_parameters():
         p.requires_grad = False
     for name, p in model.parameters_and_names():
@@ -1165,15 +1094,11 @@ def main():
     trainable_p2 = sum(p.size for p in model.trainable_params())
     log(f"Trainable after freeze: {trainable_p2:,}")
 
-    # ── Load pretrained weights ────────────────────────────────────────────────
-    # All workers load from safetensors in parallel (avoids ckpt race condition
-    # on network filesystem — save/load dance caused DecodeError).
     if model_dir:
         load_pretrained_weights(model, model_dir, rank_id)
     else:
         log("WARNING: no pretrained weights found — using random init")
 
-    # ── Load dataset ─────────────────────────────────────────────────────
     log("Loading dataset …")
     data_chunks = load_dataset(DATASET_PATH, SEQ_LEN, PRETRAIN_MODEL_PATH)
     use_real_data = data_chunks is not None
@@ -1184,9 +1109,7 @@ def main():
     else:
         log("WARNING: no dataset files found — using synthetic random tokens")
 
-    # ── Optimiser ────────────────────────────────────────────────────────
     tokens_per_step_per_device = BATCH_SIZE * SEQ_LEN
-    # max_steps: generous upper bound for LR schedule (5 epochs over data)
     if use_real_data:
         max_steps = data_chunks.shape[0] * 5 // rank_size + 100
     else:
@@ -1195,7 +1118,6 @@ def main():
         f"real_data={use_real_data}")
 
     train_params = list(model.trainable_params())
-    # Cosine LR schedule with linear warmup
     lr_schedule = []
     for s in range(max_steps):
         if s < WARMUP_STEPS:
@@ -1216,7 +1138,6 @@ def main():
         beta2=0.95,
     )
 
-    # ── Training cells (try B=16, fallback to B=8) ──────────────────────
     forward_loss = ForwardLossCell(model)
     train_step = None
     actual_bs = BATCH_SIZE
@@ -1252,7 +1173,6 @@ def main():
     log(f"Training with B={actual_bs}, S={SEQ_LEN}, "
         f"{actual_bs * SEQ_LEN:,} tok/step/device")
 
-    # ── Training loop ────────────────────────────────────────────────────
     step = 0
     total_tokens = 0
     best_loss = float("inf")
@@ -1260,7 +1180,6 @@ def main():
     tokens_per_step = actual_bs * SEQ_LEN
     stop_reason = "not started"
 
-    # Convergence tracking
     loss_history = []
     best_rolling_avg = float("inf")
     steps_without_improvement = 0
@@ -1312,7 +1231,6 @@ def main():
 
         step += 1
 
-        # Track epochs
         if use_real_data and samples_seen >= total_samples:
             epochs_completed += 1
             samples_seen -= total_samples
@@ -1327,7 +1245,6 @@ def main():
             if rolling_avg < best_rolling_avg * (1 - CONVERGENCE_THRESHOLD):
                 best_rolling_avg = rolling_avg
                 steps_without_improvement = 0
-                # Save best model checkpoint
                 if rank_id == 0 and rolling_avg < prev_best_rolling:
                     ms.save_checkpoint(model, os.path.join(CKPT_DIR, "best.ckpt"))
                     log(f"New best model saved (rolling_avg={rolling_avg:.4f})")
@@ -1361,7 +1278,6 @@ def main():
             ms.save_checkpoint(model, ckpt_path)
             log(f"Checkpoint saved: {ckpt_path}")
 
-    # ── Final checkpoint + results ───────────────────────────────────────
     elapsed_total = time.time() - t_start
     tps_dev_avg = (total_tokens / rank_size) / elapsed_total if elapsed_total > 0 else 0
     tps_total_avg = total_tokens / elapsed_total if elapsed_total > 0 else 0
@@ -1403,7 +1319,6 @@ def main():
     for k, v in results.items():
         log(f"  {k}: {v}")
 
-    # Upload via c2net
     if HAS_C2NET:
         try:
             upload_output()
