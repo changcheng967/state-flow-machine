@@ -552,10 +552,9 @@ class ForwardLossCell(nn.Cell):
 
 
 class TrainStep(nn.Cell):
-    """Manual train step with gradient clipping."""
+    """Manual train step (no grad clipping — not available in MS 2.2)."""
 
-    def __init__(self, forward_loss: ForwardLossCell, optimizer,
-                 max_grad_norm: float = MAX_GRAD_NORM):
+    def __init__(self, forward_loss: ForwardLossCell, optimizer):
         super().__init__()
         self.forward_loss = forward_loss
         self.optimizer = optimizer
@@ -563,15 +562,13 @@ class TrainStep(nn.Cell):
         self.grad_op = ops.GradOperation(get_by_list=True, sens_param=True)
         self.sens = Tensor([1.0], ms.float32)
         self.depend = ops.Depend()
-        self.clip_grad = nn.ClipByGlobalNorm(max_norm=max_grad_norm)
 
     @ms.jit
     def construct(self, input_ids: Tensor) -> Tensor:
         loss = self.forward_loss(input_ids)
         grads = self.grad_op(self.forward_loss, self.weights)(
             input_ids, self.sens)
-        clipped, _ = self.clip_grad(grads)
-        status = self.optimizer(clipped)
+        status = self.optimizer(grads)
         return self.depend(loss, status)
 
 
@@ -881,7 +878,7 @@ def main() -> None:
     for bs in [4, 2, 1]:
         try:
             log(f"Building training graph for B={bs} ...")
-            ts = TrainStep(forward_loss, optimizer, MAX_GRAD_NORM)
+            ts = TrainStep(forward_loss, optimizer)
             ts.set_train()
             dummy = Tensor(
                 np.random.randint(0, VOCAB_SIZE, (bs, MAX_SEQ_LEN)).astype(
