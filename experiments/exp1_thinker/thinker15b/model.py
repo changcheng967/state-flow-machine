@@ -306,7 +306,7 @@ class Thinker15BModel(nn.Cell):
         Override in the training script with the unrolled version.
         """
         B = input_ids.shape[0]
-        x = self.embedding(input_ids)
+        x = self.embedding(input_ids).astype(ms.float16)
         total_slot_loss = Tensor(0.0, ms.float32)
         mse_fn = nn.MSELoss()
 

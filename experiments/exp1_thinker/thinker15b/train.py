@@ -476,7 +476,7 @@ class Thinker15BModel(nn.Cell):
                   mask: Tensor) -> tuple:
         """Returns (logits, total_slot_pred_loss)."""
         B = input_ids.shape[0]
-        x = self.embedding(input_ids)
+        x = self.embedding(input_ids).astype(ms.float16)
         total_slot_loss = Tensor(0.0, ms.float32)
 
         x = self.layer0(x, cos, sin, mask)
