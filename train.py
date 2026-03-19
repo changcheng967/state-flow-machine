@@ -79,9 +79,15 @@ else:
     except Exception:
         print("c2net not available — using default paths", flush=True)
 
-# Fallback: ensure OUTPUT_PATH is set and valid
-if not OUTPUT_PATH:
-    OUTPUT_PATH = "/cache/output"
+# Fallback: grampus sets LOCAL_* env vars if c2net didn't provide paths
+if not os.path.isdir(CODE_PATH) and os.environ.get("LOCAL_CODE_PATH"):
+    CODE_PATH = os.environ["LOCAL_CODE_PATH"]
+if not os.path.isdir(DATASET_PATH) and os.environ.get("LOCAL_DATASET_PATH"):
+    DATASET_PATH = os.environ["LOCAL_DATASET_PATH"]
+if not os.path.isdir(PRETRAIN_MODEL_PATH) and os.environ.get("LOCAL_PRETRAIN_MODEL_PATH"):
+    PRETRAIN_MODEL_PATH = os.environ["LOCAL_PRETRAIN_MODEL_PATH"]
+if not OUTPUT_PATH or not os.path.isdir(OUTPUT_PATH):
+    OUTPUT_PATH = os.environ.get("LOCAL_OUTPUT_PATH", "/cache/output")
 
 # Derive working dirs from discovered paths
 CKPT_DIR = os.path.join(OUTPUT_PATH, "checkpoints")
