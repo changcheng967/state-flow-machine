@@ -219,6 +219,10 @@ if is_main_process():
     launch_distributed()
     sys.exit(0)
 
+# Worker process — print early diagnostic
+print(f"[worker] RANK_ID={os.environ.get('RANK_ID')}, "
+      f"OUTPUT_PATH={OUTPUT_PATH}, PID={os.getpid()}", flush=True)
+
 # ═══════════════════════════════════════════════════════════════════════════
 # SECTION 5 — Safetensors reader (pure Python, no pip package)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1184,4 +1188,18 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        print(f"FATAL ERROR in main(): {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        # Try to write error to output path
+        try:
+            os.makedirs(OUTPUT_PATH, exist_ok=True)
+            with open(os.path.join(OUTPUT_PATH, "error.log"), "w") as f:
+                f.write(f"FATAL: {e}\n")
+                traceback.print_exc(file=f)
+        except Exception:
+            pass
+        raise
