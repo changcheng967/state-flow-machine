@@ -72,12 +72,16 @@ else:
         PRETRAIN_MODEL_PATH = _ctx.pretrain_model_path
         OUTPUT_PATH = _ctx.output_path
         HAS_C2NET = True
-        log(f"c2net initialised: code={CODE_PATH}, "
-            f"dataset={DATASET_PATH}, "
-            f"pretrain={PRETRAIN_MODEL_PATH}, "
-            f"output={OUTPUT_PATH}")
+        print(f"c2net initialised: code={CODE_PATH}, "
+              f"dataset={DATASET_PATH}, "
+              f"pretrain={PRETRAIN_MODEL_PATH}, "
+              f"output={OUTPUT_PATH}", flush=True)
     except Exception:
-        log("c2net not available — using default paths")
+        print("c2net not available — using default paths", flush=True)
+
+# Fallback: ensure OUTPUT_PATH is set and valid
+if not OUTPUT_PATH:
+    OUTPUT_PATH = "/cache/output"
 
 # Derive working dirs from discovered paths
 CKPT_DIR = os.path.join(OUTPUT_PATH, "checkpoints")
