@@ -707,13 +707,19 @@ def _find_data_files(base: str) -> list:
 def _try_load_byte_tokenizer(pretrain_path: str):
     """Try to build a vocab mapping from tokenizer.json."""
     tok_path = None
+    # Direct path first
     for cand in [
         os.path.join(pretrain_path, "tokenizer.json"),
-        os.path.join(pretrain_path, "tokenizer.model"),
     ]:
         if os.path.isfile(cand):
             tok_path = cand
             break
+    # Recursive search (tokenizer may be in a subdirectory)
+    if tok_path is None:
+        results = glob.glob(os.path.join(pretrain_path, "**",
+                                          "tokenizer.json"), recursive=True)
+        if results:
+            tok_path = results[0]
     if tok_path is None:
         return None
     try:
@@ -722,7 +728,6 @@ def _try_load_byte_tokenizer(pretrain_path: str):
         vocab = tok_data.get("model", {}).get("vocab", {})
         if not vocab:
             return None
-        # Build token→id mapping
         token_to_id = {}
         for token, idx in vocab.items():
             token_to_id[token] = idx
@@ -774,11 +779,11 @@ def _tokenize_texts(texts: list, token_to_id: dict, seq_len: int) -> np.ndarray:
     else:
         # Byte-level fallback
         log("  Using byte-level tokenizer (no BPE vocab found)")
-        all_ids = np.zeros(0, dtype=np.int64)
+        all_ids = np.zeros(0, dtype=np.int32)
         for text in texts:
             encoded = text.encode("utf-8", errors="replace")
             all_ids = np.concatenate([all_ids, np.frombuffer(encoded,
-                                                             dtype=np.int64)])
+                                                             dtype=np.uint8).astype(np.int32)])
         # Add BOS/EOS sentinel bytes (256 = outside ASCII range)
         all_ids = np.concatenate([
             np.full(2, 256, dtype=np.int64),  # BOS pair
