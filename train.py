@@ -269,7 +269,7 @@ def _hf_to_ms_name(hf_name: str) -> str:
     if hf_name == "embed_tokens.weight":
         return "embedding.embedding_table"
     if hf_name == "norm.weight":
-        return "norm.norm_weight"
+        return "norm.weight"
     if hf_name == "lm_head.weight":
         return None
     if not hf_name.startswith("layers."):
@@ -301,9 +301,9 @@ def _hf_to_ms_name(hf_name: str) -> str:
     if rest == f"{_HF_MLP}.down_proj.weight":
         return f"{ms_layer}.feed_forward.w2.frozen_weight"
     if rest == f"{_HF_NORM1}.weight":
-        return f"{ms_layer}.attention_norm.norm_weight"
+        return f"{ms_layer}.attention_norm.weight"
     if rest == f"{_HF_NORM2}.weight":
-        return f"{ms_layer}.ffn_norm.norm_weight"
+        return f"{ms_layer}.ffn_norm.weight"
     return None
 
 
@@ -366,7 +366,9 @@ def load_pretrained_weights(model, model_dir: str, rank_id: int) -> bool:
     not_found = []
     for name, _ in model.parameters_and_names():
         if name in param_dict:
-            ms_param[name] = param_dict[name]
+            ms_param[name] = ms.Parameter(
+                ms.Tensor(param_dict[name]), name=name
+            )
         else:
             if any(k in name for k in ("lora_", "sfm", "gate")):
                 continue
@@ -376,7 +378,6 @@ def load_pretrained_weights(model, model_dir: str, rank_id: int) -> bool:
         log(f"  WARNING: {len(not_found)} model params not found in HF weights "
             f"(first 5: {not_found[:5]})")
 
-    import mindspore as ms
     ms.load_param_into_net(model, ms_param)
     log(f"  Weights loaded successfully")
     return True
