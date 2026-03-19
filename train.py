@@ -94,7 +94,7 @@ if not OUTPUT_PATH or not os.path.isdir(OUTPUT_PATH):
 CKPT_DIR = os.path.join(OUTPUT_PATH, "checkpoints")
 
 
-VOCAB_SIZE = 151936
+VOCAB_SIZE = 152064
 HIDDEN_SIZE = 3584
 NUM_LAYERS = 32
 NUM_HEADS = 28
@@ -259,7 +259,7 @@ def _hf_to_ms_name(hf_name: str) -> str:
     if hf_name == "norm.weight":
         return "norm.weight"
     if hf_name == "lm_head.weight":
-        return "lm_head_weight"
+        return "lm_head"
     if not hf_name.startswith("layers."):
         return None
     parts = hf_name.split(".")
