@@ -248,12 +248,9 @@ def _fp16_dense(in_ch: int, out_ch: int,
     w = np.random.randn(out_ch, in_ch).astype(np.float16) * (
         1.0 / np.sqrt(in_ch))
     dense = nn.Dense(in_ch, out_ch, has_bias=has_bias)
-    dense.weight = ms.Parameter(Tensor(w), name=dense.weight.name)
+    dense.weight.set_data(Tensor(w))
     if has_bias:
-        dense.bias = ms.Parameter(
-            Tensor(np.zeros(out_ch, dtype=np.float16)),
-            name=dense.bias.name,
-        )
+        dense.bias.set_data(Tensor(np.zeros(out_ch, dtype=np.float16)))
     return dense
 
 
@@ -375,7 +372,6 @@ class SFMSlotBank(nn.Cell):
         self.softmax = ops.Softmax(axis=-1)
         self.sigmoid = ops.Sigmoid()
         self.mean = ops.ReduceMean(keep_dims=True)
-        self.tile = ops.Tile()
 
     def construct(self, hidden: Tensor, slots: Tensor) -> tuple:
         """Process hidden through slot bank.
@@ -411,10 +407,9 @@ class SFMSlotBank(nn.Cell):
         h_cand = ops.tanh(self.W_h(ops.concat([r * slots, slot_out], -1)))
         new_slots = (1.0 - z) * slots + z * h_cand
 
-        # Gated write-back: mean(slot_out) -> residual
+        # Gated write-back: mean(slot_out) -> residual (broadcast (B,1,H))
         slot_mean = self.mean(new_slots, 1)  # (B, 1, SD)
         writeback = self.write_proj(slot_mean)  # (B, 1, H)
-        writeback = self.tile(writeback, (1, 1, S))  # (B, S, H)
         modified = hidden + self.sigmoid(self.gate.astype(hidden.dtype)) * \
             writeback.astype(hidden.dtype)
 
@@ -434,6 +429,7 @@ class Thinker15BModel(nn.Cell):
         self.embedding = nn.Embedding(VOCAB_SIZE, HIDDEN_DIM)
         self.norm = RMSNorm(HIDDEN_DIM)
         self.matmul = ops.MatMul(transpose_b=True)
+        self.tile = ops.Tile()
 
         # Initial slots — learned parameter (broadcast to batch)
         self.initial_slots = ms.Parameter(
@@ -441,13 +437,14 @@ class Thinker15BModel(nn.Cell):
                 np.float16) * 0.02),
             name="initial_slots")
 
-        # 24 transformer layers (unrolled)
-        for i in range(NUM_LAYERS):
-            setattr(self, f"layer{i}", TransformerBlock())
+        # 24 transformer layers
+        self.layers = nn.CellList(
+            [TransformerBlock() for _ in range(NUM_LAYERS)])
 
         # 4 SFM banks at layers 5, 11, 17, 23
-        for idx, layer_idx in enumerate(SFM_LAYERS):
-            setattr(self, f"sfm{idx}", SFMSlotBank())
+        self.sfm_banks = nn.CellList(
+            [SFMSlotBank() for _ in range(len(SFM_LAYERS))])
+        self.sfm_layer_set = set(SFM_LAYERS)
 
     def construct(self, input_ids: Tensor, cos: Tensor, sin: Tensor,
                   mask: Tensor) -> Tensor:
@@ -461,9 +458,9 @@ class Thinker15BModel(nn.Cell):
 
         sfm_idx = 0
         for i in range(NUM_LAYERS):
-            x = getattr(self, f"layer{i}")(x, cos, sin, mask)
-            if i in SFM_LAYERS:
-                x, slots = getattr(self, f"sfm{sfm_idx}")(x, slots)
+            x = self.layers[i](x, cos, sin, mask)
+            if i in self.sfm_layer_set:
+                x, slots = self.sfm_banks[sfm_idx](x, slots)
                 sfm_idx += 1
 
         x = self.norm(x)
@@ -486,9 +483,9 @@ class ForwardLossCell(nn.Cell):
         super().__init__()
         self.model = model
         self.ce_loss = nn.CrossEntropyLoss()
-        self.cos = cos
-        self.sin = sin
-        self.mask = mask
+        self.cos = ms.Parameter(cos, name="cos", requires_grad=False)
+        self.sin = ms.Parameter(sin, name="sin", requires_grad=False)
+        self.mask = ms.Parameter(mask, name="mask", requires_grad=False)
 
     def construct(self, input_ids: Tensor) -> Tensor:
         logits = self.model(input_ids, self.cos, self.sin, self.mask)
@@ -721,7 +718,7 @@ def train_bpe_tokenizer(texts, vocab_size=VOCAB_SIZE, min_count=2):
         ch = b2u[byte_val]
         if ch not in vocab:
             vocab[ch] = len(vocab)
-    special_tokens = ["<pad>", "<eos>", "<unk>"]
+    special_tokens = ["<pad>", "<eos>", "<unk>"] + SPECIAL_TOKENS
     for tok in special_tokens:
         vocab[tok] = len(vocab)
     eos_id = vocab["<eos>"]
@@ -878,7 +875,15 @@ def _tokenize_texts(texts, vocab, merge_priority, eos_id, seq_len):
     return chunks
 
 
-# ── Synthetic data generation ────────────────────────────────────────
+# ── Synthetic data generation (Phi-1 / SemCoder inspired) ────────────
+
+# Special tokens for structured data
+SPECIAL_TOKENS = [
+    "<|code|>", "<|trace|>", "<|answer|>", "<|concept|>",
+    "<|explanation|>", "<|usage|>", "<|buggy_code|>", "<|error|>",
+    "<|reasoning|>", "<|fix|>", "<|documentation|>", "<|task|>",
+    "<|think|>", "<|verify|>",
+]
 
 # Restricted builtins for exec()
 _SAFE_BUILTINS = {
@@ -886,506 +891,1048 @@ _SAFE_BUILTINS = {
     "int": int, "float": float, "str": str, "list": list,
     "dict": dict, "tuple": tuple, "set": set, "bool": bool,
     "sum": sum, "round": round, "sorted": sorted, "reversed": reversed,
-    "enumerate": enumerate, "zip": zip, "map": map, "filter": filter,
+    "enumerate": enumerate, "zip": zip, "map": filter,
     "isinstance": isinstance, "print": lambda *a: None,
     "True": True, "False": False, "None": None,
+    "type": type, "hash": hash, "id": id, "hex": hex, "oct": oct,
+    "bin": bin, "chr": chr, "ord": ord, "pow": pow, "divmod": divmod,
+    "all": all, "any": any, "frozenset": frozenset,
 }
 
 
-def _gen_stage1_variables(n_samples: int) -> list:
-    """Stage 1: Variable assignments and arithmetic."""
-    texts = []
-    var_names = [f"var_{i}" for i in range(20)] + \
-               [f"x{i}" for i in range(10)] + \
-               ["result", "total", "count", "value", "temp", "ans"]
-    ops = ["+", "-", "*", "//", "%"]
+def _exec_with_trace(code_str: str, timeout_s: float = 1.0):
+    """Execute code with sys.settrace to capture line-by-line state.
 
-    for _ in range(n_samples):
-        lines = []
-        n_vars = random.randint(3, 10)
-        used = random.sample(var_names, min(n_vars, len(var_names)))
+    Returns (line_states, final_vars) or None on failure/timeout.
+    line_states: list of (line_no, {var: repr(val)})
+    """
+    import signal as _sig
+
+    namespace = {}
+    line_states = []
+    code_lines = code_str.strip().split("\n")
+
+    def trace_fn(frame, event, arg):
+        if event == "line":
+            fname = frame.f_code.co_filename
+            if fname == "<string>":
+                lineno = frame.f_lineno
+                snapshot = {}
+                for k, v in frame.f_locals.items():
+                    try:
+                        snapshot[k] = repr(v)
+                    except Exception:
+                        snapshot[k] = "<error>"
+                line_states.append((lineno, snapshot))
+        return trace_fn
+
+    def _timeout_handler(signum, frame):
+        raise TimeoutError()
+
+    old_handler = None
+    try:
+        old_handler = _sig.signal(_sig.SIGALRM, _timeout_handler)
+        _sig.alarm(int(timeout_s) + 1)
+        sys.settrace(trace_fn)
+        exec(code_str, {"__builtins__": _SAFE_BUILTINS}, namespace)
+        sys.settrace(None)
+        _sig.alarm(0)
+    except Exception:
+        return None
+    finally:
+        sys.settrace(None)
+        if old_handler is not None:
+            try:
+                _sig.signal(_sig.SIGALRM, old_handler)
+            except Exception:
+                pass
+
+    # Build final answer from last line state
+    final_vars = {}
+    if line_states:
+        final_vars = dict(line_states[-1][1])
+
+    return line_states, final_vars
+
+
+def _gen_random_program(complexity: int) -> str:
+    """Generate a random Python program with given complexity (1-5).
+
+    1: simple assignments + arithmetic
+    2: if/else, simple loops
+    3: nested loops, functions
+    4: recursion, list operations, dict usage
+    5: multi-function programs with list comprehensions
+    """
+    vars_pool = ["x", "y", "z", "n", "i", "j", "k", "a", "b", "c",
+                  "total", "result", "count", "found", "data", "tmp"]
+    lines = []
+
+    if complexity == 1:
+        n_vars = random.randint(2, 5)
+        used = random.sample(vars_pool, n_vars)
         for v in used:
-            val = random.randint(-100, 100)
-            lines.append(f"{v} = {val}")
-        n_expr = random.randint(2, 8)
-        for _ in range(n_expr):
+            lines.append(f"{v} = {random.randint(-50, 50)}")
+        for _ in range(random.randint(1, 4)):
             v1 = random.choice(used)
-            op = random.choice(ops)
-            if op == "//":
-                v2 = random.choice(used)
-                lines.append(f"{v1} = {v1} {op} max(1, abs({v2}))")
-            elif op == "%":
-                v2 = random.choice(used)
-                lines.append(f"{v1} = {v1} {op} max(1, abs({v2}))")
-            else:
-                if random.random() < 0.7:
-                    v2 = random.choice(used)
-                else:
-                    v2 = random.randint(-50, 50)
-                lines.append(f"{v1} = {v1} {op} {v2}")
-        out_var = random.choice(used)
-        lines.append(f"print({out_var})")
-        texts.append("\n".join(lines))
-    return texts
+            op = random.choice(["+", "-", "*"])
+            v2 = random.choice(used) if random.random() < 0.7 else \
+                random.randint(-20, 20)
+            lines.append(f"{v1} = {v1} {op} {v2}")
 
-
-def _gen_stage2_control_flow(n_samples: int) -> list:
-    """Stage 2: Control flow (if/elif/else, for, while)."""
-    texts = []
-    var_names = ["i", "j", "k", "n", "x", "y", "s", "total", "found",
-                 "result", "count", "max_val", "min_val", "data"]
-
-    for _ in range(n_samples):
-        lines = []
-        kind = random.choice(["if", "for", "while", "nested"])
-
+    elif complexity == 2:
+        kind = random.choice(["if", "for", "while"])
         if kind == "if":
-            n = random.randint(5, 15)
+            n = random.randint(1, 30)
             lines.append(f"n = {n}")
-            for _ in range(random.randint(2, 5)):
-                v = random.choice(var_names)
-                val = random.randint(-100, 100)
-                lines.append(f"{v} = {val}")
-            threshold = random.randint(0, 50)
-            lines.append(f"if n > {threshold}:")
+            lines.append(f"if n > {random.randint(10, 20)}:")
             lines.append(f"    result = n * 2")
-            lines.append(f"elif n > {threshold // 2}:")
-            lines.append(f"    result = n + 10")
             lines.append(f"else:")
-            lines.append(f"    result = 0")
-            lines.append(f"print(result)")
-
+            lines.append(f"    result = n + {random.randint(1, 5)}")
         elif kind == "for":
-            n = random.randint(5, 20)
+            n = random.randint(3, 15)
             lines.append(f"total = 0")
             lines.append(f"for i in range({n}):")
             op = random.choice(["+", "*"])
-            val = random.randint(1, 10)
-            if op == "+":
-                lines.append(f"    total = total + {val}")
-            else:
-                lines.append(f"    total = total * {val}")
-            lines.append(f"print(total)")
-
+            val = random.randint(1, 5)
+            lines.append(f"    total = total {op} {val}")
         elif kind == "while":
-            start = random.randint(1, 50)
-            lines.append(f"x = {start}")
-            target = random.randint(100, 500)
-            step = random.randint(2, 10)
+            x0 = random.randint(0, 10)
+            target = random.randint(15, 50)
+            lines.append(f"x = {x0}")
             lines.append(f"while x < {target}:")
-            lines.append(f"    x = x + {step}")
-            lines.append(f"print(x)")
+            lines.append(f"    x = x + {random.randint(1, 5)}")
 
-        elif kind == "nested":
-            n = random.randint(3, 10)
+    elif complexity == 3:
+        kind = random.choice(["nested", "func_simple", "list_ops"])
+        if kind == "nested":
+            n = random.randint(3, 8)
             lines.append(f"result = 0")
             lines.append(f"for i in range({n}):")
-            lines.append(f"    if i % 2 == 0:")
-            lines.append(f"        result = result + i")
-            lines.append(f"    else:")
-            lines.append(f"        result = result - i // 2")
-            lines.append(f"print(result)")
-
-        texts.append("\n".join(lines))
-    return texts
-
-
-def _gen_stage3_functions(n_samples: int) -> list:
-    """Stage 3: Functions with lists and basic algorithms."""
-    texts = []
-
-    for _ in range(n_samples):
-        lines = []
-        kind = random.choice(["sort_search", "math_func", "list_comp",
-                               "fibonacci"])
-
-        if kind == "sort_search":
-            fn = random.choice(["find_max", "find_min", "binary_search",
-                                "bubble_sort"])
-            if fn == "find_max":
-                lines.append("def find_max(arr):")
-                lines.append("    m = arr[0]")
-                lines.append("    for x in arr:")
-                lines.append("        if x > m:")
-                lines.append("            m = x")
-                lines.append("    return m")
-            elif fn == "find_min":
-                lines.append("def find_min(arr):")
-                lines.append("    m = arr[0]")
-                lines.append("    for x in arr:")
-                lines.append("        if x < m:")
-                lines.append("            m = x")
-                lines.append("    return m")
-            elif fn == "bubble_sort":
-                lines.append("def bubble_sort(arr):")
-                lines.append("    n = len(arr)")
-                lines.append("    for i in range(n):")
-                lines.append("        for j in range(n - i - 1):")
-                lines.append("            if arr[j] > arr[j+1]:")
-                lines.append("                arr[j], arr[j+1] = "
-                             "arr[j+1], arr[j]")
-                lines.append("    return arr")
-            elif fn == "binary_search":
-                lines.append("def binary_search(arr, target):")
-                lines.append("    lo, hi = 0, len(arr) - 1")
-                lines.append("    while lo <= hi:")
-                lines.append("        mid = (lo + hi) // 2")
-                lines.append("        if arr[mid] == target:")
-                lines.append("            return mid")
-                lines.append("        elif arr[mid] < target:")
-                lines.append("            lo = mid + 1")
-                lines.append("        else:")
-                lines.append("            hi = mid - 1")
-                lines.append("    return -1")
-            # Test
-            arr = [random.randint(1, 100) for _ in range(random.randint(5, 15))]
+            cond = random.choice(["i % 2 == 0", "i % 3 == 0",
+                                   "i > 0", "True"])
+            op = random.choice(["+", "-"])
+            val = random.randint(1, 5)
+            lines.append(f"    if {cond}:")
+            lines.append(f"        result = result {op} {val}")
+        elif kind == "func_simple":
+            fn = random.choice(["double", "negate", "clamp"])
+            if fn == "double":
+                lines.append("def double(x):")
+                lines.append("    return x * 2")
+            elif fn == "negate":
+                lines.append("def negate(x):")
+                lines.append("    return -x")
+            else:
+                lines.append("def clamp(x, lo=0, hi=100):")
+                lines.append("    if x < lo:")
+                lines.append("        return lo")
+                lines.append("    if x > hi:")
+                lines.append("        return hi")
+                lines.append("    return x")
+            val = random.randint(1, 50)
+            lines.append(f"result = {fn}({val})")
+        elif kind == "list_ops":
+            arr = [random.randint(1, 20) for _ in range(random.randint(3, 8))]
             lines.append(f"data = {arr}")
-            lines.append(f"print({fn}(data))")
+            op = random.choice(["sum", "max", "min", "len", "sorted"])
+            lines.append(f"result = {op}(data)")
 
-        elif kind == "math_func":
-            fn = random.choice(["factorial", "gcd", "is_prime", "power"])
-            if fn == "factorial":
-                lines.append("def factorial(n):")
+    elif complexity == 4:
+        kind = random.choice(["recursive", "dict_ops", "list_build"])
+        if kind == "recursive":
+            fn = random.choice(["fib", "fact", "pow2"])
+            if fn == "fib":
+                lines.append("def fib(n):")
+                lines.append("    if n <= 1:")
+                lines.append("        return n")
+                lines.append("    return fib(n-1) + fib(n-2)")
+                lines.append(f"result = fib({random.randint(4, 10)})")
+            elif fn == "fact":
+                lines.append("def fact(n):")
                 lines.append("    if n <= 1:")
                 lines.append("        return 1")
-                lines.append("    return n * factorial(n - 1)")
-                lines.append(f"print(factorial({random.randint(3, 12)}))")
-            elif fn == "gcd":
-                lines.append("def gcd(a, b):")
-                lines.append("    while b:")
-                lines.append("        a, b = b, a % b")
-                lines.append("    return a")
-                a, b = random.randint(10, 100), random.randint(10, 100)
-                lines.append(f"print(gcd({a}, {b}))")
-            elif fn == "is_prime":
-                lines.append("def is_prime(n):")
-                lines.append("    if n < 2:")
-                lines.append("        return False")
-                lines.append("    for i in range(2, int(n**0.5) + 1):")
-                lines.append("        if n % i == 0:")
-                lines.append("            return False")
-                lines.append("    return True")
-                lines.append(f"print(is_prime({random.randint(2, 100)}))")
-            elif fn == "power":
-                lines.append("def power(base, exp):")
-                lines.append("    result = 1")
-                lines.append("    for _ in range(exp):")
-                lines.append("        result = result * base")
-                lines.append("    return result")
-                b, e = random.randint(2, 10), random.randint(2, 8)
-                lines.append(f"print(power({b}, {e}))")
-
-        elif kind == "list_comp":
-            lines.append(f"data = {[random.randint(1, 50)
-                                       for _ in range(random.randint(5, 15))]}")
-            op = random.choice(["evens", "squares", "filter_gt"])
-            if op == "evens":
-                lines.append("evens = [x for x in data if x % 2 == 0]")
-                lines.append("print(evens)")
-            elif op == "squares":
-                lines.append("squares = [x*x for x in data]")
-                lines.append("print(squares)")
-            elif op == "filter_gt":
-                threshold = random.randint(10, 30)
-                lines.append(f"big = [x for x in data if x > {threshold}]")
-                lines.append("print(big)")
-
-        elif kind == "fibonacci":
-            lines.append("def fibonacci(n):")
-            lines.append("    if n <= 1:")
-            lines.append("        return n")
-            lines.append("    a, b = 0, 1")
-            lines.append("    for _ in range(n - 1):")
-            lines.append("        a, b = b, a + b")
-            lines.append("    return b")
-            lines.append(f"print(fibonacci({random.randint(5, 20)}))")
-
-        texts.append("\n".join(lines))
-    return texts
-
-
-def _gen_stage4_docs(n_samples: int) -> list:
-    """Stage 4: Fictional API documentation with code examples."""
-    texts = []
-    modules = ["datastore", "pipeline", "scheduler", "config", "auth",
-               "cache", "logger", "metrics", "client", "registry"]
-
-    for _ in range(n_samples):
-        lines = []
-        mod = random.choice(modules)
-        cap_mod = mod.capitalize()
-
-        # Module docstring
-        lines.append(f"\"\"\"{cap_mod} module - provides {mod} "
-                     f"functionality.")
-        lines.append(f"\"\"\"")
-        lines.append("")
-
-        # Classes
-        n_classes = random.randint(1, 3)
-        for ci in range(n_classes):
-            cls_choices = ['Manager', 'Handler', 'Client', 'Config',
-                           'Store', 'Builder']
-            cls_name = f"{cap_mod}{random.choice(cls_choices)}"
-            lines.append(f"class {cls_name}:")
-            lines.append(f"    \"\"\"Manages {mod} operations.\"\"\"")
-            lines.append("")
-
-            # __init__
-            params = []
-            for pi in range(random.randint(1, 4)):
-                pname = random.choice(["name", "path", "size", "timeout",
-                                       "retries", "verbose", "debug",
-                                       "buffer_size", "max_items",
-                                       "auto_commit"])
-                ptype = random.choice(["str", "int", "bool", "float"])
-                pdefault = random.choice(["None", "True", "False", "0",
-                                          "100", "''"])
-                params.append(f"{pname}: {ptype} = {pdefault}")
-            lines.append(f"    def __init__(self, {', '.join(params)}):")
-            for p in params:
-                pname = p.split(":")[0].strip()
-                lines.append(f"        self.{pname} = {pname}")
-            lines.append("")
-
-            # Methods
-            n_methods = random.randint(2, 5)
-            for mi in range(n_methods):
-                mname = random.choice(
-                    ["get", "set", "create", "delete", "update", "list",
-                     "find", "validate", "process", "transform", "connect",
-                     "disconnect", "sync", "flush"])
-                ret_type = random.choice(["None", "bool", "str", "int",
-                                          "list", "dict"])
-                lines.append(f"    def {mname}(self, key: str) -> {ret_type}:")
-                lines.append(f"        \"\"\"{mname} a {mod} resource.\"\"\"")
-                # Body
-                if mname in ("get", "find"):
-                    lines.append(f"        return self._data.get(key)")
-                elif mname in ("create", "set"):
-                    lines.append(f"        self._data[key] = value")
-                    lines.append(f"        return True")
-                elif mname in ("delete", "remove"):
-                    lines.append(f"        if key in self._data:")
-                    lines.append(f"            del self._data[key]")
-                    lines.append(f"            return True")
-                    lines.append(f"        return False")
-                elif mname == "list":
-                    lines.append(f"        return list(self._data.keys())")
-                elif mname == "validate":
-                    lines.append(f"        return isinstance(key, str) "
-                                 f"and len(key) > 0")
-                else:
-                    lines.append(f"        pass")
-                lines.append("")
-
-            # Usage example
-            lines.append("# Example usage:")
-            args = []
-            for p in params:
-                pname = p.split(":")[0].strip()
-                if "str" in p:
-                    args.append(f"'{pname}_value'")
-                elif "bool" in p:
-                    args.append("True")
-                elif "int" in p or "float" in p:
-                    args.append(str(random.randint(1, 100)))
-                else:
-                    args.append("None")
-            lines.append(f"mgr = {cls_name}({', '.join(args)})")
-            if n_methods > 0:
-                mname = random.choice(
-                    ["get", "set", "create", "delete", "list", "find"])
-                lines.append(f"result = mgr.{mname}('example_key')")
-                lines.append(f"print(result)")
-            lines.append("")
-
-        texts.append("\n".join(lines))
-    return texts
-
-
-def _gen_stage5_errors(n_samples: int) -> list:
-    """Stage 5: Error handling and edge cases."""
-    texts = []
-
-    for _ in range(n_samples):
-        lines = []
-        kind = random.choice(["try_except", "validation", "edge_case"])
-
-        if kind == "try_except":
-            lines.append("def safe_divide(a, b):")
-            lines.append("    try:")
-            lines.append("        return a / b")
-            lines.append("    except ZeroDivisionError:")
-            lines.append("        return None")
-            lines.append("")
-            lines.append("def safe_index(arr, idx):")
-            lines.append("    try:")
-            lines.append("        return arr[idx]")
-            lines.append("    except (IndexError, TypeError):")
-            lines.append("        return -1")
-            lines.append("")
-            lines.append(f"print(safe_divide({random.randint(1, 100)}, "
-                         f"{random.choice([0, random.randint(1, 10)])}))")
-
-        elif kind == "validation":
-            fn = random.choice(["validate_age", "validate_email",
-                                "validate_score"])
-            if fn == "validate_age":
-                lines.append("def validate_age(age):")
-                lines.append("    if not isinstance(age, (int, float)):")
-                lines.append("        raise ValueError('Age must be a number')")
-                lines.append("    if age < 0 or age > 150:")
-                lines.append("        raise ValueError('Age out of range')")
-                lines.append("    return True")
-            elif fn == "validate_score":
-                lines.append("def validate_score(score):")
-                lines.append("    if not isinstance(score, (int, float)):")
-                lines.append("        return False")
-                lines.append("    return 0 <= score <= 100")
+                lines.append("    return n * fact(n-1)")
+                lines.append(f"result = fact({random.randint(3, 8)})")
             else:
-                lines.append("def validate_positive(n):")
-                lines.append("    return isinstance(n, (int, float)) and n > 0")
-            lines.append("")
-            lines.append(f"print({fn}({random.randint(1, 100)}))")
+                lines.append("def pow2(n):")
+                lines.append("    if n == 0:")
+                lines.append("        return 1")
+                lines.append("    return 2 * pow2(n-1)")
+                lines.append(f"result = pow2({random.randint(2, 8)})")
+        elif kind == "dict_ops":
+            lines.append("d = {}")
+            keys = ["a", "b", "c", "x", "y"]
+            n_pairs = random.randint(2, 4)
+            for k in keys[:n_pairs]:
+                lines.append(f"d['{k}'] = {random.randint(1, 100)}")
+            lines.append(f"result = sum(d.values())")
+        elif kind == "list_build":
+            lines.append(f"result = []")
+            n = random.randint(3, 8)
+            lines.append(f"for i in range({n}):")
+            expr = random.choice(["i*i", "i*2+1", "i if i%2==0 else 0"])
+            lines.append(f"    result.append({expr})")
 
-        elif kind == "edge_case":
-            lines.append("def safe_sum(arr):")
-            lines.append("    if not arr:")
-            lines.append("        return 0")
+    elif complexity == 5:
+        kind = random.choice(["comp", "multi_func", "filter_map"])
+        if kind == "comp":
+            arr = [random.randint(1, 30) for _ in range(random.randint(4, 10))]
+            pred = random.choice(["x % 2 == 0", "x > 10", "x % 3 == 0"])
+            expr = random.choice(["x*x", "x*2", "x+1"])
+            lines.append(f"data = {arr}")
+            lines.append(f"result = [{expr} for x in data if {pred}]")
+        elif kind == "multi_func":
+            lines.append("def square(x):")
+            lines.append("    return x * x")
+            lines.append("")
+            lines.append("def sum_sq(lst):")
             lines.append("    total = 0")
-            lines.append("    for x in arr:")
-            lines.append("        if isinstance(x, (int, float)):")
-            lines.append("            total = total + x")
+            lines.append("    for v in lst:")
+            lines.append("        total = total + square(v)")
             lines.append("    return total")
             lines.append("")
-            cases = random.choice([
-                "[]", "[1, 2, 3]", "[1, 'a', 3, None]",
-                "[-1, -2, -3]", "[0]"
-            ])
-            lines.append(f"print(safe_sum({cases}))")
+            arr = [random.randint(1, 10) for _ in range(random.randint(3, 6))]
+            lines.append(f"result = sum_sq({arr})")
+        elif kind == "filter_map":
+            arr = [random.randint(-10, 30) for _ in range(random.randint(4, 8))]
+            lines.append(f"data = {arr}")
+            lines.append("pos = [x for x in data if x > 0]")
+            lines.append("result = [x*2 for x in pos]")
 
-        texts.append("\n".join(lines))
+    return "\n".join(lines)
+
+
+def _stage1_mental_simulation(n_samples: int, seed: int) -> list:
+    """Stage 1 (30%): Mental simulation — exec code + capture trace.
+
+    Teaches the model to simulate execution step by step, the core
+    skill transformers provably lack.
+    """
+    random.seed(seed)
+    texts = []
+    success = 0
+
+    for _ in range(n_samples * 3):  # Over-generate; many will fail
+        if success >= n_samples:
+            break
+        complexity = random.choices(
+            range(1, 6), weights=[15, 30, 25, 20, 10])[0]
+        code = _gen_random_program(complexity)
+        if not code.strip():
+            continue
+
+        result = _exec_with_trace(code, timeout_s=1.0)
+        if result is None:
+            continue
+
+        line_states, final_vars = result
+        if not line_states:
+            continue
+
+        # Format: <|code|> ... <|trace|> ... <|answer|> ...
+        parts = []
+        parts.append("<|code|>")
+        parts.append(code)
+        parts.append("<|trace|>")
+        for lineno, snapshot in line_states:
+            line_text = code_lines_get(code, lineno)
+            state_str = ", ".join(
+                f"{k}: {v}" for k, v in sorted(snapshot.items()))
+            parts.append(f"Line {lineno}: {line_text} -> state: {{{state_str}}}")
+        parts.append("<|answer|>")
+        # Pick the last assigned variable as answer
+        last_line = code.strip().split("\n")[-1].strip()
+        if "=" in last_line and not last_line.startswith("def ") and \
+                not last_line.startswith("for ") and \
+                not last_line.startswith("while ") and \
+                not last_line.startswith("if "):
+            var = last_line.split("=")[0].strip()
+            if var in final_vars:
+                parts.append(f"Final: {var} = {final_vars[var]}")
+            else:
+                parts.append(f"Final state: {dict(sorted(final_vars.items()))}")
+        else:
+            parts.append(f"Final state: {dict(sorted(final_vars.items()))}")
+
+        texts.append("\n".join(parts))
+        success += 1
+
+    log(f"  Stage 1 (Mental Simulation): {success}/{n_samples*3} succeeded")
     return texts
 
 
-def _gen_stage6_trajectories(n_samples: int) -> list:
-    """Stage 6: Synthetic thinkcode agent trajectories (ReAct-style)."""
+def code_lines_get(code: str, lineno: int) -> str:
+    """Get a line from code by 1-indexed line number."""
+    lines = code.split("\n")
+    if 1 <= lineno <= len(lines):
+        return lines[lineno - 1].strip()
+    return "..."
+
+
+def _stage2_textbook_explanations(n_samples: int, seed: int) -> list:
+    """Stage 2 (25%): Textbook-quality explanations.
+
+    Each sample teaches a concept with explanation + code + usage.
+    Progressive difficulty within each concept.
+    """
+    random.seed(seed)
+
+    concepts = {
+        "Variables": [
+            ("A variable stores a value in memory. You assign with '='.",
+             "x = 42\nprint(x)", "x -> 42"),
+            ("Variables can be reassigned. Python is dynamically typed.",
+             "x = 10\nx = 'hello'\nprint(x)", "x is now the string 'hello'"),
+            ("Multiple assignment swaps values without a temp variable.",
+             "a, b = 3, 7\na, b = b, a\nprint(a, b)", "a=7, b=3"),
+            ("Use descriptive variable names for readability.",
+             "user_age = 25\nmax_connections = 100\nprint(user_age * 2)",
+             "50"),
+        ],
+        "Operators": [
+            ("Arithmetic operators: + - * // % **. Note // is floor division.",
+             "print(17 // 3)\nprint(17 % 3)\nprint(2 ** 10)",
+             "5, 2, 1024"),
+            ("Comparison operators return bool: == != < > <= >=",
+             "x = 15\nprint(x > 10)\nprint(x == 15)\nprint(x != 20)",
+             "True, True, True"),
+            ("Logical operators: and, or, not. Short-circuit evaluation.",
+             "x = 5\nprint(x > 0 and x < 10)\nprint(x < 0 or x > 3)",
+             "True, True"),
+            ("The 'in' operator tests membership in sequences.",
+             "print(3 in [1, 2, 3, 4])\nprint('h' in 'hello')",
+             "True, True"),
+        ],
+        "Control Flow": [
+            ("if/elif/else executes blocks based on conditions.",
+             "score = 85\nif score >= 90:\n    grade = 'A'\nelif score >= 80:\n    grade = 'B'\nelse:\n    grade = 'C'\nprint(grade)", "B"),
+            ("for loops iterate over any iterable (range, list, string).",
+             "total = 0\nfor i in range(1, 6):\n    total += i\nprint(total)",
+             "15 (sum of 1+2+3+4+5)"),
+            ("while loops repeat until a condition is false.",
+             "n = 64\nsteps = 0\nwhile n > 1:\n    n = n // 2\n    steps += 1\nprint(steps)",
+             "6 (64->32->16->8->4->2->1)"),
+            ("break exits a loop early. continue skips to next iteration.",
+             "for i in range(10):\n    if i == 5:\n        break\n    if i % 2 == 0:\n        continue\n    print(i)",
+             "1, 3"),
+            ("Nested loops: inner loop runs fully for each outer iteration.",
+             "for i in range(3):\n    for j in range(3):\n        if i == j:\n            print(i)",
+             "0, 1, 2 (diagonal)"),
+        ],
+        "Functions": [
+            ("A function encapsulates reusable logic with def.",
+             "def greet(name):\n    return f'Hello, {name}!'\nprint(greet('World'))",
+             "Hello, World!"),
+            ("Default parameters make arguments optional.",
+             "def power(base, exp=2):\n    result = 1\n    for _ in range(exp):\n        result *= base\n    return result\nprint(power(3))\nprint(power(2, 10))",
+             "9, 1024"),
+            ("*args collects positional args into a tuple.",
+             "def total(*nums):\n    return sum(nums)\nprint(total(1, 2, 3, 4, 5))",
+             "15"),
+            ("Recursion: a function calls itself with a smaller input.",
+             "def gcd(a, b):\n    if b == 0:\n        return a\n    return gcd(b, a % b)\nprint(gcd(48, 18))",
+             "6"),
+        ],
+        "Data Structures": [
+            ("Lists are ordered mutable sequences. Index from 0.",
+             "fruits = ['apple', 'banana', 'cherry']\nfruits.append('date')\nprint(fruits[1])\nprint(len(fruits))",
+             "banana, 4"),
+            ("List slicing: lst[start:stop:step]. Stop is exclusive.",
+             "nums = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]\nprint(nums[2:7])\nprint(nums[::2])\nprint(nums[::-1])",
+             "[2,3,4,5,6], [0,2,4,6,8], [9,8,7,6,5,4,3,2,1,0]"),
+            ("Dicts store key-value pairs. O(1) lookup by key.",
+             "ages = {'Alice': 30, 'Bob': 25, 'Charlie': 35}\nages['Dave'] = 28\nprint(sorted(ages.items()))",
+             "[('Alice', 30), ('Bob', 25), ('Charlie', 35), ('Dave', 28)]"),
+            ("Sets store unique elements. Support union, intersection, diff.",
+             "a = {1, 2, 3, 4}\nb = {3, 4, 5, 6}\nprint(a & b)\nprint(a | b)\nprint(a - b)",
+             "{3, 4}, {1, 2, 3, 4, 5, 6}, {1, 2}"),
+            ("List comprehensions: concise way to create lists.",
+             "squares = [x*x for x in range(1, 6)]\nevens = [x for x in range(20) if x % 2 == 0]\nprint(squares)\nprint(evens[:5])",
+             "[1, 4, 9, 16, 25], [0, 2, 4, 6, 8]"),
+        ],
+        "Sorting & Searching": [
+            ("Binary search finds a target in a sorted array in O(log n).",
+             "def binary_search(arr, target):\n    lo, hi = 0, len(arr) - 1\n    while lo <= hi:\n        mid = (lo + hi) // 2\n        if arr[mid] == target:\n            return mid\n        elif arr[mid] < target:\n            lo = mid + 1\n        else:\n            hi = mid - 1\n    return -1\nprint(binary_search([1, 3, 5, 7, 9, 11], 7))",
+             "3 (index of 7)"),
+            ("Bubble sort repeatedly swaps adjacent out-of-order elements.",
+             "def bubble_sort(arr):\n    n = len(arr)\n    for i in range(n):\n        for j in range(n - i - 1):\n            if arr[j] > arr[j+1]:\n                arr[j], arr[j+1] = arr[j+1], arr[j]\n    return arr\nprint(bubble_sort([5, 3, 8, 1, 9, 2]))",
+             "[1, 2, 3, 5, 8, 9]"),
+            ("Two-pointer technique: sort then find pairs meeting a condition.",
+             "def two_sum_sorted(arr, target):\n    lo, hi = 0, len(arr) - 1\n    while lo < hi:\n        s = arr[lo] + arr[hi]\n        if s == target:\n            return [lo, hi]\n        elif s < target:\n            lo += 1\n        else:\n            hi -= 1\n    return None\nprint(two_sum_sorted([1, 3, 5, 7, 11], 12))",
+             "[1, 3] (3 + 9 = 12)"),
+        ],
+        "String Operations": [
+            ("Strings are immutable sequences. Use + to concatenate.",
+             "first = 'hello'\nsecond = ' world'\nresult = first + second\nprint(len(result))\nprint(result.upper())",
+             "11, HELLO WORLD"),
+            ("str.split() and str.join() for parsing/formatting.",
+             "line = 'name:Alice,age:30,city:NYC'\nparts = line.split(',')\nresult = '; '.join(parts)\nprint(result)",
+             "name:Alice; age:30; city:NYC"),
+            ("f-strings interpolate variables directly into strings.",
+             "name = 'Alice'\nscore = 95\nresult = f'{name} scored {score}/100'\nprint(result)",
+             "Alice scored 95/100"),
+            ("str.strip(), str.replace(), str.count() for cleaning.",
+             "text = '  hello world  '\nprint(text.strip())\nprint(text.strip().replace('world', 'Python'))",
+             "hello world, hello Python"),
+        ],
+        "Error Handling": [
+            ("try/except catches exceptions so the program doesn't crash.",
+             "def safe_divide(a, b):\n    try:\n        return a / b\n    except ZeroDivisionError:\n        return None\nprint(safe_divide(10, 3))\nprint(safe_divide(10, 0))",
+             "3.333..., None"),
+            ("finally block always runs, even if an exception occurred.",
+             "def process(data):\n    try:\n        result = int(data)\n    except ValueError:\n        result = 0\n    finally:\n        print('done')\n    return result\nprint(process('42'))\nprint(process('abc'))",
+             "done, 42, done, 0"),
+        ],
+        "Recursion": [
+            ("Factorial: n! = n * (n-1)!. Base case: 0! = 1.",
+             "def factorial(n):\n    if n <= 1:\n        return 1\n    return n * factorial(n - 1)\nprint(factorial(5))\nprint(factorial(10))",
+             "120, 3628800"),
+            ("Fibonacci: each number is the sum of the two before it.",
+             "def fib(n):\n    if n <= 1:\n        return n\n    return fib(n-1) + fib(n-2)\nprint(fib(0))\nprint(fib(7))",
+             "0, 13"),
+            ("Tower of Hanoi: move n disks from source to target using aux.",
+             "def hanoi(n, src, dst, aux):\n    if n == 1:\n        return 1\n    return hanoi(n-1, src, aux, dst) + 1 + hanoi(n-1, aux, dst, src)\nprint(hanoi(3))\nprint(hanoi(5))",
+             "7, 31"),
+        ],
+        "OOP Basics": [
+            ("A class defines a blueprint. __init__ sets up instance state.",
+             "class Counter:\n    def __init__(self, start=0):\n        self.value = start\n    def increment(self):\n        self.value += 1\n    def get(self):\n        return self.value\nc = Counter(10)\nc.increment()\nc.increment()\nprint(c.get())",
+             "12"),
+            ("Inheritance: a subclass extends a parent class.",
+             "class Animal:\n    def __init__(self, name):\n        self.name = name\n    def speak(self):\n        return '...'\nclass Dog(Animal):\n    def speak(self):\n        return f'{self.name} says Woof!'\nd = Dog('Rex')\nprint(d.speak())",
+             "Rex says Woof!"),
+        ],
+    }
+
     texts = []
-    tasks = [
-        "sort a list of numbers",
-        "find the maximum value in a list",
-        "calculate the sum of even numbers",
-        "reverse a string",
-        "count occurrences of an element",
-        "check if a number is prime",
-        "find duplicates in a list",
-        "merge two sorted lists",
-        "calculate factorial",
-        "find the median of a list",
+    for concept_name, examples in concepts.items():
+        for explanation, code, expected in examples:
+            parts = []
+            parts.append("<|concept|> " + concept_name)
+            parts.append("<|explanation|> " + explanation)
+            parts.append("<|code|>")
+            parts.append(code)
+            parts.append("<|usage|> " + expected)
+            texts.append("\n".join(parts))
+
+    # Duplicate to reach target
+    while len(texts) < n_samples:
+        extra = list(texts)
+        random.shuffle(extra)
+        texts.extend(extra)
+    random.shuffle(texts)
+    return texts[:n_samples]
+
+
+def _stage3_monologue_debugging(n_samples: int, seed: int) -> list:
+    """Stage 3 (20%): Buggy code + step-by-step reasoning to fix.
+
+    SemCoder-inspired: the model narrates its debugging process.
+    """
+    random.seed(seed)
+
+    bug_templates = [
+        {
+            "buggy": "def sum_evens(lst):\n    total = 0\n    for i in range(len(lst)):\n        if lst[i] % 2 == 0:\n            total += lst[i]\n        return total",
+            "error": "sum_evens([1, 2, 3, 4]) returns 0 instead of 6",
+            "reasoning": "Let me trace: i=0, lst[0]=1, 1%2!=0, skip. "
+                         "Then return total -> returns 0! The return is "
+                         "inside the for loop (wrong indentation). It returns "
+                         "after the first element instead of after all.",
+            "fix": "def sum_evens(lst):\n    total = 0\n    for i in range(len(lst)):\n        if lst[i] % 2 == 0:\n            total += lst[i]\n    return total",
+        },
+        {
+            "buggy": "def find_max(lst):\n    max_val = lst[0]\n    for i in range(1, len(lst) + 1):\n        if lst[i] > max_val:\n            max_val = lst[i]\n    return max_val",
+            "error": "find_max([3, 7, 2, 9]) raises IndexError",
+            "reasoning": "The range goes to len(lst) which is 4. lst[4] "
+                         "is out of bounds. The range should be range(1, "
+                         "len(lst)), not len(lst) + 1. Off-by-one error.",
+            "fix": "def find_max(lst):\n    max_val = lst[0]\n    for i in range(1, len(lst)):\n        if lst[i] > max_val:\n            max_val = lst[i]\n    return max_val",
+        },
+        {
+            "buggy": "def reverse_str(s):\n    result = ''\n    for i in range(len(s)):\n        result = s[i] + result\n    return result\nprint(reverse_str('hello'))",
+            "error": "reverse_str('hello') returns 'olleh' — wait, "
+                     "that's correct actually. Let me check again.",
+            "reasoning": "Actually this IS correct: prepending each char "
+                         "builds the reversed string. The 'bug' here is "
+                         "subtle — the function works but is O(n^2) due "
+                         "to string concatenation in a loop. Better: s[::-1].",
+            "fix": "def reverse_str(s):\n    return s[::-1]",
+        },
+        {
+            "buggy": "def is_palindrome(s):\n    return s == s.reverse()",
+            "error": "is_palindrome('racecar') raises AttributeError",
+            "reasoning": "str.reverse() doesn't exist — that's a list method. "
+                         "Strings are immutable. Should use slicing: "
+                         "s[::-1] or reversed(s).",
+            "fix": "def is_palindrome(s):\n    return s == s[::-1]",
+        },
+        {
+            "buggy": "def count_words(text):\n    words = text.split()\n    for word in words:\n        count = 1\n    return count",
+            "error": "count_words('hello world foo') returns 1 instead of 3",
+            "reasoning": "count is initialized INSIDE the loop, so it resets "
+                         "to 1 on every iteration. Should initialize before "
+                         "the loop and increment, or just use len(words).",
+            "fix": "def count_words(text):\n    return len(text.split())",
+        },
+        {
+            "buggy": "def merge_sorted(a, b):\n    result = []\n    i = j = 0\n    while i < len(a) or j < len(b):\n        if a[i] < b[j]:\n            result.append(a[i])\n            i += 1\n        else:\n            result.append(b[j])\n            j += 1\n    return result",
+            "error": "merge_sorted([1, 3], [2, 4]) raises IndexError",
+            "reasoning": "When i reaches len(a), a[i] is out of bounds. "
+                         "Need to check bounds before comparing. Also need "
+                         "to handle remaining elements when one list is "
+                         "exhausted.",
+            "fix": "def merge_sorted(a, b):\n    result = []\n    i = j = 0\n    while i < len(a) and j < len(b):\n        if a[i] < b[j]:\n            result.append(a[i])\n            i += 1\n        else:\n            result.append(b[j])\n            j += 1\n    result.extend(a[i:])\n    result.extend(b[j:])\n    return result",
+        },
+        {
+            "buggy": "def remove_dupes(lst):\n    seen = set()\n    for x in lst:\n        if x not in seen:\n            seen.append(x)\n    return list(seen)",
+            "error": "remove_dupes([1,2,2,3]) raises AttributeError",
+            "reasoning": "Sets don't have an append() method. Use .add() "
+                         "for sets, or use a list for seen.",
+            "fix": "def remove_dupes(lst):\n    seen = []\n    for x in lst:\n        if x not in seen:\n            seen.append(x)\n    return seen",
+        },
+        {
+            "buggy": "def binary_search(arr, target):\n    lo, hi = 0, len(arr) - 1\n    while lo < hi:\n        mid = (lo + hi) // 2\n        if arr[mid] == target:\n            return mid\n        elif arr[mid] < target:\n            lo = mid + 1\n        else:\n            hi = mid\n    return -1",
+            "error": "binary_search([1, 3, 5], 5) returns -1",
+            "reasoning": "The condition should be 'while lo <= hi', not "
+                         "'while lo < hi'. When lo == hi, the last element "
+                         "might be the target, but the loop exits early.",
+            "fix": "def binary_search(arr, target):\n    lo, hi = 0, len(arr) - 1\n    while lo <= hi:\n        mid = (lo + hi) // 2\n        if arr[mid] == target:\n            return mid\n        elif arr[mid] < target:\n            lo = mid + 1\n        else:\n            hi = mid - 1\n    return -1",
+        },
+        {
+            "buggy": "def flatten(lst):\n    result = []\n    for item in lst:\n        if isinstance(item, list):\n            for sub in item:\n                result.append(sub)\n    return result",
+            "error": "flatten([1, [2, 3], 4]) returns [2, 3] instead of "
+                     "[1, 2, 3, 4]",
+            "reasoning": "Non-list items are never appended! The else "
+                         "branch is missing. Only list items get processed.",
+            "fix": "def flatten(lst):\n    result = []\n    for item in lst:\n        if isinstance(item, list):\n            result.extend(item)\n        else:\n            result.append(item)\n    return result",
+        },
+        {
+            "buggy": "def fibonacci(n):\n    a, b = 0, 1\n    for _ in range(n):\n        a, b = b, a + b\n    return a",
+            "error": "fibonacci(0) returns 1 instead of 0",
+            "reasoning": "The loop runs n times even when n=0. Actually "
+                         "when n=0, range(0) is empty so a=0 is returned "
+                         "— wait, that IS correct. Let me re-check... "
+                         "fib(1) should be 1. After 1 iteration: a=1, b=1. "
+                         "Returns 1. Correct. fib(6) = 8? Let me trace: "
+                         "iter1: a=1,b=1 iter2: a=1,b=2 iter3: a=2,b=3 "
+                         "iter4: a=3,b=5 iter5: a=5,b=8 iter6: a=8,b=13. "
+                         "Returns 8. Correct! The bug report was wrong.",
+            "fix": "def fibonacci(n):\n    a, b = 0, 1\n    for _ in range(n):\n        a, b = b, a + b\n    return a  # No bug — this is correct!",
+        },
     ]
 
-    for _ in range(n_samples):
-        task = random.choice(tasks)
-        lines = []
-        lines.append(f"Task: {task}")
-        lines.append("")
+    texts = []
+    for tmpl in bug_templates:
+        parts = []
+        parts.append("<|buggy_code|>")
+        parts.append(tmpl["buggy"])
+        parts.append("<|error|>")
+        parts.append(tmpl["error"])
+        parts.append("<|reasoning|>")
+        parts.append(tmpl["reasoning"])
+        parts.append("<|fix|>")
+        parts.append(tmpl["fix"])
+        texts.append("\n".join(parts))
 
-        # Thought / Action / Observation cycles
-        n_steps = random.randint(3, 8)
-        for si in range(n_steps):
-            lines.append(f"Thought {si+1}: Let me think about step {si+1} "
-                         f"of {task}.")
-
-            if si == 0:
-                lines.append(f"Action: Understand the input format and "
-                             f"requirements.")
-                lines.append(f"Observation: The task requires processing "
-                             f"the input data step by step.")
-            elif si < n_steps - 1:
-                action = random.choice([
-                    "Break down the problem into smaller sub-problems.",
-                    "Consider edge cases and boundary conditions.",
-                    "Apply the appropriate algorithm.",
-                    "Verify the intermediate result.",
-                    "Handle potential errors gracefully.",
-                ])
-                lines.append(f"Action: {action}")
-                lines.append(f"Observation: Intermediate result looks "
-                             f"correct. Moving to next step.")
-            else:
-                lines.append(f"Action: Combine all results and produce "
-                             f"the final answer.")
-
-            lines.append("")
-
-        lines.append(f"Answer: The solution handles {task} correctly.")
-        lines.append(f"```python")
-        # Generate a simple solution
-        if "sort" in task:
-            lines.append("def solution(arr):")
-            lines.append("    return sorted(arr)")
-        elif "maximum" in task or "max" in task:
-            lines.append("def solution(arr):")
-            lines.append("    return max(arr)")
-        elif "sum" in task and "even" in task:
-            lines.append("def solution(arr):")
-            lines.append("    return sum(x for x in arr if x % 2 == 0)")
-        elif "reverse" in task:
-            lines.append("def solution(s):")
-            lines.append("    return s[::-1]")
-        elif "prime" in task:
-            lines.append("def solution(n):")
-            lines.append("    if n < 2: return False")
-            lines.append("    for i in range(2, int(n**0.5) + 1):")
-            lines.append("        if n % i == 0: return False")
-            lines.append("    return True")
-        elif "factorial" in task:
-            lines.append("def solution(n):")
-            lines.append("    r = 1")
-            lines.append("    for i in range(2, n+1): r *= i")
-            lines.append("    return r")
-        else:
-            lines.append("def solution(data):")
-            lines.append("    return data")
-        lines.append("```")
-        texts.append("\n".join(lines))
-    return texts
+    # Duplicate with variation to reach target
+    while len(texts) < n_samples:
+        extra = []
+        for tmpl in bug_templates:
+            parts = []
+            parts.append("<|buggy_code|>")
+            parts.append(tmpl["buggy"])
+            parts.append("<|error|>")
+            parts.append(tmpl["error"])
+            parts.append("<|reasoning|>")
+            parts.append(tmpl["reasoning"])
+            parts.append("<|fix|>")
+            parts.append(tmpl["fix"])
+            extra.append("\n".join(parts))
+        random.shuffle(extra)
+        texts.extend(extra)
+    random.shuffle(texts)
+    return texts[:n_samples]
 
 
-def generate_synthetic_data(n_total: int = 50000) -> list:
-    """Generate synthetic training data from all stages.
+def _stage4_novel_api(n_samples: int, seed: int) -> list:
+    """Stage 4 (15%): Fictional API documentation + usage task.
+
+    Teaches learning-from-context — reading docs to use novel APIs.
+    """
+    random.seed(seed)
+
+    api_templates = [
+        {
+            "doc": (
+                "class DataPipeline:\n"
+                "    \"\"\"Process data through a sequence of transformations.\"\"\"\n"
+                "    def __init__(self, source: str):\n"
+                "        \"\"\"Initialize pipeline with data source path.\"\"\"\n"
+                "        self.steps = []\n"
+                "        self.source = source\n"
+                "    def add_step(self, fn: callable, name: str = '') -> 'DataPipeline':\n"
+                "        \"\"\"Add a transformation step. Returns self for chaining.\"\"\"\n"
+                "        self.steps.append((name, fn))\n"
+                "        return self\n"
+                "    def run(self, limit: int = -1) -> list:\n"
+                "        \"\"\"Execute pipeline. limit=-1 means process all.\"\"\"\n"
+                "        data = [1, 2, 3, 4, 5]  # simulated from source\n"
+                "        for name, fn in self.steps:\n"
+                "            data = [fn(x) for x in data]\n"
+                "        if limit > 0:\n"
+                "            data = data[:limit]\n"
+                "        return data"
+            ),
+            "task": "Create a DataPipeline from 'data.csv' that squares each "
+                    "value, then keeps only values greater than 5.",
+            "solution": (
+                "pipeline = DataPipeline('data.csv')\n"
+                "pipeline.add_step(lambda x: x * x, 'square')\n"
+                "pipeline.add_step(lambda x: x if x > 5 else None, 'filter')\n"
+                "result = pipeline.run()"
+            ),
+        },
+        {
+            "doc": (
+                "class TimeSeries:\n"
+                "    \"\"\"Analyze a sequence of numerical values over time.\"\"\"\n"
+                "    def __init__(self, values: list):\n"
+                "        self.values = values\n"
+                "    def moving_avg(self, window: int) -> list:\n"
+                "        \"\"\"Compute moving average with given window size.\"\"\"\n"
+                "        result = []\n"
+                "        for i in range(len(self.values) - window + 1):\n"
+                "            chunk = self.values[i:i+window]\n"
+                "            result.append(sum(chunk) / window)\n"
+                "        return result\n"
+                "    def trend(self) -> str:\n"
+                "        \"\"\"Return 'up', 'down', or 'flat' based on slope.\"\"\"\n"
+                "        if len(self.values) < 2:\n"
+                "            return 'flat'\n"
+                "        diff = self.values[-1] - self.values[0]\n"
+                "        if diff > 0:\n"
+                "            return 'up'\n"
+                "        elif diff < 0:\n"
+                "            return 'down'\n"
+                "        return 'flat'"
+            ),
+            "task": "Create a TimeSeries with values [10, 15, 12, 20, 18, 25], "
+                    "compute the 3-period moving average, and determine the trend.",
+            "solution": (
+                "ts = TimeSeries([10, 15, 12, 20, 18, 25])\n"
+                "avg = ts.moving_avg(3)\n"
+                "direction = ts.trend()\n"
+                "print(avg)  # [12.33, 15.67, 16.67, 21.0]\n"
+                "print(direction)  # 'up'"
+            ),
+        },
+        {
+            "doc": (
+                "class RateLimiter:\n"
+                "    \"\"\"Limit how many operations can occur in a time window.\"\"\"\n"
+                "    def __init__(self, max_ops: int, window: int):\n"
+                "        self.max_ops = max_ops\n"
+                "        self.window = window\n"
+                "        self.ops = []\n"
+                "    def allow(self, timestamp: int) -> bool:\n"
+                "        \"\"\"Check if operation is allowed at given timestamp.\"\"\"\n"
+                "        cutoff = timestamp - self.window\n"
+                "        self.ops = [t for t in self.ops if t > cutoff]\n"
+                "        if len(self.ops) < self.max_ops:\n"
+                "            self.ops.append(timestamp)\n"
+                "            return True\n"
+                "        return False"
+            ),
+            "task": "Create a RateLimiter allowing 3 operations per 10-second "
+                    "window. Test it at timestamps 0, 2, 4, 5, 15.",
+            "solution": (
+                "rl = RateLimiter(max_ops=3, window=10)\n"
+                "print(rl.allow(0))   # True (1/3)\n"
+                "print(rl.allow(2))   # True (2/3)\n"
+                "print(rl.allow(4))   # True (3/3)\n"
+                "print(rl.allow(5))   # False (4th op within window)\n"
+                "print(rl.allow(15))  # True (old ops expired)"
+            ),
+        },
+        {
+            "doc": (
+                "class SparseVector:\n"
+                "    \"\"\"Efficiently represent vectors with mostly zero values.\"\"\"\n"
+                "    def __init__(self, dim: int):\n"
+                "        self.dim = dim\n"
+                "        self.data = {}  # {index: value}\n"
+                "    def set(self, idx: int, val: float):\n"
+                "        \"\"\"Set value at index.\"\"\"\n"
+                "        if val != 0:\n"
+                "            self.data[idx] = val\n"
+                "        elif idx in self.data:\n"
+                "            del self.data[idx]\n"
+                "    def dot(self, other: 'SparseVector') -> float:\n"
+                "        \"\"\"Dot product with another sparse vector.\"\"\"\n"
+                "        result = 0.0\n"
+                "        for idx, val in self.data.items():\n"
+                "            if idx in other.data:\n"
+                "                result += val * other.data[idx]\n"
+                "        return result"
+            ),
+            "task": "Create two SparseVectors of dimension 100. Set v1 at "
+                    "indices 0,5,10 with values 1,2,3. Set v2 at indices "
+                    "5,10,15 with values 4,5,6. Compute their dot product.",
+            "solution": (
+                "v1 = SparseVector(100)\n"
+                "v1.set(0, 1)\nv1.set(5, 2)\nv1.set(10, 3)\n"
+                "v2 = SparseVector(100)\n"
+                "v2.set(5, 4)\nv2.set(10, 5)\nv2.set(15, 6)\n"
+                "result = v1.dot(v2)  # 2*4 + 3*5 = 23\n"
+                "print(result)"
+            ),
+        },
+        {
+            "doc": (
+                "class EventBus:\n"
+                "    \"\"\"Pub/sub event system for decoupled communication.\"\"\"\n"
+                "    def __init__(self):\n"
+                "        self.subscribers = {}\n"
+                "    def subscribe(self, event: str, handler: callable):\n"
+                "        \"\"\"Register a handler for an event.\"\"\"\n"
+                "        if event not in self.subscribers:\n"
+                "            self.subscribers[event] = []\n"
+                "        self.subscribers[event].append(handler)\n"
+                "    def emit(self, event: str, data):\n"
+                "        \"\"\"Emit event, calling all subscribers.\"\"\"\n"
+                "        for handler in self.subscribers.get(event, []):\n"
+                "            handler(data)\n"
+                "    def on(self, event: str):\n"
+                "        \"\"\"Decorator to register handler.\"\"\"\n"
+                "        def decorator(fn):\n"
+                "            self.subscribe(event, fn)\n"
+                "            return fn\n"
+                "        return decorator"
+            ),
+            "task": "Create an EventBus, subscribe to 'user_created' event "
+                    "with a handler that prints the username, and emit the "
+                    "event with {'username': 'alice'}.",
+            "solution": (
+                "bus = EventBus()\n"
+                "def on_user_created(data):\n"
+                "    print(f'New user: {data[\"username\"]}')\n"
+                "bus.subscribe('user_created', on_user_created)\n"
+                "bus.emit('user_created', {'username': 'alice'})\n"
+                "# Output: New user: alice"
+            ),
+        },
+    ]
+
+    texts = []
+    for tmpl in api_templates:
+        parts = []
+        parts.append("<|documentation|>")
+        parts.append(tmpl["doc"])
+        parts.append("<|task|>")
+        parts.append(tmpl["task"])
+        parts.append("<|solution|>")
+        parts.append(tmpl["solution"])
+        texts.append("\n".join(parts))
+
+    while len(texts) < n_samples:
+        extra = []
+        for tmpl in api_templates:
+            parts = []
+            parts.append("<|documentation|>")
+            parts.append(tmpl["doc"])
+            parts.append("<|task|>")
+            parts.append(tmpl["task"])
+            parts.append("<|solution|>")
+            parts.append(tmpl["solution"])
+            extra.append("\n".join(parts))
+        random.shuffle(extra)
+        texts.extend(extra)
+    random.shuffle(texts)
+    return texts[:n_samples]
+
+
+def _stage5_agent_trajectories(n_samples: int, seed: int) -> list:
+    """Stage 5 (10%): Multi-step reasoning chains for coding tasks.
+
+    Simulates how an agent thinks through a problem before coding.
+    """
+    random.seed(seed)
+
+    tasks = [
+        {
+            "task": "Write a function that finds the longest common "
+                   "subsequence of two strings.",
+            "think": (
+                "This is a classic dynamic programming problem.\n"
+                "1. Create a 2D table dp of size (m+1) x (n+1)\n"
+                "2. Fill bottom-up: if chars match, dp[i][j] = dp[i-1][j-1] + 1\n"
+                "3. If chars differ, dp[i][j] = max(dp[i-1][j], dp[i][j-1])\n"
+                "4. Backtrack from dp[m][n] to reconstruct the subsequence"
+            ),
+            "code": (
+                "def lcs(s1, s2):\n"
+                "    m, n = len(s1), len(s2)\n"
+                "    dp = [[0] * (n + 1) for _ in range(m + 1)]\n"
+                "    for i in range(1, m + 1):\n"
+                "        for j in range(1, n + 1):\n"
+                "            if s1[i-1] == s2[j-1]:\n"
+                "                dp[i][j] = dp[i-1][j-1] + 1\n"
+                "            else:\n"
+                "                dp[i][j] = max(dp[i-1][j], dp[i][j-1])\n"
+                "    result = []\n"
+                "    i, j = m, n\n"
+                "    while i > 0 and j > 0:\n"
+                "        if s1[i-1] == s2[j-1]:\n"
+                "            result.append(s1[i-1])\n"
+                "            i -= 1\n"
+                "            j -= 1\n"
+                "        elif dp[i-1][j] > dp[i][j-1]:\n"
+                "            i -= 1\n"
+                "        else:\n"
+                "            j -= 1\n"
+                "    return ''.join(reversed(result))"
+            ),
+            "verify": "lcs('ABCBDAB', 'BDCAB') -> 'BCAB'\n"
+                     "lcs('', 'ABC') -> ''\n"
+                     "lcs('ABC', 'ABC') -> 'ABC'",
+        },
+        {
+            "task": "Write a function that validates parentheses in a string.",
+            "think": (
+                "Use a stack-based approach:\n"
+                "1. Iterate through each character\n"
+                "2. Push opening brackets onto stack\n"
+                "3. For closing brackets, pop and check if types match\n"
+                "4. If types don't match or stack empty when we need to pop: invalid\n"
+                "5. At end, string is valid if stack is empty"
+            ),
+            "code": (
+                "def is_valid(s):\n"
+                "    stack = []\n"
+                "    pairs = {')': '(', ']': '[', '}': '{'}\n"
+                "    for ch in s:\n"
+                "        if ch in '({[':\n"
+                "            stack.append(ch)\n"
+                "        elif ch in ')}]':\n"
+                "            if not stack or stack[-1] != pairs[ch]:\n"
+                "                return False\n"
+                "            stack.pop()\n"
+                "    return len(stack) == 0"
+            ),
+            "verify": "is_valid('()') -> True\n"
+                     "is_valid('({[]})') -> True\n"
+                     "is_valid('(]') -> False\n"
+                     "is_valid('') -> True",
+        },
+        {
+            "task": "Implement a min-heap with insert and extract_min.",
+            "think": (
+                "A min-heap is a complete binary tree where parent <= children.\n"
+                "1. Use a list. Children of node i are at 2i+1 and 2i+2.\n"
+                "2. Insert: append, then bubble up (swap with parent while < parent)\n"
+                "3. Extract min: swap root with last, pop last, bubble down\n"
+                "   (swap with smaller child while child < current)"
+            ),
+            "code": (
+                "class MinHeap:\n"
+                "    def __init__(self):\n"
+                "        self.data = []\n"
+                "    def insert(self, val):\n"
+                "        self.data.append(val)\n"
+                "        i = len(self.data) - 1\n"
+                "        while i > 0:\n"
+                "            parent = (i - 1) // 2\n"
+                "            if self.data[i] < self.data[parent]:\n"
+                "                self.data[i], self.data[parent] = self.data[parent], self.data[i]\n"
+                "                i = parent\n"
+                "            else:\n"
+                "                break\n"
+                "    def extract_min(self):\n"
+                "        if not self.data:\n"
+                "            return None\n"
+                "        val = self.data[0]\n"
+                "        self.data[0] = self.data[-1]\n"
+                "        self.data.pop()\n"
+                "        i = 0\n"
+                "        while True:\n"
+                "            left = 2*i + 1\n"
+                "            right = 2*i + 2\n"
+                "            smallest = i\n"
+                "            if left < len(self.data) and self.data[left] < self.data[smallest]:\n"
+                "                smallest = left\n"
+                "            if right < len(self.data) and self.data[right] < self.data[smallest]:\n"
+                "                smallest = right\n"
+                "            if smallest == i:\n"
+                "                break\n"
+                "            self.data[i], self.data[smallest] = self.data[smallest], self.data[i]\n"
+                "            i = smallest\n"
+                "        return val"
+            ),
+            "verify": (
+                "h = MinHeap()\n"
+                "h.insert(5)\nh.insert(3)\nh.insert(8)\nh.insert(1)\n"
+                "print(h.extract_min())  # 1\n"
+                "print(h.extract_min())  # 3\n"
+                "print(h.extract_min())  # 5\n"
+                "print(h.extract_min())  # 8"
+            ),
+        },
+        {
+            "task": "Write a function that counts the number of islands "
+                   "in a 2D grid (DFS).",
+            "think": (
+                "An island is a group of adjacent '1's (4-directional).\n"
+                "1. Iterate every cell in the grid\n"
+                "2. When we find an unvisited '1', it's a new island\n"
+                "3. DFS from that cell to mark all connected '1's as visited\n"
+                "4. Increment island count, continue scanning"
+            ),
+            "code": (
+                "def count_islands(grid):\n"
+                "    if not grid:\n"
+                "        return 0\n"
+                "    rows, cols = len(grid), len(grid[0])\n"
+                "    visited = set()\n"
+                "    count = 0\n"
+                "    def dfs(r, c):\n"
+                "        stack = [(r, c)]\n"
+                "        while stack:\n"
+                "            cr, cc = stack.pop()\n"
+                "            if (cr, cc) in visited:\n"
+                "                continue\n"
+                "            if cr < 0 or cr >= rows or cc < 0 or cc >= cols:\n"
+                "                continue\n"
+                "            if grid[cr][cc] == 0:\n"
+                "                continue\n"
+                "            visited.add((cr, cc))\n"
+                "            stack.extend([(cr-1,cc),(cr+1,cc),(cr,cc-1),(cr,cc+1)])\n"
+                "    for r in range(rows):\n"
+                "        for c in range(cols):\n"
+                "            if grid[r][c] == 1 and (r, c) not in visited:\n"
+                "                dfs(r, c)\n"
+                "                count += 1\n"
+                "    return count"
+            ),
+            "verify": (
+                "count_islands([[1,1,0,0],[1,0,0,1],[0,0,1,1],[0,1,0,0]]) -> 3\n"
+                "count_islands([[1,1,1],[1,1,1]]) -> 1\n"
+                "count_islands([[0,0,0],[0,0,0]]) -> 0"
+            ),
+        },
+        {
+            "task": "Implement an LRU (Least Recently Used) cache.",
+            "think": (
+                "LRU evicts the least recently accessed item when full.\n"
+                "1. Use OrderedDict (or dict + doubly linked list)\n"
+                "2. get(key): move to front (most recent), return value\n"
+                "3. put(key, value): if exists, update and move to front\n"
+                "4. If full, evict from back (least recent) before inserting"
+            ),
+            "code": (
+                "class LRUCache:\n"
+                "    def __init__(self, capacity: int):\n"
+                "        self.capacity = capacity\n"
+                "        self.cache = {}\n"
+                "    def get(self, key):\n"
+                "        if key in self.cache:\n"
+                "            val = self.cache.pop(key)\n"
+                "            self.cache[key] = val\n"
+                "            return val\n"
+                "        return -1\n"
+                "    def put(self, key, value):\n"
+                "        if key in self.cache:\n"
+                "            self.cache.pop(key)\n"
+                "        elif len(self.cache) >= self.capacity:\n"
+                "            self.cache.pop(next(iter(self.cache)))\n"
+                "        self.cache[key] = value"
+            ),
+            "verify": (
+                "cache = LRUCache(2)\n"
+                "cache.put(1, 'a')\ncache.put(2, 'b')\n"
+                "print(cache.get(1))  # 'a', key 1 is now most recent\n"
+                "cache.put(3, 'c')  # evicts key 2 (least recent)\n"
+                "print(cache.get(2))  # -1 (evicted)"
+            ),
+        },
+    ]
+
+    texts = []
+    for tmpl in tasks:
+        parts = []
+        parts.append("<|task|> " + tmpl["task"])
+        parts.append("<|think|>")
+        parts.append(tmpl["think"])
+        parts.append("<|code|>")
+        parts.append(tmpl["code"])
+        parts.append("<|verify|>")
+        parts.append(tmpl["verify"])
+        texts.append("\n".join(parts))
+
+    while len(texts) < n_samples:
+        extra = []
+        for tmpl in tasks:
+            parts = []
+            parts.append("<|task|> " + tmpl["task"])
+            parts.append("<|think|>")
+            parts.append(tmpl["think"])
+            parts.append("<|code|>")
+            parts.append(tmpl["code"])
+            parts.append("<|verify|>")
+            parts.append(tmpl["verify"])
+            extra.append("\n".join(parts))
+        random.shuffle(extra)
+        texts.extend(extra)
+    random.shuffle(texts)
+    return texts[:n_samples]
+
+
+def generate_synthetic_data(n_total: int = 50000, rank_id: int = 0) -> list:
+    """Generate Phi-1/SemCoder-inspired synthetic training data.
 
     Stage distribution:
-      1. Variables + arithmetic: 20%
-      2. Control flow: 20%
-      3. Functions + algorithms: 20%
-      4. API documentation: 20%
-      5. Error handling: 10%
-      6. Agent trajectories: 10%
+      1. Mental Simulation (exec traces): 30%
+      2. Textbook Explanations: 25%
+      3. Monologue Debugging: 20%
+      4. Novel API Learning: 15%
+      5. Agent Trajectories: 10%
     """
-    log(f"Generating {n_total} synthetic texts ...")
+    log(f"Generating {n_total} synthetic texts (rank={rank_id}) ...")
     t0 = time.time()
     all_texts = []
 
-    stage_gens = [
-        (_gen_stage1_variables, 0.20),
-        (_gen_stage2_control_flow, 0.20),
-        (_gen_stage3_functions, 0.20),
-        (_gen_stage4_docs, 0.20),
-        (_gen_stage5_errors, 0.10),
-        (_gen_stage6_trajectories, 0.10),
-    ]
+    n1 = int(n_total * 0.30)
+    n2 = int(n_total * 0.25)
+    n3 = int(n_total * 0.20)
+    n4 = int(n_total * 0.15)
+    n5 = n_total - n1 - n2 - n3 - n4
 
-    for gen_fn, frac in stage_gens:
-        n = int(n_total * frac)
-        log(f"  Stage: {gen_fn.__name__} ({n} samples) ...")
-        texts = gen_fn(n)
-        all_texts.extend(texts)
+    log(f"  Stage 1 (Mental Simulation): {n1} target ...")
+    t1 = _stage1_mental_simulation(n1, seed=42 + rank_id * 1000)
+    all_texts.extend(t1)
+
+    log(f"  Stage 2 (Textbook Explanations): {n2} target ...")
+    t2 = _stage2_textbook_explanations(n2, seed=142 + rank_id * 1000)
+    all_texts.extend(t2)
+
+    log(f"  Stage 3 (Monologue Debugging): {n3} target ...")
+    t3 = _stage3_monologue_debugging(n3, seed=242 + rank_id * 1000)
+    all_texts.extend(t3)
+
+    log(f"  Stage 4 (Novel API Learning): {n4} target ...")
+    t4 = _stage4_novel_api(n4, seed=342 + rank_id * 1000)
+    all_texts.extend(t4)
+
+    log(f"  Stage 5 (Agent Trajectories): {n5} target ...")
+    t5 = _stage5_agent_trajectories(n5, seed=442 + rank_id * 1000)
+    all_texts.extend(t5)
 
     random.shuffle(all_texts)
     log(f"Synthetic generation done in {time.time() - t0:.1f}s — "
-        f"{len(all_texts)} texts")
+        f"{len(all_texts)} texts "
+        f"(s1={len(t1)}, s2={len(t2)}, s3={len(t3)}, "
+        f"s4={len(t4)}, s5={len(t5)})")
     return all_texts
 
 
@@ -1474,7 +2021,9 @@ def load_dataset(dataset_path: str, seq_len: int) -> tuple:
     target_synth = 50000
     if len(texts) < 1000:
         log(f"  Few real texts ({len(texts)}), generating synthetic data...")
-        synth_texts = generate_synthetic_data(target_synth)
+        synth_texts = generate_synthetic_data(
+            target_synth, rank_id=int(
+                os.environ.get("RANK_ID", "0")))
         texts.extend(synth_texts)
         log(f"  Total texts: {len(texts)} "
             f"({len(synth_texts)} synthetic)")
