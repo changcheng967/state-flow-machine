@@ -63,8 +63,9 @@ class RotaryEmbedding(nn.Cell):
         ))
         t = np.arange(max_seq, dtype=np.float32)
         freqs = np.outer(t, inv_freq)
-        cos = np.cos(freqs).astype(np.float16)
-        sin = np.sin(freqs).astype(np.float16)
+        emb = np.concatenate([freqs, freqs], axis=-1)
+        cos = np.cos(emb).astype(np.float16)
+        sin = np.sin(emb).astype(np.float16)
         self.cos_table = Tensor(cos[np.newaxis, np.newaxis, :, :])
         self.sin_table = Tensor(sin[np.newaxis, np.newaxis, :, :])
 

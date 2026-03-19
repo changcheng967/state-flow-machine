@@ -149,9 +149,10 @@ def test_components() -> None:
         np.arange(0, cfg.head_dim, 2, dtype=np.float32) / cfg.head_dim))
     t = np.arange(S, dtype=np.float32)
     freqs = np.outer(t, inv_freq)
-    cos_t = Tensor(np.cos(freqs).astype(np.float16)[np.newaxis, np.newaxis,
+    emb = np.concatenate([freqs, freqs], axis=-1)
+    cos_t = Tensor(np.cos(emb).astype(np.float16)[np.newaxis, np.newaxis,
                                                      :, :])
-    sin_t = Tensor(np.sin(freqs).astype(np.float16)[np.newaxis, np.newaxis,
+    sin_t = Tensor(np.sin(emb).astype(np.float16)[np.newaxis, np.newaxis,
                                                      :, :])
     mask_np = np.triu(np.full((S, S), -1e4, dtype=np.float16), k=1)
     mask_t = Tensor(mask_np.reshape(1, 1, S, S))
@@ -222,9 +223,10 @@ def test_gradient_flow() -> None:
         np.arange(0, cfg.head_dim, 2, dtype=np.float32) / cfg.head_dim))
     t = np.arange(S, dtype=np.float32)
     freqs = np.outer(t, inv_freq)
-    cos_t = Tensor(np.cos(freqs).astype(np.float16)[np.newaxis, np.newaxis,
+    emb = np.concatenate([freqs, freqs], axis=-1)
+    cos_t = Tensor(np.cos(emb).astype(np.float16)[np.newaxis, np.newaxis,
                                                      :, :])
-    sin_t = Tensor(np.sin(freqs).astype(np.float16)[np.newaxis, np.newaxis,
+    sin_t = Tensor(np.sin(emb).astype(np.float16)[np.newaxis, np.newaxis,
                                                      :, :])
     mask_np = np.triu(np.full((S, S), -1e4, dtype=np.float16), k=1)
     mask_t = Tensor(mask_np.reshape(1, 1, S, S))
