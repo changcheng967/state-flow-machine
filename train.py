@@ -24,7 +24,6 @@ import gc
 import glob
 import warnings
 import subprocess
-from pathlib import Path
 
 warnings.filterwarnings("ignore")
 
@@ -528,7 +527,7 @@ class SwiGLUFFN(nn.Cell):
         self.w1 = LoRALinear(HIDDEN_SIZE, INTERMEDIATE_SIZE, has_bias=False)
         self.w3 = LoRALinear(HIDDEN_SIZE, INTERMEDIATE_SIZE, has_bias=False)
         self.w2 = LoRALinear(INTERMEDIATE_SIZE, HIDDEN_SIZE, has_bias=False)
-        self.silu = ops.SiLU()
+        self.silu = nn.SiLU()
         self.mul = ops.Mul()
 
     def construct(self, x: Tensor) -> Tensor:
@@ -550,8 +549,7 @@ class SFMSlotBank(nn.Cell):
         self.q_proj = nn.Dense(hidden_size, hidden_size)
         self.k_proj = nn.Dense(hidden_size, hidden_size)
         self.v_proj = nn.Dense(hidden_size, hidden_size)
-        self.output_proj = nn.Dense(hidden_size, hidden_size,
-                                    weight_init="zeros", bias_init="zeros")
+        self.output_proj = nn.Dense(hidden_size, hidden_size)
         self.gate = ms.Parameter(ms.Tensor([0.0], dtype=ms.float32),
                                   name="sfm_gate")
         self.sqrt_d = Tensor(hidden_size ** -0.5, ms.float16)
@@ -565,14 +563,12 @@ class SFMSlotBank(nn.Cell):
     def construct(self, x: Tensor) -> Tensor:
         B = x.shape[0]
         sl = self.tile(self.slots.reshape(1, self.num_slots, self.H), (B, 1, 1))
-        Q = self.q_proj(sl)
-        K = self.k_proj(x)
-        V = self.v_proj(x)
-        Q = Q.transpose(0, 2, 1, 3)
-        K = K.transpose(0, 2, 1, 3)
-        attn = self.softmax(self.bmm_t(Q, K) * self.sqrt_d)
-        slot_out = self.bmm(attn, V.transpose(0, 2, 1, 3))
-        summary = self.mean(slot_out, 1)
+        Q = self.q_proj(sl)        # (B, num_slots, H)
+        K = self.k_proj(x)         # (B, S, H)
+        V = self.v_proj(x)         # (B, S, H)
+        attn = self.softmax(self.bmm_t(Q, K) * self.sqrt_d)  # (B, num_slots, S)
+        slot_out = self.bmm(attn, V)                        # (B, num_slots, H)
+        summary = self.mean(slot_out, 1)                     # (B, 1, H)
         return x + self.sigmoid(self.gate.astype(x.dtype)) * self.output_proj(summary)
 
 
@@ -642,14 +638,13 @@ class TrainStep(nn.Cell):
         self.grad_op = ops.GradOperation(get_by_list=True, sens_param=True)
         self.sens = Tensor([1.0], ms.float32)
         self.depend = ops.Depend()
-        self.clip_grad = ops.clip_by_global_norm
-        self.max_norm = Tensor(max_grad_norm, ms.float32)
+        self.clip_grad = nn.ClipByGlobalNorm(max_norm=max_grad_norm)
 
     def construct(self, input_ids: Tensor) -> Tensor:
         loss = self.forward_loss(input_ids)
         grads = self.grad_op(self.forward_loss, self.weights)(input_ids, self.sens)
-        clipped, _ = self.clip_grad(grads, self.max_norm)
-        status = self.optimizer(tuple(clipped))
+        clipped, _ = self.clip_grad(grads)
+        status = self.optimizer(clipped)
         return self.depend(loss, status)
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -725,13 +720,32 @@ def _tokenize_texts(texts: list, token_to_id: dict, seq_len: int) -> np.ndarray:
     byte_fallback = (token_to_id is None or len(token_to_id) < 100)
 
     if not byte_fallback:
-        # BPE tokenisation
+        # BPE tokenisation — try whole-word lookup, then character fallback
         all_ids = []
         unk_id = token_to_id.get("<unk>", 0)
         for text in texts:
             ids = [unk_id] * (2)  # BOS-like padding
-            for word in text.split():
-                ids.extend(token_to_id.get(word, unk_id))
+            words = text.split()
+            for word in words:
+                tid = token_to_id.get(word)
+                if tid is not None:
+                    ids.append(tid)
+                else:
+                    # Fallback: character-level greedy match
+                    i = 0
+                    while i < len(word):
+                        matched = False
+                        # Try longest match first
+                        for end in range(min(len(word), i + 20), i, -1):
+                            sub = word[i:end]
+                            if sub in token_to_id:
+                                ids.append(token_to_id[sub])
+                                i = end
+                                matched = True
+                                break
+                        if not matched:
+                            ids.append(unk_id)
+                            i += 1
             ids.append(unk_id)  # EOS-like
             all_ids.extend(ids)
         all_ids = np.array(all_ids, dtype=np.int64)
@@ -800,8 +814,9 @@ def load_dataset(dataset_path: str, seq_len: int,
                     import pyarrow.parquet as pq
                     table = pq.read_table(fp)
                     cols = table.to_pydict()
-                    for i in range(len(cols["text"])):
-                        texts.append(cols["text"][i])
+                    for i in range(table.num_rows):
+                        row = {col: cols[col][i] for col in cols}
+                        texts.append(_extract_text(row))
                     loaded = True
                 except Exception:
                     pass
@@ -809,8 +824,8 @@ def load_dataset(dataset_path: str, seq_len: int,
                     try:
                         import pandas as pd
                         df = pd.read_parquet(fp)
-                        for val in df["text"].values:
-                            texts.append(str(val))
+                        for val in df.itertuples(index=False):
+                            texts.append(_extract_text(val._asdict()))
                     except Exception:
                         pass
                 log(f"    (parquet, {len(texts)} rows extracted)")
@@ -820,7 +835,7 @@ def load_dataset(dataset_path: str, seq_len: int,
                         line = line.strip()
                         if line:
                             texts.append(_extract_text(
-                                json.loads("{\"text\": line}")))
+                                json.loads("{\"text\": " + json.dumps(line) + "}")))
             elif fp.endswith(".txt"):
                 with open(fp, "r", encoding="utf-8") as f:
                     texts.append(f.read())
@@ -1069,12 +1084,10 @@ def main():
 
         # Get next batch
         if use_real_data:
-            # Distribute chunks across ranks
-            rank_start = (step * actual_bs) % data_chunks.shape[0]
-            rank_end = rank_start + actual_bs
-            if rank_end > data_chunks.shape[0]:
-                rank_end = data_chunks.shape[0]
-            batch_np = data_chunks[rank_start:rank_end]
+            # Distribute chunks across ranks with modular indexing
+            indices = [(step * actual_bs + rank_id * actual_bs + j) % data_chunks.shape[0]
+                       for j in range(actual_bs)]
+            batch_np = data_chunks[indices]
         else:
             batch_np = np.random.randint(0, VOCAB_SIZE,
                                          (actual_bs, SEQ_LEN)).astype(np.int32)
