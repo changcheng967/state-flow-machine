@@ -467,7 +467,7 @@ class LoRALinear(nn.Cell):
             name="lora_A",
         )
         self.lora_B = ms.Parameter(
-            ms.Tensor(np.zeros(out_features, rank, dtype=np.float16)),
+            ms.Tensor(np.zeros((out_features, rank), dtype=np.float16)),
             name="lora_B",
         )
         self.matmul = ops.MatMul(transpose_b=True)
