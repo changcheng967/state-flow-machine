@@ -45,6 +45,44 @@ os.environ.update({
 })
 
 # ═══════════════════════════════════════════════════════════════════════════
+# SECTION 1b — c2net path discovery (OpenI platform)
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Check if parent passed paths via env vars (from subprocess launcher)
+_PARENT_PASSED = os.environ.get("SFM_OUTPUT_PATH") is not None
+HAS_C2NET = False
+CODE_PATH = "/home/ma-user/work/code"
+DATASET_PATH = "/home/ma-user/work/dataset"
+PRETRAIN_MODEL_PATH = "/home/ma-user/work/pretrainmodel"
+OUTPUT_PATH = "/home/ma-user/work/output"
+
+if _PARENT_PASSED:
+    # Paths already discovered by parent process
+    OUTPUT_PATH = os.environ["SFM_OUTPUT_PATH"]
+    DATASET_PATH = os.environ["SFM_DATASET_PATH"]
+    PRETRAIN_MODEL_PATH = os.environ["SFM_PRETRAIN_PATH"]
+    CODE_PATH = os.environ.get("SFM_CODE_PATH", CODE_PATH)
+else:
+    # Try c2net
+    try:
+        from c2net.context import prepare, upload_output  # noqa: F401
+        _ctx = prepare()
+        CODE_PATH = _ctx.code_path
+        DATASET_PATH = _ctx.dataset_path
+        PRETRAIN_MODEL_PATH = _ctx.pretrain_model_path
+        OUTPUT_PATH = _ctx.output_path
+        HAS_C2NET = True
+        log(f"c2net initialised: code={CODE_PATH}, "
+            f"dataset={DATASET_PATH}, "
+            f"pretrain={PRETRAIN_MODEL_PATH}, "
+            f"output={OUTPUT_PATH}")
+    except Exception:
+        log("c2net not available — using default paths")
+
+# Derive working dirs from discovered paths
+CKPT_DIR = os.path.join(OUTPUT_PATH, "checkpoints")
+
+# ═══════════════════════════════════════════════════════════════════════════
 # SECTION 2 — Constants (Qwen2.5-Coder-1.5B config.json values)
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -82,10 +120,6 @@ TIME_LIMIT = 7000              # seconds (< 2 h with buffer)
 
 # Infrastructure
 RANK_SIZE = 4
-WORK_DIR = "/home/ma-user/work"
-MODEL_DIR = f"{WORK_DIR}/models/qwen2.5-coder-1.5b"
-CKPT_DIR = f"{WORK_DIR}/checkpoints"
-OUTPUT_DIR = f"{WORK_DIR}/output"
 
 # ═══════════════════════════════════════════════════════════════════════════
 # SECTION 3 — Logging
@@ -105,11 +139,12 @@ def log(msg: str, level: str = "INFO") -> None:
 
 def setup_logging(rank_id: int) -> None:
     global _log_fh
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(OUTPUT_PATH, exist_ok=True)
+    os.makedirs(CKPT_DIR, exist_ok=True)
     if rank_id == 0:
-        path = os.path.join(OUTPUT_DIR, "train.log")
+        path = os.path.join(OUTPUT_PATH, "train.log")
     else:
-        path = os.path.join(OUTPUT_DIR, f"worker_{rank_id}.log")
+        path = os.path.join(OUTPUT_PATH, f"worker_{rank_id}.log")
     _log_fh = open(path, "a")
     log(f"Logging to {path}")
 
@@ -123,7 +158,7 @@ def is_main_process() -> bool:
 
 def launch_distributed() -> None:
     """Parent: fork 4 child processes, wait, collect results."""
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(OUTPUT_PATH, exist_ok=True)
     os.makedirs(CKPT_DIR, exist_ok=True)
     log("Parent: launching 4 worker processes")
     procs = []
@@ -132,7 +167,12 @@ def launch_distributed() -> None:
         env["RANK_ID"] = str(i)
         env["DEVICE_ID"] = str(i)
         env["RANK_SIZE"] = str(RANK_SIZE)
-        log_path = os.path.join(OUTPUT_DIR, f"worker_{i}.log")
+        # Pass discovered paths to children so they skip c2net re-init
+        env["SFM_OUTPUT_PATH"] = OUTPUT_PATH
+        env["SFM_DATASET_PATH"] = DATASET_PATH
+        env["SFM_PRETRAIN_PATH"] = PRETRAIN_MODEL_PATH
+        env["SFM_CODE_PATH"] = CODE_PATH
+        log_path = os.path.join(OUTPUT_PATH, f"worker_{i}.log")
         fh = open(log_path, "w")
         p = subprocess.Popen(
             [sys.executable, __file__, "--worker"],
@@ -146,7 +186,7 @@ def launch_distributed() -> None:
         log(f"Worker (pid={p.pid}) exited with code {p.returncode}")
 
     # Collect results from rank 0
-    results_path = os.path.join(OUTPUT_DIR, "results.json")
+    results_path = os.path.join(OUTPUT_PATH, "results.json")
     if os.path.exists(results_path):
         with open(results_path) as f:
             results = json.load(f)
@@ -155,18 +195,14 @@ def launch_distributed() -> None:
         log("=" * 60)
         for k, v in results.items():
             log(f"  {k}: {v}")
-    else:
-        log("WARNING: results.json not found — training may have failed")
 
-    # Copy to OpenI upload dir
-    import shutil
-    upload_dir = "/home/ma-user/work/output"
-    if os.path.isdir(upload_dir):
-        for fn in os.listdir(OUTPUT_DIR):
-            src = os.path.join(OUTPUT_DIR, fn)
-            dst = os.path.join(upload_dir, fn)
-            shutil.copy2(src, dst)
-        log(f"Copied results to {upload_dir}")
+    # Upload via c2net
+    if HAS_C2NET:
+        try:
+            upload_output()
+            log("upload_output() completed successfully")
+        except Exception as e:
+            log(f"upload_output() failed: {e}")
 
 
 # ── Fork gate ──────────────────────────────────────────────────────────────
@@ -208,7 +244,6 @@ def load_safetensors(filepath: str) -> dict:
 # SECTION 6 — Weight conversion (HF → MindSpore)
 # ═══════════════════════════════════════════════════════════════════════════
 
-# Mapping from HF Qwen2.5 parameter names to our MindSpore model names.
 _HF_ATT = "self_attn"
 _HF_MLP = "mlp"
 _HF_NORM1 = "input_layernorm"
@@ -219,27 +254,18 @@ def _hf_to_ms_name(hf_name: str) -> str:
     prefix = "model."
     if hf_name.startswith(prefix):
         hf_name = hf_name[len(prefix):]
-
-    # Top-level embeddings
     if hf_name == "embed_tokens.weight":
         return "embedding.embedding_table"
     if hf_name == "norm.weight":
         return "norm.weight"
-
-    # lm_head.weight — skip (tied to embedding)
     if hf_name == "lm_head.weight":
         return None
-
-    # Layer params
     if not hf_name.startswith("layers."):
         return None
-
     parts = hf_name.split(".")
     layer_i = parts[1]
     rest = ".".join(parts[2:])
     ms_layer = f"layers.{layer_i}"
-
-    # Attention
     if rest == f"{_HF_ATT}.q_proj.weight":
         return f"{ms_layer}.attention.wq.frozen_weight"
     if rest == f"{_HF_ATT}.q_proj.bias":
@@ -256,21 +282,45 @@ def _hf_to_ms_name(hf_name: str) -> str:
         return f"{ms_layer}.attention.wo.frozen_weight"
     if rest == f"{_HF_ATT}.o_proj.bias":
         return f"{ms_layer}.attention.wo.frozen_bias"
-
-    # MLP
     if rest == f"{_HF_MLP}.gate_proj.weight":
         return f"{ms_layer}.feed_forward.w1.frozen_weight"
     if rest == f"{_HF_MLP}.up_proj.weight":
         return f"{ms_layer}.feed_forward.w3.frozen_weight"
     if rest == f"{_HF_MLP}.down_proj.weight":
         return f"{ms_layer}.feed_forward.w2.frozen_weight"
-
-    # Norms
     if rest == f"{_HF_NORM1}.weight":
         return f"{ms_layer}.attention_norm.weight"
     if rest == f"{_HF_NORM2}.weight":
         return f"{ms_layer}.ffn_norm.weight"
+    return None
 
+
+def find_model_dir(base_path: str) -> str:
+    """Search for .safetensors files under base_path (max depth 3).
+
+    Returns the directory containing the files, or None.
+    """
+    if not os.path.isdir(base_path):
+        return None
+
+    # Check base_path itself
+    if glob.glob(os.path.join(base_path, "*.safetensors")):
+        return base_path
+
+    # Check immediate subdirectories
+    for d in sorted(os.listdir(base_path)):
+        sub = os.path.join(base_path, d)
+        if os.path.isdir(sub) and glob.glob(os.path.join(sub, "*.safetensors")):
+            return sub
+
+    # Recursive search (max depth 2 more)
+    for root, dirs, _files in os.walk(base_path):
+        depth = root[len(base_path):].count(os.sep)
+        if depth > 3:
+            dirs.clear()
+            continue
+        if glob.glob(os.path.join(root, "*.safetensors")):
+            return root
     return None
 
 
@@ -294,21 +344,18 @@ def load_pretrained_weights(model, model_dir: str, rank_id: int) -> bool:
         if ms_name is None:
             skipped += 1
             continue
-        # Cast to FP16 for consistency
         if arr.dtype != np.float16:
             arr = arr.astype(np.float16)
         param_dict[ms_name] = arr
 
     log(f"  Mapped {len(param_dict)} params, skipped {skipped} (tied/unused)")
 
-    # Build load dict matching model parameter names
     ms_param = {}
     not_found = []
     for name, _ in model.parameters_and_names():
         if name in param_dict:
             ms_param[name] = param_dict[name]
         else:
-            # LoRA/SFM params not in HF weights — that's expected
             if any(k in name for k in ("lora_", "sfm", "gate")):
                 continue
             not_found.append(name)
@@ -323,7 +370,7 @@ def load_pretrained_weights(model, model_dir: str, rank_id: int) -> bool:
     return True
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SECTION 7 — Model architecture
+# SECTION 7 — Model architecture  (UNCHANGED)
 # ═══════════════════════════════════════════════════════════════════════════
 
 import numpy as np
@@ -333,7 +380,6 @@ from mindspore.common.initializer import Zero, Normal, One
 from mindspore.common.tensor import Tensor
 from mindspore.ops import functional as F
 
-# ── 7a. RMSNorm ────────────────────────────────────────────────────────────
 
 class RMSNorm(nn.Cell):
     """Root Mean Square Layer Normalisation."""
@@ -356,7 +402,6 @@ class RMSNorm(nn.Cell):
         x_norm = x_float * self.rsqrt(variance + self.eps)
         return self.cast(x_norm, x.dtype) * self.cast(self.weight, x.dtype)
 
-# ── 7b. Rotary Position Embedding ──────────────────────────────────────────
 
 class RotaryEmbedding(nn.Cell):
     """Pre-computed RoPE cos/sin tables.  Applied in GQAAttention."""
@@ -371,12 +416,10 @@ class RotaryEmbedding(nn.Cell):
         emb = np.concatenate([freqs, freqs], axis=-1)
         cos = np.cos(emb).astype(np.float16)
         sin = np.sin(emb).astype(np.float16)
-        # (1, 1, max_seq, head_dim)
         self.cos_table = Tensor(cos[np.newaxis, np.newaxis, :, :])
         self.sin_table = Tensor(sin[np.newaxis, np.newaxis, :, :])
 
     def construct(self, x: Tensor) -> Tensor:
-        """x: (B, num_heads, S, head_dim) -> same shape, RoPE applied."""
         cos = self.cos_table
         sin = self.sin_table
         half = x.shape[-1] // 2
@@ -385,7 +428,6 @@ class RotaryEmbedding(nn.Cell):
         rotated = ops.concat([-x2, x1], axis=-1)
         return x * cos + rotated * sin
 
-# ── 7c. LoRALinear ────────────────────────────────────────────────────────
 
 class LoRALinear(nn.Cell):
     """Linear layer with frozen base weight and trainable LoRA."""
@@ -398,8 +440,6 @@ class LoRALinear(nn.Cell):
         self.out_features = out_features
         self.has_bias = has_bias
         self.scaling = Tensor(alpha / rank, ms.float16)
-
-        # Frozen base (nn.Dense convention: weight is (out, in))
         self.frozen_weight = ms.Parameter(
             ms.Tensor(np.random.randn(out_features, in_features).astype(
                 np.float16) * 0.02),
@@ -411,8 +451,6 @@ class LoRALinear(nn.Cell):
                 ms.Tensor(np.zeros(out_features, dtype=np.float16)),
                 name="frozen_bias", requires_grad=False,
             )
-
-        # Trainable LoRA
         self.lora_A = ms.Parameter(
             ms.Tensor(np.random.randn(rank, in_features).astype(np.float16)
                       * (1.0 / math.sqrt(in_features))),
@@ -425,20 +463,15 @@ class LoRALinear(nn.Cell):
         self.matmul = ops.MatMul(transpose_b=True)
 
     def construct(self, x: Tensor) -> Tensor:
-        # x: (B, S, in_features) -> (B, S, out_features)
         shape = x.shape
         x2 = x.reshape((-1, self.in_features))
-
-        base_out = self.matmul(x2, self.frozen_weight)       # (N, out)
+        base_out = self.matmul(x2, self.frozen_weight)
         if self.has_bias:
             base_out = base_out + self.frozen_bias
-
-        hidden = self.matmul(x2, self.lora_A)                # (N, rank)
-        lora_out = self.matmul(hidden, self.lora_B) * self.scaling  # (N, out)
-
+        hidden = self.matmul(x2, self.lora_A)
+        lora_out = self.matmul(hidden, self.lora_B) * self.scaling
         return (base_out + lora_out).reshape(shape[:-1] + (self.out_features,))
 
-# ── 7d. Grouped-Query Attention ────────────────────────────────────────────
 
 class GQAAttention(nn.Cell):
     """Multi-head attention with GQA (12 query heads, 2 KV heads)."""
@@ -449,17 +482,13 @@ class GQAAttention(nn.Cell):
         self.wk = LoRALinear(HIDDEN_SIZE, NUM_KV_HEADS * HEAD_DIM, has_bias=True)
         self.wv = LoRALinear(HIDDEN_SIZE, NUM_KV_HEADS * HEAD_DIM, has_bias=True)
         self.wo = LoRALinear(NUM_HEADS * HEAD_DIM, HIDDEN_SIZE, has_bias=True)
-
         self.rope = RotaryEmbedding(HEAD_DIM, MAX_SEQ_LEN)
         self.tile = ops.Tile()
         self.reshape = ops.Reshape()
-
         self.bmm_t = ops.BatchMatMul(transpose_b=True)
         self.bmm = ops.BatchMatMul()
         self.softmax = ops.Softmax(axis=-1)
         self.scale = Tensor(HEAD_DIM ** -0.5, ms.float16)
-
-        # Pre-computed causal mask  (1, 1, S, S)
         mask_np = np.triu(
             np.full((MAX_SEQ_LEN, MAX_SEQ_LEN), -1e4, dtype=np.float16), k=1
         )
@@ -468,40 +497,33 @@ class GQAAttention(nn.Cell):
     def construct(self, x: Tensor) -> Tensor:
         B = x.shape[0]
         S = x.shape[1]
-
         q = self.wq(x).reshape(B, S, NUM_HEADS, HEAD_DIM).transpose(0, 2, 1, 3)
         k = self.wk(x).reshape(B, S, NUM_KV_HEADS, HEAD_DIM).transpose(0, 2, 1, 3)
         v = self.wv(x).reshape(B, S, NUM_KV_HEADS, HEAD_DIM).transpose(0, 2, 1, 3)
-
-        # GQA: repeat K, V from 2 heads -> 12 heads
         k = self.tile(k, (1, NUM_GROUPS, 1, 1))
         v = self.tile(v, (1, NUM_GROUPS, 1, 1))
-
         q = self.rope(q)
         k = self.rope(k)
-
-        scores = self.bmm_t(q, k) * self.scale          # (B, 12, S, S)
+        scores = self.bmm_t(q, k) * self.scale
         scores = scores + self.causal_mask[:, :, :S, :S]
         attn = self.softmax(scores)
-        out = self.bmm(attn, v)                           # (B, 12, S, 128)
+        out = self.bmm(attn, v)
         out = out.transpose(0, 2, 1, 3).reshape(B, S, NUM_HEADS * HEAD_DIM)
         return self.wo(out)
 
-# ── 7e. SwiGLU FFN ─────────────────────────────────────────────────────────
 
 class SwiGLUFFN(nn.Cell):
     def __init__(self):
         super().__init__()
-        self.w1 = LoRALinear(HIDDEN_SIZE, INTERMEDIATE_SIZE, has_bias=False)  # gate
-        self.w3 = LoRALinear(HIDDEN_SIZE, INTERMEDIATE_SIZE, has_bias=False)  # up
-        self.w2 = LoRALinear(INTERMEDIATE_SIZE, HIDDEN_SIZE, has_bias=False)  # down
+        self.w1 = LoRALinear(HIDDEN_SIZE, INTERMEDIATE_SIZE, has_bias=False)
+        self.w3 = LoRALinear(HIDDEN_SIZE, INTERMEDIATE_SIZE, has_bias=False)
+        self.w2 = LoRALinear(INTERMEDIATE_SIZE, HIDDEN_SIZE, has_bias=False)
         self.silu = ops.SiLU()
         self.mul = ops.Mul()
 
     def construct(self, x: Tensor) -> Tensor:
         return self.w2(self.silu(self.w1(x)) * self.w3(x))
 
-# ── 7f. SFM Slot Bank ─────────────────────────────────────────────────────
 
 class SFMSlotBank(nn.Cell):
     """State-Flow Machine slot bank with cross-attention + gated summary."""
@@ -510,7 +532,6 @@ class SFMSlotBank(nn.Cell):
         super().__init__()
         self.num_slots = num_slots
         self.H = hidden_size
-
         self.slots = ms.Parameter(
             ms.Tensor(np.random.randn(num_slots, hidden_size).astype(
                 np.float16) * 0.02),
@@ -523,7 +544,6 @@ class SFMSlotBank(nn.Cell):
                                     weight_init="zeros", bias_init="zeros")
         self.gate = ms.Parameter(ms.Tensor([0.0], dtype=ms.float32),
                                   name="sfm_gate")
-
         self.sqrt_d = Tensor(hidden_size ** -0.5, ms.float16)
         self.bmm_t = ops.BatchMatMul(transpose_b=True)
         self.bmm = ops.BatchMatMul()
@@ -533,24 +553,18 @@ class SFMSlotBank(nn.Cell):
         self.tile = ops.Tile()
 
     def construct(self, x: Tensor) -> Tensor:
-        """x: (B, S, H) -> (B, S, H)"""
         B = x.shape[0]
-        # Expand slots to (B, K, H)
         sl = self.tile(self.slots.reshape(1, self.num_slots, self.H), (B, 1, 1))
-        Q = self.q_proj(sl)                # (B, K, H)
-        K = self.k_proj(x)                 # (B, S, H)
-        V = self.v_proj(x)                 # (B, S, H)
-
-        Q = Q.transpose(0, 2, 1, 3)       # (B, H, K, 1) — reshape for bmm
-        K = K.transpose(0, 2, 1, 3)       # (B, H, S, 1)
-        # Use 2-D approach: (B*K, H) @ (B*K, H).T not feasible for BatchMatMul
-        # Work in 3-D: (B, K, H) @ (B, H, S) -> (B, K, S)
-        attn = self.softmax(self.bmm_t(Q, K) * self.sqrt_d)   # (B, K, S)
-        slot_out = self.bmm(attn, V.transpose(0, 2, 1, 3))    # (B, K, H)
-        summary = self.mean(slot_out, 1)                        # (B, 1, H)
+        Q = self.q_proj(sl)
+        K = self.k_proj(x)
+        V = self.v_proj(x)
+        Q = Q.transpose(0, 2, 1, 3)
+        K = K.transpose(0, 2, 1, 3)
+        attn = self.softmax(self.bmm_t(Q, K) * self.sqrt_d)
+        slot_out = self.bmm(attn, V.transpose(0, 2, 1, 3))
+        summary = self.mean(slot_out, 1)
         return x + self.sigmoid(self.gate.astype(x.dtype)) * self.output_proj(summary)
 
-# ── 7g. Transformer Block ──────────────────────────────────────────────────
 
 class TransformerBlock(nn.Cell):
     def __init__(self, layer_id: int):
@@ -571,7 +585,6 @@ class TransformerBlock(nn.Cell):
             h = self.sfm_bank(h)
         return h
 
-# ── 7h. Thinker-1 Model ────────────────────────────────────────────────────
 
 class Thinker1Model(nn.Cell):
     """Qwen2.5-Coder-1.5B backbone with LoRA + SFM adapters."""
@@ -583,20 +596,17 @@ class Thinker1Model(nn.Cell):
             TransformerBlock(i) for i in range(NUM_LAYERS)
         ])
         self.norm = RMSNorm(HIDDEN_SIZE)
-        # Weight-tied lm_head — use embedding table directly
         self.matmul = ops.MatMul(transpose_b=True)
 
     def construct(self, input_ids: Tensor) -> Tensor:
-        h = self.embedding(input_ids)                        # (B, S, H)
+        h = self.embedding(input_ids)
         for layer in self.layers:
             h = layer(h)
         h = self.norm(h)
-        # Weight-tied lm_head: h @ embedding_table.T
         h2 = h.reshape((-1, HIDDEN_SIZE))
         logits = self.matmul(h2, self.embedding.embedding_table)
         return logits.reshape(h.shape[0], h.shape[1], VOCAB_SIZE)
 
-# ── 7i. Forward + Loss cell ──────────────────────────────────────────────
 
 class ForwardLossCell(nn.Cell):
     def __init__(self, model: Thinker1Model):
@@ -605,13 +615,12 @@ class ForwardLossCell(nn.Cell):
         self.loss_fn = nn.CrossEntropyLoss()
 
     def construct(self, input_ids: Tensor) -> Tensor:
-        logits = self.model(input_ids)                       # (B, S, V)
-        logits_t = logits[:, :-1, :]                         # (B, S-1, V)
-        labels = input_ids[:, 1:].reshape((-1,))              # (B*(S-1),)
+        logits = self.model(input_ids)
+        logits_t = logits[:, :-1, :]
+        labels = input_ids[:, 1:].reshape((-1,))
         loss = self.loss_fn(logits_t.reshape((-1, VOCAB_SIZE)), labels)
         return loss
 
-# ── 7j. Train step (grad + clip + optimiser) ───────────────────────────────
 
 class TrainStep(nn.Cell):
     def __init__(self, forward_loss: ForwardLossCell, optimizer,
@@ -634,9 +643,199 @@ class TrainStep(nn.Cell):
         return self.depend(loss, status)
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SECTION 8 — Data
+# SECTION 8 — Dataset loading (OpenThoughts-114k or synthetic fallback)
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _extract_text(row: dict) -> str:
+    """Extract text content from a dataset row (various schema formats)."""
+    # Chat / conversations format
+    for key in ("messages", "conversations"):
+        if key in row:
+            parts = row[key]
+            if isinstance(parts, list):
+                return "\n".join(
+                    m.get("content", m.get("text", "")) for m in parts
+                    if isinstance(m, dict)
+                )
+    # Field-based formats
+    for pair in [("output", "input"), ("response", "instruction"),
+                  ("solution", "problem"), ("answer", "question"),
+                  ("content", "text")]:
+        a, b = pair
+        if a in row and b in row:
+            return str(row[b]) + "\n" + str(row[a])
+        if a in row:
+            return str(row[a])
+    return str(row)
+
+
+def _find_data_files(base: str) -> list:
+    """Recursively find readable data files under base."""
+    found = []
+    for ext in ("*.jsonl", "*.json", "*.parquet", "*.csv", "*.txt", "*.arrow"):
+        found.extend(glob.glob(os.path.join(base, "**", ext), recursive=True))
+    return sorted(found)
+
+
+def _try_load_byte_tokenizer(pretrain_path: str) -> dict | None:
+    """Try to build a vocab mapping from tokenizer.json."""
+    tok_path = None
+    for cand in [
+        os.path.join(pretrain_path, "tokenizer.json"),
+        os.path.join(pretrain_path, "tokenizer.model"),
+    ]:
+        if os.path.isfile(cand):
+            tok_path = cand
+            break
+    if tok_path is None:
+        return None
+    try:
+        with open(tok_path) as f:
+            tok_data = json.load(f)
+        vocab = tok_data.get("model", {}).get("vocab", {})
+        if not vocab:
+            return None
+        # Build token→id mapping
+        token_to_id = {}
+        for token, idx in vocab.items():
+            token_to_id[token] = idx
+        log(f"  Loaded BPE tokenizer: {len(token_to_id)} tokens from "
+            f"{tok_path}")
+        return token_to_id
+    except Exception as e:
+        log(f"  Failed to parse tokenizer.json: {e}")
+        return None
+
+
+def _tokenize_texts(texts: list, token_to_id: dict, seq_len: int) -> np.ndarray:
+    """Convert text strings to token-id chunks of fixed seq_len using BPE vocab.
+    Falls back to byte-level encoding if vocab is unavailable.
+    Returns (num_chunks, seq_len) int32 array.
+    """
+    byte_fallback = (token_to_id is None or len(token_to_id) < 100)
+
+    if not byte_fallback:
+        # BPE tokenisation
+        all_ids = []
+        unk_id = token_to_id.get("<unk>", 0)
+        for text in texts:
+            ids = [unk_id] * (2)  # BOS-like padding
+            for word in text.split():
+                ids.extend(token_to_id.get(word, unk_id))
+            ids.append(unk_id)  # EOS-like
+            all_ids.extend(ids)
+        all_ids = np.array(all_ids, dtype=np.int64)
+    else:
+        # Byte-level fallback
+        log("  Using byte-level tokenizer (no BPE vocab found)")
+        all_ids = np.zeros(0, dtype=np.int64)
+        for text in texts:
+            encoded = text.encode("utf-8", errors="replace")
+            all_ids = np.concatenate([all_ids, np.frombuffer(encoded,
+                                                             dtype=np.int64)])
+        # Add BOS/EOS sentinel bytes (256 = outside ASCII range)
+        all_ids = np.concatenate([
+            np.full(2, 256, dtype=np.int64),  # BOS pair
+            all_ids,
+            np.full(1, 256, dtype=np.int64),  # EOS
+        ])
+
+    total = len(all_ids)
+    # Trim to exact multiple of seq_len
+    usable = (total // seq_len) * seq_len
+    if usable < seq_len:
+        log("  WARNING: dataset too small for even one chunk, using random fallback")
+        return None
+    trimmed = all_ids[:usable]
+    chunks = trimmed.reshape(-1, seq_len)
+    log(f"  {len(chunks)} chunks of {seq_len} tokens from "
+        f"{total:,} tokens "
+        f"(byte_fallback={byte_fallback})")
+    return chunks.astype(np.int32)
+
+
+def load_dataset(dataset_path: str, seq_len: int,
+               pretrain_path: str) -> np.ndarray | None:
+    """Load and tokenise the OpenThoughts-114k dataset.
+
+    Returns (num_chunks, seq_len) int32 array, or None on failure.
+    """
+    files = _find_data_files(dataset_path)
+    log(f"  Found {len(files)} data file(s) in {dataset_path}")
+    if not files:
+        return None
+
+    # Read all rows
+    texts = []
+    for fp in files:
+        log(f"  Reading {os.path.basename(fp)} …")
+        try:
+            if fp.endswith(".jsonl"):
+                with open(fp, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            texts.append(_extract_text(json.loads(line)))
+            elif fp.endswith(".json"):
+                with open(fp, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, list):
+                        for row in data:
+                            texts.append(_extract_text(row))
+                    elif isinstance(data, dict):
+                        texts.append(_extract_text(data))
+            elif fp.endswith(".parquet"):
+                loaded = False
+                try:
+                    import pyarrow.parquet as pq
+                    table = pq.read_table(fp)
+                    cols = table.to_pydict()
+                    for i in range(len(cols["text"])):
+                        texts.append(cols["text"][i])
+                    loaded = True
+                except Exception:
+                    pass
+                if not loaded:
+                    try:
+                        import pandas as pd
+                        df = pd.read_parquet(fp)
+                        for val in df["text"].values:
+                            texts.append(str(val))
+                    except Exception:
+                        pass
+                log(f"    (parquet, {len(texts)} rows extracted)")
+            elif fp.endswith(".csv"):
+                with open(fp, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            texts.append(_extract_text(
+                                json.loads("{\"text\": line}")))
+            elif fp.endswith(".txt"):
+                with open(fp, "r", encoding="utf-8") as f:
+                    texts.append(f.read())
+            else:
+                log(f"    Skipping unknown format: {os.path.basename(fp)}")
+        except Exception as e:
+            log(f"    Error reading {fp}: {e}")
+
+    if not texts:
+        log("  WARNING: no text content extracted from any data file")
+        return None
+
+    log(f"  Extracted {len(texts)} text samples")
+
+    # Deduplicate and filter empty
+    texts = list(set(t for t in texts if len(t.strip()) > 10))
+    log(f"  After dedup: {len(texts)} unique samples")
+
+    # Try BPE tokenizer
+    token_to_id = _try_load_byte_tokenizer(pretrain_path)
+
+    return _tokenize_texts(texts, token_to_id, seq_len)
+
+
+# Synthetic fallback dataset
 class RandomTokenDataset:
     """Synthetic random-token dataset for throughput measurement."""
 
@@ -649,19 +848,6 @@ class RandomTokenDataset:
 
     def __getitem__(self, idx):
         return np.random.randint(0, VOCAB_SIZE, (self.seq_len,)).astype(np.int32)
-
-
-def create_dataset(batch_size: int, rank_id: int, rank_size: int,
-                  num_steps: int) -> ms.dataset.Dataset:
-    total = num_steps * batch_size
-    ds = ms.dataset.GeneratorDataset(
-        RandomTokenDataset(total),
-        column_names=["input_ids"],
-        num_shards=rank_size,
-        shard_id=rank_id,
-    )
-    ds = ds.batch(batch_size, drop_remainder=True)
-    return ds
 
 # ═══════════════════════════════════════════════════════════════════════════
 # SECTION 9 — Main training loop
@@ -688,21 +874,41 @@ def main():
         f"world_size={rank_size}")
     log(f"Python {sys.version}")
     log(f"CWD: {os.getcwd()}")
-    log("=" * 60)
+    log("")
+
+    # ── Print discovered paths ──────────────────────────────────────────────
+    log(f"CODE_PATH:     {CODE_PATH}")
+    log(f"DATASET_PATH:  {DATASET_PATH}")
+    log(f"PRETRAIN_PATH: {PRETRAIN_MODEL_PATH}")
+    log(f"OUTPUT_PATH:   {OUTPUT_PATH}")
+    log("")
+
+    # List dataset directory contents
+    if os.path.isdir(DATASET_PATH):
+        entries = sorted(os.listdir(DATASET_PATH))[:20]
+        log(f"DATASET dir contents: {entries}")
+    else:
+        log("DATASET_PATH does not exist")
+
+    # Find pretrained model
+    model_dir = find_model_dir(PRETRAIN_MODEL_PATH)
+    if model_dir:
+        log(f"Model weights found at: {model_dir}")
+    else:
+        log(f"WARNING: no .safetensors found under {PRETRAIN_MODEL_PATH}")
 
     # ── MindSpore context ────────────────────────────────────────────────
     ms.set_context(
         mode=ms.GRAPH_MODE,
         device_target="Ascend",
         device_id=device_id,
-        memory_optimize_level="O1",     # SOMAS — aggressive tensor reuse
+        memory_optimize_level="O1",
     )
 
     # ── Data-parallel init (best-effort, fallback to single) ───────────
     use_dp = rank_size > 1
     if use_dp:
         try:
-            # Small stagger so all ranks start before HCCL handshake
             time.sleep(rank_id * 0.5)
             ms.communication.init()
             ms.set_auto_parallel_context(
@@ -721,7 +927,6 @@ def main():
     log("Building Thinker-1 model …")
     model = Thinker1Model()
 
-    # Recompute on every transformer layer (gradient checkpointing)
     for i, layer in enumerate(model.layers):
         layer.recompute()
 
@@ -733,24 +938,21 @@ def main():
     for p in model.get_parameters():
         p.requires_grad = False
     for p in model.trainable_params():
-        p.requires_grad = True  # LoRA lora_A/lora_B, SFM Dense params
+        p.requires_grad = True
     trainable_p2 = sum(p.size for p in model.trainable_params())
     log(f"Trainable after freeze: {trainable_p2:,}")
 
-    # ── Load pretrained weights (rank 0 loads, others wait) ─────────────
-    if os.path.isdir(MODEL_DIR):
+    # ── Load pretrained weights ────────────────────────────────────────────────
+    if model_dir:
         if rank_id == 0:
-            success = load_pretrained_weights(model, MODEL_DIR, rank_id)
+            success = load_pretrained_weights(model, model_dir, rank_id)
             if success:
-                # Save converted ckpt so other ranks can load it
                 ckpt_path = os.path.join(CKPT_DIR, "hf_converted.ckpt")
                 ms.save_checkpoint(model, ckpt_path)
                 log(f"Saved converted ckpt to {ckpt_path}")
-                # Signal file for other ranks
                 signal = os.path.join(CKPT_DIR, ".ready")
                 open(signal, "w").close()
         else:
-            # Wait for rank 0 to finish conversion
             ckpt_path = os.path.join(CKPT_DIR, "hf_converted.ckpt")
             signal = os.path.join(CKPT_DIR, ".ready")
             waited = 0
@@ -764,15 +966,33 @@ def main():
                 log("WARNING: timed out waiting for weight conversion — "
                     "using random init")
     else:
-        log(f"WARNING: {MODEL_DIR} not found — using random init")
+        log("WARNING: no pretrained weights found — using random init")
 
-    # ── Optimiser + LR schedule ──────────────────────────────────────────
+    # ── Load dataset ─────────────────────────────────────────────────────
+    log("Loading dataset …")
+    data_chunks = load_dataset(DATASET_PATH, SEQ_LEN, PRETRAIN_MODEL_PATH)
+    use_real_data = data_chunks is not None
+
+    if use_real_data:
+        log(f"Using REAL dataset: {data_chunks.shape[0]} chunks, "
+            f"{data_chunks.shape[1]} tok/chunk")
+    else:
+        log("WARNING: no dataset files found — using synthetic random tokens")
+
+    # ── Optimiser ────────────────────────────────────────────────────────
     tokens_per_step_per_device = BATCH_SIZE * SEQ_LEN
     target_tokens_per_device = 125_000_000  # 500M / 4
-    max_steps = target_tokens_per_device // tokens_per_step_per_device + 10
+    if use_real_data:
+        max_steps = min(
+            target_tokens_per_device // tokens_per_step_per_device + 10,
+            data_chunks.shape[0] // rank_size + 10,   # don't over-iterate data
+        )
+    else:
+        max_steps = target_tokens_per_device // tokens_per_step_per_device + 10
     actual_lr = LEARNING_RATE
     log(f"Target: {target_tokens_per_device:,} tokens/device, "
-        f"{max_steps} steps, B={BATCH_SIZE} S={SEQ_LEN}")
+        f"{max_steps} steps, B={BATCH_SIZE} S={SEQ_LEN}, "
+        f"real_data={use_real_data}")
 
     train_params = list(model.trainable_params())
     optimizer = nn.AdamWeightDecay(
@@ -793,8 +1013,6 @@ def main():
             log(f"Building training graph for B={bs} …")
             ts = TrainStep(forward_loss, optimizer, MAX_GRAD_NORM)
             ts.set_train()
-
-            # Compile with a single step
             dummy = Tensor(
                 np.random.randint(0, VOCAB_SIZE, (bs, SEQ_LEN)).astype(np.int32)
             )
@@ -821,9 +1039,6 @@ def main():
     log(f"Training with B={actual_bs}, S={SEQ_LEN}, "
         f"{actual_bs * SEQ_LEN:,} tok/step/device")
 
-    # ── Data iterator (numpy, manual loop for timing) ───────────────────
-    log("Creating data iterator …")
-
     # ── Training loop ────────────────────────────────────────────────────
     step = 0
     total_tokens = 0
@@ -842,9 +1057,17 @@ def main():
             log(f"Time limit reached ({elapsed:.0f}s > {TIME_LIMIT}s)")
             break
 
-        # Synthetic batch
-        batch_np = np.random.randint(0, VOCAB_SIZE,
-                                     (actual_bs, SEQ_LEN)).astype(np.int32)
+        # Get next batch
+        if use_real_data:
+            # Distribute chunks across ranks
+            rank_start = (step * actual_bs) % data_chunks.shape[0]
+            rank_end = rank_start + actual_bs
+            if rank_end > data_chunks.shape[0]:
+                rank_end = data_chunks.shape[0]
+            batch_np = data_chunks[rank_start:rank_end]
+        else:
+            batch_np = np.random.randint(0, VOCAB_SIZE,
+                                         (actual_bs, SEQ_LEN)).astype(np.int32)
         batch_tensor = Tensor(batch_np)
 
         try:
@@ -856,7 +1079,6 @@ def main():
                 break
             raise
 
-        # loss_val is a Tensor — convert to float
         loss_float = float(loss_val.asnumpy())
         total_tokens += tokens_per_step * rank_size
         if loss_float < best_loss:
@@ -864,7 +1086,6 @@ def main():
 
         step += 1
 
-        # Logging
         if step % 50 == 0 or step <= 3:
             dt = time.time() - t_start
             tps_dev = tokens_per_step / dt * step if dt > 0 else 0
@@ -877,7 +1098,6 @@ def main():
                 f"elapsed={dt:.0f}s | "
                 f"tokens={total_tokens:,}")
 
-        # Checkpoint
         if rank_id == 0 and step % 1000 == 0 and step > 0:
             ckpt_path = os.path.join(CKPT_DIR, f"step_{step}.ckpt")
             ms.save_checkpoint(model, ckpt_path)
@@ -907,9 +1127,10 @@ def main():
         "final_loss": round(loss_float, 4) if 'loss_float' in dir() else None,
         "best_loss": round(best_loss, 4),
         "data_parallel": use_dp,
+        "used_real_data": use_real_data,
     }
 
-    results_path = os.path.join(OUTPUT_DIR, "results.json")
+    results_path = os.path.join(OUTPUT_PATH, "results.json")
     with open(results_path, "w") as f:
         json.dump(results, f, indent=2)
     log(f"Results written to {results_path}")
@@ -920,6 +1141,14 @@ def main():
     log("=" * 60)
     for k, v in results.items():
         log(f"  {k}: {v}")
+
+    # Upload via c2net
+    if HAS_C2NET:
+        try:
+            upload_output()
+            log("upload_output() completed successfully")
+        except Exception as e:
+            log(f"upload_output() failed: {e}")
 
     if _log_fh is not None:
         _log_fh.close()
