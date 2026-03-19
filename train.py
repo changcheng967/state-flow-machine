@@ -23,6 +23,20 @@ import math
 import gc
 import glob
 import warnings
+
+# ── Bootstrap diagnostic (before anything else can fail) ──────────────────
+try:
+    _boot_ts = time.strftime("%H:%M:%S")
+    _boot_pid = os.getpid()
+    _boot_rank = os.environ.get("RANK_ID", "?")
+    sys.stderr.write(f"[BOOT {_boot_ts}] pid={_boot_pid} rank={_boot_rank} started\n")
+    sys.stderr.flush()
+    # Write to /cache/output directly (bypasses all variable logic)
+    os.makedirs("/cache/output", exist_ok=True)
+    with open("/cache/output/boot.log", "a") as _bf:
+        _bf.write(f"[{_boot_ts}] pid={_boot_pid} rank={_boot_rank} script_started\n")
+except Exception:
+    pass
 import subprocess
 
 warnings.filterwarnings("ignore")
@@ -1191,15 +1205,24 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        print(f"FATAL ERROR in main(): {e}", flush=True)
         import traceback
-        traceback.print_exc()
-        # Try to write error to output path
+        msg = f"FATAL ERROR in main(): {e}\n{traceback.format_exc()}"
+        print(msg, flush=True)
+        sys.stderr.write(msg + "\n")
+        sys.stderr.flush()
+        # Write to BOTH /cache/output (hardcoded) and OUTPUT_PATH
+        for _err_dir in ["/cache/output", OUTPUT_PATH]:
+            try:
+                os.makedirs(_err_dir, exist_ok=True)
+                with open(os.path.join(_err_dir, "error.log"), "w") as f:
+                    f.write(msg)
+            except Exception:
+                pass
+        # Try c2net upload so error.log is downloadable
         try:
-            os.makedirs(OUTPUT_PATH, exist_ok=True)
-            with open(os.path.join(OUTPUT_PATH, "error.log"), "w") as f:
-                f.write(f"FATAL: {e}\n")
-                traceback.print_exc(file=f)
+            if HAS_C2NET:
+                from c2net.context import upload_output
+                upload_output()
         except Exception:
             pass
         raise
