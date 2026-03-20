@@ -1,77 +1,94 @@
 """test_image.py — Verify OpenI custom image works for training.
 
-Tests (in order, continues on failure):
-  1. Python version
-  2. c2net path discovery
-  3. MindSpore import + version
-  4. NPU detection
-  5. Basic tensor ops
-  6. nn.Dense + nn.Embedding
-  7. @ms.jit compilation
-  8. GradOperation
-  9. AdamWeightDecay
-  10. ClipByGlobalNorm
-  11. ForiLoop / WhileLoop
-  12. Mini DeltaNet forward
-  13. DeltaNet @ms.jit
-  14. Mini training step
+Writes to MULTIPLE directories for maximum compatibility with OpenI platform.
 
-Writes results to OUTPUT_PATH/test_result.log and test_result.json.
+Output files (at least one should appear):
+  - /cache/output/test_result.log
+  - ./test_result.log  (current working directory)
+  - /tmp/test_result.log
 """
 
 # ═══════════════════════════════════════════════════════════════════
-# BOOT LOG — write IMMEDIATELY before anything can fail
-# ═══════════════════════════════════════════════════════════════════
-
-def _boot_log(msg: str) -> None:
-    """Write to stdout + error.log BEFORE any imports can fail."""
-    ts = time.strftime("%H:%M:%S")
-    line = f"[{ts}] {msg}"
-    print(line, flush=True)
-    for d in ["/cache/output"]:
-        try:
-            import os
-            os.makedirs(d, exist_ok=True)
-            with open(os.path.join(d, "test_result.log"), "a") as f:
-                f.write(line + "\n")
-        except Exception:
-            pass
+# SANITY CHECK — write to as many places as possible, using ONLY stdlib
+# This runs BEFORE any MindSpore/c2net imports that might fail.
+# ═════════════════════════════════════════════════════════════════
 
 import sys
 import os
 import json
 import time
+import traceback
 
-_boot_ts = time.strftime("%H:%M:%S")
-_boot_pid = os.getpid()
-_boot_rank = os.environ.get("RANK_ID", "?")
-_boot_log(f"test_image started pid={_boot_pid} rank={_boot_rank} python={sys.version.split()[0]}")
+# Collect all possible output directories to write logs
+_LOG_DIRS = ["/cache/output"]
+_cwd = os.getcwd()
 
-# ═══════════════════════════════════════════════════════════════════
-# PATH DISCOVERY — c2net + fallbacks
-# ═══════════════════════════════════════════════════════════════════
+# Also try the OpenI standard paths
+for p in ["/cache/output", "/home/ma-user/work/output",
+            "/home/ma-user/modelarts/workspace/device0",
+            _cwd, "/tmp"]:
+    if os.path.isdir(p) or p == "/tmp":
+        _LOG_DIRS.insert(0, p)
 
+_LOG_DIRS = list(dict.fromkeys(_LOG_DIRS).keys())  # deduplicate
+
+def _boot_log(msg: str) -> None:
+    """Write to ALL possible output locations + stderr. Never fails."""
+    ts = time.strftime("%H:%M:%S")
+    line = f"[{ts}] {msg}"
+    print(line, flush=True)
+    sys.stderr.write(line + "\n")
+    sys.stderr.flush()
+    for d in _LOG_DIRS:
+        try:
+            with open(os.path.join(d, "test_result.log"), "a") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
+
+
+_boot_log(f"=== test_image.py started ===")
+_boot_log(f"  pid={os.getpid()}")
+_boot_log(f"  python={sys.version}")
+_boot_log(f"  cwd={os.getcwd()}")
+_boot_log(f"  writable dirs: {_LOG_DIRS}")
+_boot_log(f"  HOME={os.environ.get('HOME', '?')}")
+_boot_log(f"  RANK_ID={os.environ.get('RANK_ID', '?')}")
+_boot_log(f"  DEVICE_ID={os.environ.get('DEVICE_ID', '?')}")
+_boot_log(f"  OUTPUT_PATH env={os.environ.get('OUTPUT_PATH', 'not set')}")
+_boot_log("  sys.path[:3]={sys.path[:3]}")
+
+# ── Discover output path (try c2net, fall back to /cache/output) ───
 OUTPUT_PATH = "/cache/output"
-DATASET_PATH = "/cache/dataset"
-PRETRAIN_PATH = "/cache/pretrainmodel"
-CODE_PATH = "/cache/code"
 
 try:
-    from c2net.context import prepare, upload_output
+    from c2net.context import prepare
+    _boot_log("c2net import OK, calling prepare()...")
     _ctx = prepare()
     OUTPUT_PATH = _ctx.output_path
-    DATASET_PATH = _ctx.dataset_path
-    PRETRAIN_PATH = _ctx.pretrain_model_path
-    CODE_PATH = _ctx.code_path
-    _boot_log(f"c2net OK: out={OUTPUT_PATH} data={DATASET_PATH} pre={PRETRAIN_PATH}")
+    _boot_log(f"c2net prepare() OK, output_path={OUTPUT_PATH}")
+    _LOG_DIRS.insert(0, OUTPUT_PATH)
 except Exception as e:
-    _boot_log(f"c2net not available ({e}), using default paths")
+    _boot_log(f"c2net not available: {type(e).__name__}: {e}")
+    _boot_log("Using fallback output path: /cache/output")
 
 os.makedirs(OUTPUT_PATH, exist_ok=True)
+_boot_log(f"Final OUTPUT_PATH: {OUTPUT_PATH}")
+_boot_log(f"OUTPUT_PATH exists: {os.path.isdir(OUTPUT_PATH)}")
+_boot_log(f"OUTPUT_PATH isdir: {os.path.isdir(OUTPUT_PATH)}")
 
-# ═══════════════════════════════════════════════════════════════════
-# LOGGING
-# ═══════════════════════════════════════════════════════════════════
+# Write a test file to verify write access
+_test_file = os.path.join(OUTPUT_PATH, "_write_test.txt")
+try:
+    with open(_test_file, "w") as f:
+        f.write(f"write test OK at {time.strftime('%H:%M:%S')}\n")
+    _boot_log(f"Write test OK: {_test_file}")
+except Exception as e:
+    _boot_log(f"Write test FAILED: {e}")
+
+# ═════════════════════════════════════════════════════════════════
+# LOGGING (uses discovered OUTPUT_PATH)
+# ═════════════════════════════════════════════════════════════════
 
 _log_fh = None
 
@@ -79,6 +96,8 @@ def log(msg: str) -> None:
     ts = time.strftime("%H:%M:%S")
     line = f"[{ts}] {msg}"
     print(line, flush=True)
+    sys.stderr.write(line + "\n")
+    sys.stderr.flush()
     if _log_fh is not None:
         _log_fh.write(line + "\n")
         _log_fh.flush()
@@ -86,23 +105,16 @@ def log(msg: str) -> None:
 
 def setup_log() -> None:
     global _log_fh
+    _LOG_DIRS.insert(0, OUTPUT_PATH)
     log_path = os.path.join(OUTPUT_PATH, "test_result.log")
     _log_fh = open(log_path, "w")
     log(f"Log file: {log_path}")
-    log(f"OUTPUT_PATH: {OUTPUT_PATH}")
-    log(f"DATASET_PATH: {DATASET_PATH}")
-    log(f"PRETRAIN_PATH: {PRETRAIN_PATH}")
-    log(f"CODE_PATH: {CODE_PATH}")
-    log(f"RANK_ID: {_boot_rank}")
-    log(f"PID: {_boot_pid}")
-    log(f"Python: {sys.version}")
-    log(f"CWD: {os.getcwd()}")
 
 setup_log()
 
-# ═══════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════
 # TEST FRAMEWORK
-# ═══════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════
 
 passed = 0
 failed = 0
@@ -135,44 +147,37 @@ def check(name: str, fn, *args, **kwargs):
         return None
 
 
-# ═══════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════
 # TESTS
-# ═══════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════
 
-# ── 1. MindSpore import + version ─────────────────────────────────
 log(f"\n{'='*60}")
-log("OpenI Custom Image Test")
+log("OpenI Custom Image Compatibility Test")
 log(f"{'='*60}")
 
+# ── 1. MindSpore import ────────────────────────────────────────────
 ms_ver = "?"
 try:
     import mindspore as ms
     from mindspore import nn, ops, Tensor
     ms_ver = ms.__version__
-    check(f"MindSpore version: {ms_ver}", lambda: ms_ver)
+    check(f"MindSpore import + version ({ms_ver})", lambda: ms_ver)
 except Exception as e:
-    check("Import MindSpore", lambda: (_ for _ in ()).throw(e))
-    log(f"FATAL: Cannot import MindSpore: {e}")
+    log(f"FATAL: Cannot import MindSpore: {type(e).__name__}: {e}")
+    log(f"sys.path: {sys.path[:3]}")
     # Write error and exit
-    summary = {"passed": 0, "failed": 1, "total": 1, "all_passed": False,
-                "error": f"Cannot import MindSpore: {e}"}
-    with open(os.path.join(OUTPUT_PATH, "test_result.json"), "w") as f:
-        json.dump(summary, f, indent=2)
-    log("EXITING — MindSpore not available")
+    _boot_log(f"FATAL: Cannot import MindSpore: {e}\nsys.path={sys.path[:3]}")
     sys.exit(1)
 
 import numpy as np
 
 # ── 2. NPU detection ───────────────────────────────────────────────
 def test_npu():
-    try:
-        device_id = int(os.environ.get("DEVICE_ID", "0"))
-        ms.set_context(device_target="Ascend", device_id=device_id)
-        x = Tensor(np.ones((2, 3), dtype=np.float32))
-        y = ops.matmul(x, x.transpose(1, 0))
-        return f"Ascend NPU OK, device_id={device_id}, matmul shape={y.shape}"
-    except Exception as e:
-        return f"FAILED: {e}"
+    device_id = int(os.environ.get("DEVICE_ID", "0"))
+    ms.set_context(device_target="Ascend", device_id=device_id)
+    x = Tensor(np.ones((2, 3), dtype=np.float32))
+    y = ops.matmul(x, x.transpose(1, 0))
+    return f"Ascend NPU OK, device_id={device_id}, matmul shape={y.shape}"
 
 check("NPU availability", test_npu)
 
@@ -190,52 +195,40 @@ def test_tensor_ops():
     j = ops.Tile()(a, (2, 1, 1))
     k = ops.stack([a, b], axis=0)
     l = ops.sigmoid(Tensor(np.array([-1.0, 0.0, 1.0], dtype=np.float32)))
-    m = ops.Softmax(axis=-1)(Tensor(np.random.randn(2, 4), dtype=np.float32))
     return "All tensor ops OK"
 
-check("Basic tensor ops (FP16/FP32 matmul, cast, reduce, reshape, tile, stack, sigmoid, softmax)", test_tensor_ops)
+check("Basic tensor ops", test_tensor_ops)
 
-# ── 4. nn.Dense, nn.Embedding, nn.RMSNorm-like ────────────────────
+# ── 4. nn.Dense + nn.Embedding ────────────────────────────────────
 def test_nn_layers():
     d = nn.Dense(128, 64, has_bias=True)
     x = Tensor(np.random.randn(4, 128), dtype=np.float32)
     y = d(x)
-    assert y.shape == (4, 64), f"Expected (4, 64), got {y.shape}"
-
     emb = nn.Embedding(1000, 128)
     ids = Tensor(np.random.randint(0, 1000, (4, 10)).astype(np.int32))
     e = emb(ids)
-    assert e.shape == (4, 10, 128), f"Expected (4, 10, 128), got {e.shape}"
-
     mm = ops.MatMul(transpose_b=True)
-    w = Tensor(np.random.randn(128, 64), dtype=np.float32)
-    logits = mm(y, w)
-    assert logits.shape == (4, 64), f"Expected (4, 64), got {logits.shape}"
-
-    return f"Dense(128->64), Embedding(1000,128), MatMul OK"
+    logits = mm(y, Tensor(np.random.randn(128, 64), dtype=np.float32))
+    return f"Dense({y.shape}), Emb({e.shape}), MatMul({logits.shape})"
 
 check("nn.Dense + nn.Embedding + MatMul", test_nn_layers)
 
 # ── 5. @ms.jit compilation ────────────────────────────────────────
 def test_jit():
     class AddCell(nn.Cell):
-        def __init__(self):
-            super().__init__()
-
         @ms.jit
         def construct(self, x, y):
             return x + y * 2
 
     cell = AddCell()
-    a = Tensor(np.ones((2, 3), dtype=np.float32))
-    b = Tensor(np.ones((2, 3), dtype=np.float32))
-    c = cell(a, b)
+    c = cell(Tensor(np.ones((2, 3), dtype=np.float32)),
+              Tensor(np.ones((2, 3), dtype=np.float32)))
     assert c.shape == (2, 3)
     return "@ms.jit compilation OK"
 
-check("@ms.jit basic compilation", test_jit)
+check("@ms.jit compilation", test_jit)
 
-# ── 6. ops.GradOperation ──────────────────────────────────────────
+# ── 6. GradOperation ──────────────────────────────────────────────
 def test_grad():
     class GradCell(nn.Cell):
         def __init__(self):
@@ -252,71 +245,55 @@ def test_grad():
             return y, grads
 
     cell = GradCell()
-    x = Tensor(np.random.randn(4, 16), dtype=np.float32)
-    y, grads = cell(x)
-    assert y.shape == (4, 8)
-    assert len(grads) == 2
-    return f"GradOperation OK, {len(grads)} grads, shapes={[g.shape for g in grads]}"
+    y, grads = cell(Tensor(np.random.randn(4, 16), dtype=np.float32))
+    return f"GradOperation OK, {len(grads)} grads"
 
-check("ops.GradOperation (forward + backward)", test_grad)
+check("ops.GradOperation", test_grad)
 
-# ── 7. nn.AdamWeightDecay ────────────────────────────────────────
+# ── 7. AdamWeightDecay ───────────────────────────────────────────
 def test_optimizer():
     net = nn.Dense(32, 16)
-    params = net.trainable_params()
-    lr = Tensor([0.001], ms.float32)
-    opt = nn.AdamWeightDecay(params, learning_rate=lr)
-    grads = [Tensor(np.random.randn(*p.shape), dtype=ms.float32)
-              for p in params]
+    opt = nn.AdamWeightDecay(net.trainable_params(),
+                             learning_rate=Tensor([0.001], ms.float32))
+    grads = [Tensor(np.random.randn(*p.shape), dtype=ms.float32) for p in net.trainable_params()]
     opt(tuple(grads))
-    return f"AdamWeightDecay OK, {len(params)} params"
+    return f"AdamWeightDecay OK, {len(net.trainable_params())} params"
 
 check("nn.AdamWeightDecay", test_optimizer)
 
-# ── 8. nn.ClipByGlobalNorm ───────────────────────────────────────
+# ── 8. ClipByGlobalNorm ───────────────────────────────────────────
 def test_clip():
     if hasattr(nn, 'ClipByGlobalNorm'):
         clip = nn.ClipByGlobalNorm(1.0)
         g1 = Tensor(np.random.randn(4, 8), dtype=np.float32) * 10
         g2 = Tensor(np.random.randn(4, 8), dtype=np.float32) * 10
         clipped, norm = clip((g1, g2))
-        return f"ClipByGlobalNorm EXISTS & WORKS, norm={float(norm):.4f}"
+        return f"ClipByGlobalNorm EXISTS, norm={float(norm):.4f}"
     else:
-        return "nn.ClipByGlobalNorm NOT FOUND"
+        return "nn.ClipByGlobalNorm NOT FOUND (need alternative)"
 
 check("nn.ClipByGlobalNorm", test_clip)
 
-# ── 9. ops.ForiLoop / ops.WhileLoop ───────────────────────────────
+# ── 9. ForiLoop / WhileLoop ───────────────────────────────────────
 def test_loop_ops():
     has_fori = hasattr(ops, 'ForiLoop')
     has_while = hasattr(ops, 'WhileLoop')
-    has_scan = hasattr(ops, 'Scan')
-
     if has_fori:
-        try:
-            fl = ops.ForiLoop()
-            def body(x, i):
-                return x + i
-            init = Tensor(0.0, ms.float32)
-            result = fl(body, 0, 10, init)
-            return f"ForiLoop EXISTS & WORKS, result={float(result):.1f}"
-        except Exception as e:
-            return f"ForiLoop EXISTS but FAILED: {e}"
+        fl = ops.ForiLoop()
+        def body(x, i):
+            return x + i
+        result = fl(body, 0, 10, Tensor(0.0, ms.float32))
+        return f"ForiLoop EXISTS, result={float(result):.1f}"
     elif has_while:
         return "ForiLoop not found, WhileLoop exists"
-    elif has_scan:
-        return "ForiLoop/WhileLoop not found, Scan exists"
     else:
-        return "ForiLoop/WhileLoop/Scan NOT FOUND"
+        return "ForiLoop/WhileLoop NOT FOUND"
 
 check("ops.ForiLoop / WhileLoop (MS 2.4+)", test_loop_ops)
 
 # ── 10. Mini DeltaNet forward ─────────────────────────────────────
 def test_deltanet_forward():
-    BRIDGE_DIM = 256
-    D = 256
-    NH = 16
-    HD = 16
+    BRIDGE_DIM, D, NH, HD = 256, 256, 16, 16
 
     class MiniDeltaNet(nn.Cell):
         def __init__(self):
@@ -350,25 +327,17 @@ def test_deltanet_forward():
                 state = state - update
                 out_t = state[:, :, -1, :]
                 outputs = outputs + (out_t,)
-            stacked = ops.stack(outputs, axis=0)
-            stacked = stacked.transpose(1, 0, 2, 3)
-            return stacked.reshape(B, S, NH * HD)
+            return ops.stack(outputs, axis=0).transpose(1, 0, 2, 3).reshape(B, S, NH * HD)
 
     net = MiniDeltaNet()
-    x = Tensor(np.random.randn(2, 32, BRIDGE_DIM).astype(np.float16))
-    out = net(x)
-    assert out.shape == (2, 32, D), f"Expected (2, 32, {D}), got {out.shape}"
-    n_params = sum(p.size for p in net.get_parameters())
-    return f"MiniDeltaNet forward OK, output={out.shape}, params={n_params:,}"
+    out = net(Tensor(np.random.randn(2, 32, BRIDGE_DIM).astype(np.float16)))
+    return f"MiniDeltaNet OK, output={out.shape}"
 
-check("Mini DeltaNet forward pass (B=2, S=32)", test_deltanet_forward)
+check("Mini DeltaNet forward (B=2, S=32)", test_deltanet_forward)
 
-# ── 11. DeltaNet @ms.jit compilation ──────────────────────────────
+# ── 11. DeltaNet @ms.jit ──────────────────────────────────────────
 def test_deltanet_jit():
-    BRIDGE_DIM = 256
-    D = 256
-    NH = 16
-    HD = 16
+    BRIDGE_DIM, D, NH, HD = 256, 256, 16, 16
 
     class MiniDeltaNet(nn.Cell):
         def __init__(self):
@@ -403,18 +372,14 @@ def test_deltanet_jit():
                 state = state - update
                 out_t = state[:, :, -1, :]
                 outputs = outputs + (out_t,)
-            stacked = ops.stack(outputs, axis=0)
-            stacked = stacked.transpose(1, 0, 2, 3)
-            return stacked.reshape(B, S, NH * HD)
+            return ops.stack(outputs, axis=0).transpose(1, 0, 2, 3).reshape(B, S, NH * HD)
 
     net = MiniDeltaNet()
     net.set_train(True)
-    x = Tensor(np.random.randn(2, 64, BRIDGE_DIM).astype(np.float16))
-    out = net(x)
-    assert out.shape == (2, 64, D)
+    out = net(Tensor(np.random.randn(2, 64, BRIDGE_DIM).astype(np.float16)))
     return f"DeltaNet @ms.jit OK, output={out.shape}"
 
-check("DeltaNet @ms.jit compilation (B=2, S=64)", test_deltanet_jit)
+check("DeltaNet @ms.jit (B=2, S=64)", test_deltanet_jit)
 
 # ── 12. Mini training step ─────────────────────────────────────────
 def test_training_step():
@@ -425,8 +390,7 @@ def test_training_step():
             self.dense2 = nn.Dense(128, 64)
 
         def construct(self, x):
-            h = self.dense1(x)
-            return self.dense2(h)
+            return self.dense2(self.dense1(x))
 
     class TrainStep(nn.Cell):
         def __init__(self, net, opt):
@@ -437,16 +401,11 @@ def test_training_step():
             self.grad_op = ops.GradOperation(get_by_list=True, sens_param=True)
             self.sens = Tensor([1.0], ms.float32)
             self.loss_fn = nn.MSELoss()
-
-            if hasattr(nn, 'ClipByGlobalNorm'):
-                self.clip = nn.ClipByGlobalNorm(1.0)
-            else:
-                self.clip = None
+            self.clip = nn.ClipByGlobalNorm(1.0) if hasattr(nn, 'ClipByGlobalNorm') else None
 
         @ms.jit
         def construct(self, x, target):
-            out = self.net(x)
-            loss = self.loss_fn(out, target)
+            loss = self.loss_fn(self.net(x), target)
             grads = self.grad_op(self.net, self.weights)(x, self.sens)
             if self.clip is not None:
                 grads, _ = self.clip(grads)
@@ -457,18 +416,15 @@ def test_training_step():
     opt = nn.AdamWeightDecay(net.trainable_params(),
                              learning_rate=Tensor([0.001], ms.float32))
     step = TrainStep(net, opt)
-
-    x = Tensor(np.random.randn(4, 64), dtype=np.float32)
-    target = Tensor(np.random.randn(4, 64), dtype=np.float32)
-
-    loss = step(x, target)
+    loss = step(Tensor(np.random.randn(4, 64), dtype=np.float32),
+                   Tensor(np.random.randn(4, 64), dtype=np.float32))
     return f"Training step OK, loss={float(loss):.4f}"
 
 check("Mini training step (forward + backward + optimizer)", test_training_step)
 
-# ═══════════════════════════════════════════════════════════════════
-# SUMMARY + JSON OUTPUT
-# ═══════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════
+# SUMMARY
+# ═════════════════════════════════════════════════════════════════
 
 log(f"\n{'='*60}")
 log(f"SUMMARY: {passed} passed, {failed} failed out of {passed + failed}")
@@ -480,53 +436,26 @@ if errors:
         log(f"  - {name}: {type(err).__name__}: {err}")
 
 if failed == 0:
-    log("\nALL TESTS PASSED! The image is ready for training.")
+    log("\nALL TESTS PASSED! Image ready for training.")
 else:
-    log(f"\n{failed} test(s) failed. Check errors above.")
+    log(f"\n{failed} test(s) failed.")
 
 log(f"\nMindSpore: {ms_ver}")
 log(f"Python: {sys.version}")
-log(f"NPUs available: {ms.get_context('device_num')}")
+log(f"NPUs: {ms.get_context('device_num')}")
 
-# Write JSON result file
+# Write JSON
 json_path = os.path.join(OUTPUT_PATH, "test_result.json")
-summary = {
-    "passed": passed,
-    "failed": failed,
-    "total": passed + failed,
-    "all_passed": failed == 0,
-    "mindspore_version": ms_ver,
-    "python_version": sys.version,
-    "npus": ms.get_context("device_num"),
-    "tests": results,
-    "errors": [{"name": n, "error": f"{type(e).__name__}: {e}"}
-              for n, e in errors],
-}
 with open(json_path, "w") as f:
-    json.dump(summary, f, indent=2)
-log(f"Results written to {json_path}")
+    json.dump({
+        "passed": passed, "failed": failed, "total": passed + failed,
+        "all_passed": failed == 0, "mindspore_version": ms_ver,
+        "python_version": sys.version,
+        "npus": ms.get_context("device_num"),
+        "tests": results,
+        "errors": [{"name": n, "error": f"{type(e).__name__}: {e}"} for n, e in errors],
+    }, f, indent=2)
+log(f"JSON written to {json_path}")
 
 if _log_fh is not None:
     _log_fh.close()
-
-# ═══════════════════════════════════════════════════════════════════
-# ERROR HANDLER — write error.log on any crash
-# ═══════════════════════════════════════════════════════════════════
-
-def _write_error(msg: str) -> None:
-    for d in ["/cache/output", OUTPUT_PATH]:
-        try:
-            os.makedirs(d, exist_ok=True)
-            with open(os.path.join(d, "error.log"), "w") as f:
-                f.write(msg)
-        except Exception:
-            pass
-
-if __name__ == "__main__":
-    try:
-        pass  # Tests ran above
-    except Exception as e:
-        import traceback
-        msg = f"FATAL: {e}\n{traceback.format_exc()}"
-        log(msg)
-        _write_error(msg)

@@ -320,12 +320,14 @@ def find_model_dir(base_path: str) -> str:
         has_cfg = "config.json" in files
         if has_st:
             candidates.append(root)
-            # Check config for 1.5B model (28 layers)
+            # Check config for 1.5B model (28 layers AND hidden_size=1536)
+            # Note: Qwen2.5-Coder-7B also has 28 layers but hidden_size=3584
             if has_cfg:
                 try:
                     with open(os.path.join(root, "config.json")) as f:
                         cfg = json.load(f)
-                    if cfg.get("num_hidden_layers") == 28:
+                    if (cfg.get("num_hidden_layers") == 28 and
+                            cfg.get("hidden_size") == HIDDEN_DIM):
                         return root
                 except Exception:
                     pass
@@ -2022,7 +2024,7 @@ def main() -> None:
                     forward_loss = ForwardLossCell(
                         model, cos_t, sin_t, causal_mask)
                     train_step_s1 = TrainStep(
-                        forward_loss, optimizer_s1, MAX_GRAD_NORM)
+                        forward_loss, optimizer_s1)
                     continue
                 raise
 
@@ -2219,7 +2221,7 @@ def main() -> None:
                 forward_loss = ForwardLossCell(
                     model, cos_t, sin_t, causal_mask)
                 train_step_s2 = TrainStep(
-                    forward_loss, optimizer_s2, MAX_GRAD_NORM)
+                    forward_loss, optimizer_s2)
                 continue
             raise
 
