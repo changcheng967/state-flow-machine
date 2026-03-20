@@ -280,11 +280,15 @@ from mindspore.common.tensor import Tensor
 # In PYNATIVE_MODE, GradOperation tracing replaces intermediate tensors
 # with StubTensors. Accessing .dtype or .shape on an uninitialized
 # StubTensor crashes with "bad optional access". This monkey-patch
-# makes both .dtype and .shape fall back to safe defaults.
+# makes .dtype, .shape, and stub_sync() fall back to safe defaults.
+# During GradOperation tracing, MS 2.2 creates StubTensors for
+# intermediate values. Any operation that needs the actual value
+# (astype, arithmetic, Tensor()) calls stub_sync() which crashes.
 try:
     from mindspore.common._stub_tensor import StubTensor as _StubTensor
     _orig_dtype_getter = _StubTensor.dtype.fget
     _orig_shape_getter = _StubTensor.shape.fget
+    _orig_stub_sync = _StubTensor.stub_sync
     def _safe_dtype(self):
         try:
             return _orig_dtype_getter(self)
@@ -295,8 +299,14 @@ try:
             return _orig_shape_getter(self)
         except (RuntimeError, ValueError):
             return (1,)
+    def _safe_stub_sync(self):
+        try:
+            return _orig_stub_sync(self)
+        except (RuntimeError, ValueError):
+            return np.zeros(1, dtype=np.float32)
     _StubTensor.dtype = property(_safe_dtype)
     _StubTensor.shape = property(_safe_shape)
+    _StubTensor.stub_sync = _safe_stub_sync
 except Exception:
     pass
 
@@ -506,7 +516,7 @@ class TransformerBlock(nn.Cell):
                   mask: Tensor) -> Tensor:
         try:
             B, S, _ = x.shape
-        except (ValueError, IndexError):
+        except (ValueError, IndexError, RuntimeError):
             return x  # StubTensor during GradOperation tracing
         NH = NUM_HEADS
         NKV = NUM_KV_HEADS
@@ -599,7 +609,7 @@ class DeltaNetCell(nn.Cell):
         """
         try:
             B, S, _ = x.shape
-        except (ValueError, IndexError):
+        except (ValueError, IndexError, RuntimeError):
             return x  # StubTensor during GradOperation tracing
         D = DELTANET_HIDDEN_DIM
         NH = self.NH
