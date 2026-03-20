@@ -276,6 +276,23 @@ import mindspore as ms
 from mindspore import nn, ops
 from mindspore.common.tensor import Tensor
 
+# ── MS 2.2 StubTensor bug workaround ─────────────────────────────────
+# In PYNATIVE_MODE, GradOperation tracing replaces intermediate tensors
+# with StubTensors. Accessing .dtype on a StubTensor crashes with
+# "bad optional access" (self.stub.get_dtype() fails). This monkey-patch
+# makes .dtype fall back to FP32 when the stub isn't fully initialized.
+try:
+    from mindspore.common._stub_tensor import StubTensor as _StubTensor
+    _orig_dtype_getter = _StubTensor.dtype.fget
+    def _safe_dtype(self):
+        try:
+            return _orig_dtype_getter(self)
+        except (RuntimeError, ValueError):
+            return ms.float32
+    _StubTensor.dtype = property(_safe_dtype)
+except Exception:
+    pass
+
 
 # ══════════════════════════════════════════════════════════════════════
 # SAFETENSERS LOADER
