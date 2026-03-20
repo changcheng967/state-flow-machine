@@ -32,49 +32,44 @@ Transformers dominate in-distribution but collapse to ~2% at 4x length. State Sl
 
 See `experiments/exp0_state_tracking/` for the full experiment code and `length_generalization.png` for the visualization.
 
-## Experiment 1: SFM-Enhanced LLM Training (IN PROGRESS)
+## Experiment 1: Thinker-1.5B DeltaNet SFM (IN PROGRESS)
 
-**Task**: Fine-tune Qwen2.5-Coder-7B with LoRA adapters + SFM Slot Banks on OpenThoughts-114k.
+**Task**: Fine-tune Qwen2.5-Coder-1.5B with DeltaNet SFM blocks for code execution reasoning.
 
-**Setup**:
-- **Base model**: Qwen2.5-Coder-7B (frozen, ~7B params)
-- **Adapters**: LoRA rank=32 alpha=64 on all attention + FFN projections (~75M trainable)
-- **SFM**: Slot Banks (8 slots each) inserted at layers 7, 15, 23, 31
-- **Hardware**: 4x Ascend 910 (32GB HBM each), MindSpore 2.2 + CANN 7
-- **Training**: DATA_PARALLEL, gradient checkpointing, cosine LR with warmup
-- **Platform**: OpenI (grampus launcher + c2net)
+**Architecture**:
+- **Base model**: Qwen2.5-Coder-1.5B (1.5B params, 28 layers, 12Q/2KV GQA, rope_theta=1M)
+- **DeltaNet SFM**: Simple delta rule `S = S - beta*(S@k - v)@k^T`, 16 heads x 16x16 state, inserted after layers 6, 13, 20, 27
+- **Cross-system bridge**: 256d shared space with learned gate
+- **Judge head**: Binary correct/wrong classifier (15% corrupted bootstrap labels)
+- **Surprise predictor**: Scalar for self-evolution difficulty tracking
 
-**Run**:
-```bash
-python train.py   # Self-contained, runs unattended with convergence detection
-```
-
-The training script (`train.py`) is fully self-contained — no pip installs needed. It:
-- Discovers paths via c2net/grampus platform integration
-- Loads Qwen2.5-Coder-7B from HuggingFace safetensors
-- Tokenizes OpenThoughts-114k with proper BPE
-- Trains with convergence-based stopping (24h safety limit)
-- Uploads results via c2net
+**Training**:
+- Stage 1: SFM-only (base frozen, lr=1e-3)
+- Stage 2: Full fine-tuning (base lr=2e-5, SFM lr=5e-4)
+- Multi-loss: masked CE + 0.1*judge_BCE + 0.01*surprise_MSE
+- Synthetic data: exec() traces + debugging samples generated on-the-fly
+- Self-evolution: EWMA difficulty adaptation, probe every 500 steps
+- **Hardware**: 4x Ascend 910, MindSpore 2.2 + CANN 7
 
 ## Repo Structure
 
 ```
-train.py                           # Exp 1: Self-contained 7B training script
-sfm/                               # Core library
-  systems/                         #   4 systems (perception, execution, structure, meta)
-  components/                      #   Reusable blocks (DeltaNet, state slots, GNN, etc.)
-  tokenizer/                       #   Code tokenizer
-  utils/                           #   Device & distributed utilities
+train.py                               # Exp 1: Qwen2.5-Coder-7B + LoRA + SFM training
+sfm/                                   # Core library
+  systems/                             #   4 systems (perception, execution, structure, meta)
+  components/                          #   Reusable blocks (DeltaNet, state slots, GNN, etc.)
+  tokenizer/                           #   Code tokenizer
+  utils/                               #   Device & distributed utilities
 experiments/
-  exp0_state_tracking/             #   Exp 0: State tracking (complete, PASS)
-    finish_experiment.py           #     Self-contained training + eval
-    generate_data.py               #     Synthetic execution trace generator
-    evaluate.py                    #     Generalization evaluation (1x-32x)
-    baseline_transformer.py        #     Transformer baselines
-  exp1_thinker/                    #   Exp 1: Full SFM integration
-    train_throughput.py            #     Throughput benchmark script
-scripts/
-  visualize.py                     # Visualization utilities
+  exp0_state_tracking/                 #   Exp 0: State tracking (complete, PASS)
+    finish_experiment.py               #     Self-contained training + eval
+    generate_data.py                   #     Synthetic execution trace generator
+    evaluate.py                        #     Generalization evaluation (1x-32x)
+    baseline_transformer.py            #     Transformer baselines
+  exp1_thinker/                        #   Exp 1: SFM-enhanced LLM training
+    train_throughput.py                #     Throughput benchmark script
+    thinker15b/
+      train.py                         #     Thinker-1.5B DeltaNet SFM fine-tuning
 ```
 
 ## Hardware
