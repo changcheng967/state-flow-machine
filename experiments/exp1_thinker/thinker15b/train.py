@@ -546,50 +546,47 @@ class DeltaNetCell(nn.Cell):
         self.HD = HD
 
     def construct(self, x: Tensor) -> Tensor:
-        """Process sequence through delta rule.
+        """Process sequence through delta rule (parallel scan).
 
         Args:
-            x: (B, S, HIDDEN_DIM) hidden states from transformer layer.
+            x: (B, S, BRIDGE_DIM) hidden states from bridge.
 
         Returns:
             output: (B, S, DELTANET_HIDDEN_DIM) delta net output.
         """
         B, S, _ = x.shape
-        NH = self.NH
-        HD = self.HD
+        D = DELTANET_HIDDEN_DIM
 
-        # Project all positions at once
+        # Project to key, value, beta — all (B, S, D)
         x_f32 = x.astype(ms.float32)
-        K = self.key_proj(x_f32).reshape(B, S, NH, HD).astype(ms.float16)
-        V = self.value_proj(x_f32).reshape(B, S, NH, HD).astype(ms.float16)
-        beta = ops.sigmoid(self.beta_proj(x_f32))          # (B, S, NH)
+        K = self.key_proj(x_f32).astype(ms.float16)   # (B, S, D)
+        V = self.value_proj(x_f32).astype(ms.float16)  # (B, S, D)
+        beta = ops.sigmoid(self.beta_proj(x_f32))      # (B, S, NH)
 
         # Initialize state: broadcast to batch
-        state = ops.broadcast_to(
-            self.initial_state, (B, NH, HD, HD))  # (B, NH, 16, 16)
+        state = ops.Tile()(self.initial_state, (B, 1, 1, 1))  # (B, NH, HD, HD)
 
-        # Sequential scan — this is the core of state tracking.
-        # Transformers CANNOT do this (attention is parallel).
+        # Sequential scan — core of state tracking.
+        # Unrolled via Python for-loop (PyNative traces each iteration).
+        # NOTE: In @ms.jit context this may be traced; if so, S must
+        # be a compile-time constant (which it is for the dummy forward).
         outputs = []
         for t in range(S):
-            kt = K[:, t, :, :, None]   # (B, NH, 16, 1)
-            vt = V[:, t, :, None, :]   # (B, NH, 1, 16)
+            kt = K[:, t, None, :]   # (B, D, 1)
+            vt = V[:, t, None, :]   # (B, D, 1)
             bt = beta[:, t, :, None, None]  # (B, NH, 1, 1)
 
-            # delta rule: S = S - beta * (S @ k - v) @ k^T
-            residual = ops.matmul(state, kt) - vt      # (B, NH, 16, 1)
-            update = bt * ops.matmul(residual, kt.transpose(0, 1, 3, 2))
+            # delta rule with 2D state per head: S = S - beta*(S@k - v)*k^T
+            # state: (B, NH, HD, HD), kt/vt: (B, D, 1) -> project per head
+            k_head = kt.reshape(B, NH, HD, 1)  # (B, NH, HD, 1)
+            v_head = vt.reshape(B, NH, HD, 1)  # (B, NH, HD, 1)
+            residual = ops.matmul(state, k_head) - v_head  # (B, NH, HD, 1)
+            update = bt * ops.matmul(residual, k_head.transpose(0, 1, 3, 2))  # (B, NH, HD, HD)
             state = state - update
 
-            # Read: output = sum of state row norms (aggregate info)
-            out_t = state.reshape(B, NH, HD * HD).mean(axis=-1, keep_dims=True)
-            # Actually, read from state using value as query
-            # out_t = state @ v  -> (B, NH, 16, 1) -> squeeze -> (B, NH)
-            # Better: use last row of state
-            out_t = state[:, :, -1, :]  # (B, NH, 16) = (B, NH, HD)
+            out_t = state[:, :, -1, :]  # (B, NH, HD)
             outputs.append(out_t)
 
-        # Stack: list of (B, NH, HD) -> (S, B, NH, HD) -> (B, S, NH*HD)
         stacked = ops.stack(outputs, axis=0)  # (S, B, NH, HD)
         stacked = stacked.transpose(1, 0, 2, 3)  # (B, S, NH, HD)
         output = stacked.reshape(B, S, NH * HD)   # (B, S, D)
