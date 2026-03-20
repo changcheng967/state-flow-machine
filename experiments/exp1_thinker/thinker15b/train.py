@@ -36,7 +36,7 @@ Infrastructure (from reference train.py):
   - Convergence-based stopping
   - Checkpointing
 
-Self-contained: MindSpore 2.2 + NumPy + stdlib only.
+Self-contained: MindSpore 2.8 + NumPy + stdlib only.
 """
 
 import os
@@ -78,7 +78,10 @@ os.environ.update({
     "ASCEND_GLOBAL_LOG_LEVEL": "3",
     "GLOG_v": "2",
     "HCCL_CONNECT_TIMEOUT": "1800",
-    "MS_COMPILER_OP_LEVEL": "0",
+    # MS 2.8: graph kernel optimizations for Ascend
+    "MS_DEV_GRAPH_KERNEL_FLAGS": "--enable_expand_ops=Split,Tile,"
+                                  "--disable_inline_reducesort,"
+                                  "--enable_parallel_fusion=true",
 })
 
 # ── Paths (c2net + local fallback) ──────────────────────────────────
@@ -273,19 +276,13 @@ print(f"[worker] RANK_ID={os.environ.get('RANK_ID')}, "
 # ── MindSpore imports (AFTER env vars) ───────────────────────────────
 import numpy as np
 import mindspore as ms
-from mindspore import nn, ops
+from mindspore import nn, ops, value_and_grad
 from mindspore.common.tensor import Tensor
 
-# ── MS 2.2 StubTensor patches ────────────────────────────────────────
-# In MS 2.2, cell.set_train(True) triggers "grad metagraph" construction
-# which traces the forward pass with StubTensors (placeholder objects
-# that crash on value access). The DeltaNet's 2048-step sequential scan
-# creates ~8000 StubTensors. These patches make StubTensors return safe
-# defaults so the grad metagraph builder can complete. The actual
-# forward/backward pass uses real tensors with correct shapes/dtypes.
-#
-# Previous run's Dense crash was because stub_sync returned 1D data.
-# Fix: return 2D shapes/data to satisfy Dense's dimension check.
+# ── StubTensor safety net (MS 2.8 compatibility) ────────────────────
+# MS 2.8 uses ms.value_and_grad which avoids StubTensor grad metagraph
+# tracing entirely. However, we keep these patches as a safety net in
+# case any internal MS 2.8 path still triggers StubTensors.
 try:
     from mindspore.common._stub_tensor import StubTensor as _StubTensor
     _orig_dtype_getter = _StubTensor.dtype.fget
@@ -317,8 +314,7 @@ except Exception:
     pass
 
 # Safety net: patch Tensor.astype to survive any remaining StubTensor
-# crashes during grad metagraph tracing. Returns input unchanged on
-# StubTensor errors so tracing can continue.
+# crashes. Returns input unchanged on StubTensor errors.
 try:
     _orig_tensor_astype = Tensor.astype
 
@@ -327,8 +323,8 @@ try:
             return _orig_tensor_astype(self, dtype, *args, **kwargs)
         except RuntimeError as e:
             if "bad optional access" in str(e) or "stub" in str(e).lower():
-                return self  # No-op for StubTensors during tracing
-            raise  # Re-raise non-StubTensor errors
+                return self
+            raise
     Tensor.astype = _safe_tensor_astype
 except Exception:
     pass
@@ -870,52 +866,66 @@ class ForwardLossCell(nn.Cell):
 class TrainStep:
     """Train step — plain Python class, NOT nn.Cell.
 
-    CRITICAL: GradOperation INSIDE nn.Cell.construct triggers MS 2.2's
-    "grad metagraph" builder, which traces the entire forward pass with
-    StubTensors. The DeltaNet's 2048-step sequential scan creates
-    ~8000 StubTensors that crash on ANY value-accessing operation
-    (.dtype, .shape, astype(), Dense(), etc.).
+    MS 2.8 adaptation: Uses ms.value_and_grad instead of ops.GradOperation.
+    value_and_grad uses _pynative_forward_run internally (NOT grad metagraph
+    tracing), so it never creates StubTensors. This is the clean solution
+    that eliminates the entire StubTensor crash cascade.
 
-    By making TrainStep a plain Python class and calling GradOperation
-    from a regular method (not from within construct), MS 2.2 uses the
-    computation graph from the actual forward pass instead of building
-    a separate grad metagraph with StubTensors. This eliminates ALL
-    StubTensor-related crashes.
+    Since value_and_grad doesn't auto-allreduce via DATA_PARALLEL, we
+    add manual ops.AllReduce after gradient computation.
 
     Handles:
       - Gradient clipping (clip by global norm)
       - Two-optimizer support for separate param group LRs
-      - set_train() pass-through to forward_loss
-
-    Note: DATA_PARALLEL with gradients_mean=True auto-allreduces grads
-    via GradOperation. No manual AllReduce needed.
+      - Manual AllReduce for DATA_PARALLEL gradient sync
     """
 
     def __init__(self, forward_loss: ForwardLossCell, optimizer,
-                 optimizer2=None, max_grad_norm: float = 1.0):
+                 optimizer2=None, max_grad_norm: float = 1.0,
+                 rank_size: int = 1):
         self.forward_loss = forward_loss
         self.optimizer = optimizer
         self.optimizer2 = optimizer2
+        self.rank_size = rank_size
         if optimizer2 is not None:
-            self.weights = optimizer.parameters + optimizer2.parameters
+            self.weights = nn.ParameterTuple(
+                optimizer.parameters + optimizer2.parameters)
             self.n_base = len(optimizer.parameters)
         else:
-            self.weights = optimizer.parameters
+            self.weights = nn.ParameterTuple(optimizer.parameters)
             self.n_base = 0
-        self.grad_op = ops.GradOperation(get_by_list=True, sens_param=True)
-        self.sens = Tensor([1.0], ms.float32)
         self.max_grad_norm = max_grad_norm
 
+        # Build value_and_grad function using forward_loss Cell.
+        # grad_position=None: don't differentiate w.r.t. inputs,
+        # only w.r.t. weights. Grad order matches self.weights order.
+        self.grad_fn = value_and_grad(
+            forward_loss,
+            grad_position=None,
+            weights=self.weights,
+            has_aux=False)
+
+        # AllReduce op for DATA_PARALLEL gradient sync
+        if rank_size > 1:
+            self.all_reduce = ops.AllReduce(op=ops.ReduceOp.SUM)
+
     def set_train(self, mode: bool = True) -> None:
-        """Pass-through to forward_loss (no longer a Cell)."""
+        """Pass-through to forward_loss."""
         self.forward_loss.set_train(mode)
 
     def step(self, input_ids: Tensor, loss_mask: Tensor,
              judge_label: Tensor) -> Tensor:
-        """Execute one training step: forward → grad → clip → update."""
-        loss = self.forward_loss(input_ids, loss_mask, judge_label)
-        grads = self.grad_op(self.forward_loss, self.weights)(
-            input_ids, loss_mask, judge_label, self.sens)
+        """Execute one training step: forward → grad → allreduce → clip → update."""
+        # Forward + backward in one call (no StubTensors!)
+        loss, grads = self.grad_fn(input_ids, loss_mask, judge_label)
+
+        # Manual AllReduce for DATA_PARALLEL (value_and_grad doesn't
+        # auto-allreduce like GradOperation with gradients_mean=True)
+        if self.rank_size > 1:
+            grads = tuple(
+                (self.all_reduce(g) / self.rank_size
+                 if g is not None else g)
+                for g in grads)
 
         # Gradient clipping (clip by global norm)
         norm_sq = Tensor(0.0, ms.float32)
@@ -1004,7 +1014,8 @@ def load_qwen_weights(model: Thinker15BModel,
             not_found.append(f"{hf_name} -> {ms_name}")
 
     if param_dict:
-        ms.load_param_into_net(model, param_dict)
+        # MS 2.8: load_param_into_net returns (param_not_load, ckpt_not_load)
+        _unused, _ = ms.load_param_into_net(model, param_dict)
         log(f"Loaded {loaded} Qwen tensors, skipped {len(skipped)} "
             f"(tied lm_head)")
     if not_found:
@@ -1982,6 +1993,7 @@ def main() -> None:
         device_target="Ascend",
         device_id=device_id,
         memory_optimize_level="O1",
+        jit_config={"jit_level": "O1"},
     )
 
     # Data parallel init
@@ -2093,15 +2105,15 @@ def main() -> None:
 
         forward_loss = ForwardLossCell(model, cos_t, sin_t, causal_mask)
         train_step_s1 = TrainStep(forward_loss, optimizer_s1,
-                                   max_grad_norm=MAX_GRAD_NORM)
+                                   max_grad_norm=MAX_GRAD_NORM,
+                                   rank_size=rank_size)
         actual_bs = BATCH_SIZE_PER_DEVICE
         compiled = False
         for bs in [BATCH_SIZE_PER_DEVICE, 1]:
             try:
                 log(f"  Compiling Stage 1 with B={bs}...")
-                # Test forward pass only (TrainStep is not a Cell,
-                # so we compile the forward_loss Cell separately)
-                forward_loss.set_train(True)
+                # Test forward pass only (value_and_grad handles
+                # grad computation without needing set_train)
                 dummy_ids = Tensor(
                     np.random.randint(0, VOCAB_SIZE,
                                      (bs, MAX_SEQ_LEN)).astype(np.int32))
@@ -2130,7 +2142,8 @@ def main() -> None:
                         model, cos_t, sin_t, causal_mask)
                     train_step_s1 = TrainStep(
                         forward_loss, optimizer_s1,
-                        max_grad_norm=MAX_GRAD_NORM)
+                        max_grad_norm=MAX_GRAD_NORM,
+                        rank_size=rank_size)
                     continue
                 raise
 
@@ -2304,7 +2317,7 @@ def main() -> None:
     forward_loss = ForwardLossCell(model, cos_t, sin_t, causal_mask)
     train_step_s2 = TrainStep(
         forward_loss, optimizer_base_s2, optimizer2=optimizer_sfm_s2,
-        max_grad_norm=MAX_GRAD_NORM)
+        max_grad_norm=MAX_GRAD_NORM, rank_size=rank_size)
 
     # Compile with OOM fallback (forward pass only)
     actual_bs = BATCH_SIZE_PER_DEVICE
@@ -2312,7 +2325,6 @@ def main() -> None:
     for bs in [BATCH_SIZE_PER_DEVICE, 1]:
         try:
             log(f"  Compiling Stage 2 with B={bs}...")
-            forward_loss.set_train(True)
             dummy_ids = Tensor(
                 np.random.randint(0, VOCAB_SIZE,
                                  (bs, MAX_SEQ_LEN)).astype(np.int32))
@@ -2346,7 +2358,8 @@ def main() -> None:
                 train_step_s2 = TrainStep(
                     forward_loss, optimizer_base_s2,
                     optimizer2=optimizer_sfm_s2,
-                    max_grad_norm=MAX_GRAD_NORM)
+                    max_grad_norm=MAX_GRAD_NORM,
+                    rank_size=rank_size)
                 continue
             raise
 
