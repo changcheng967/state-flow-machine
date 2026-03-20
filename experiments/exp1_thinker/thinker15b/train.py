@@ -304,36 +304,49 @@ def _hf_to_ms_name(hf_name: str) -> str:
 
 
 def find_model_dir(base_path: str) -> str:
-    """Recursively find the Qwen model directory containing model.safetensors."""
+    """Recursively find the Qwen2.5-Coder-1.5B model directory.
+
+    Prefers a directory containing config.json with num_hidden_layers=28
+    (1.5B model). Falls back to first safetensors dir found.
+    """
+    candidates = []
     for root, dirs, files in os.walk(base_path):
-        for f in files:
-            if f == "model.safetensors" or f == "model.safetensors.index.json":
-                return root
         # Don't recurse too deep
         if root.count(os.sep) - base_path.count(os.sep) > 3:
             dirs.clear()
+            continue
+        has_st = any(f == "model.safetensors" or f.endswith(".safetensors")
+                     for f in files)
+        has_cfg = "config.json" in files
+        if has_st:
+            candidates.append(root)
+            # Check config for 1.5B model (28 layers)
+            if has_cfg:
+                try:
+                    with open(os.path.join(root, "config.json")) as f:
+                        cfg = json.load(f)
+                    if cfg.get("num_hidden_layers") == 28:
+                        return root
+                except Exception:
+                    pass
+
+    # Fallback: return first candidate
+    if candidates:
+        log(f"  WARNING: no 1.5B config found, using first safetensors dir")
+        return candidates[0]
     return ""
 
 
-def load_safetensors(model_dir: str) -> dict:
-    """Load safetensors file and return dict of {name: numpy_array}."""
-    sf_path = os.path.join(model_dir, "model.safetensors")
-    if not os.path.isfile(sf_path):
-        # Try with index
-        idx_path = os.path.join(model_dir, "model.safetensors.index.json")
-        if os.path.isfile(idx_path):
-            with open(idx_path) as f:
-                idx = json.load(f)
-            weight_map = idx.get("weight_map", {})
-            sf_path = os.path.join(model_dir, list(weight_map.values())[0])
-        else:
-            raise FileNotFoundError(
-                f"No model.safetensors in {model_dir}")
-
-    log(f"Loading weights from {sf_path} ...")
-    t0 = time.time()
-
-    # Parse safetensors header manually (no pip install needed)
+def _load_single_safetensors(sf_path: str) -> dict:
+    """Load one safetensors file. Returns {name: np_array}."""
+    dtype_map = {
+        "F32": np.float32,
+        "F16": np.float16,
+        "BF16": np.float16,
+        "I32": np.int32,
+        "I64": np.int64,
+        "BOOL": np.bool_,
+    }
     weights = {}
     with open(sf_path, "rb") as f:
         header_size = struct.unpack("<Q", f.read(8))[0]
@@ -341,16 +354,9 @@ def load_safetensors(model_dir: str) -> dict:
         header = json.loads(header_json)
 
         for name, info in header.items():
+            if not isinstance(info, dict) or "dtype" not in info:
+                continue
             dtype_str = info.get("dtype", "F32")
-            # Map dtype strings to numpy dtypes
-            dtype_map = {
-                "F32": np.float32,
-                "F16": np.float16,
-                "BF16": np.float16,  # Downcast BF16 to FP16 for Ascend
-                "I32": np.int32,
-                "I64": np.int64,
-                "BOOL": np.bool_,
-            }
             np_dtype = dtype_map.get(dtype_str, np.float32)
             shape = tuple(info["shape"])
             data_offsets = info["data_offsets"]
@@ -358,9 +364,40 @@ def load_safetensors(model_dir: str) -> dict:
             nbytes = data_offsets[1] - data_offsets[0]
             data = np.frombuffer(f.read(nbytes), dtype=np_dtype).reshape(shape)
             weights[name] = data.copy()
-
-    log(f"Loaded {len(weights)} tensors in {time.time()-t0:.1f}s")
     return weights
+
+
+def load_safetensors(model_dir: str) -> dict:
+    """Load all safetensors files from model_dir.
+
+    Handles:
+      - Single file: model.safetensors
+      - Sharded: model-00001-of-00004.safetensors (loads all shards)
+      - Index-based: model.safetensors.index.json
+    """
+    # Check for single file
+    single = os.path.join(model_dir, "model.safetensors")
+    if os.path.isfile(single):
+        log(f"Loading weights from {single} ...")
+        t0 = time.time()
+        weights = _load_single_safetensors(single)
+        log(f"Loaded {len(weights)} tensors in {time.time()-t0:.1f}s")
+        return weights
+
+    # Sharded: find all model-*.safetensors files
+    shards = sorted(glob.glob(os.path.join(model_dir,
+                                            "model-*.safetensors")))
+    if shards:
+        log(f"Loading {len(shards)} sharded safetensors files ...")
+        t0 = time.time()
+        all_weights = {}
+        for sf in shards:
+            log(f"  {os.path.basename(sf)} ...")
+            all_weights.update(_load_single_safetensors(sf))
+        log(f"Loaded {len(all_weights)} tensors in {time.time()-t0:.1f}s")
+        return all_weights
+
+    raise FileNotFoundError(f"No safetensors files in {model_dir}")
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -835,6 +872,9 @@ def load_qwen_weights(model: Thinker15BModel,
     log(f"Found Qwen model at: {model_dir}")
     weights = load_safetensors(model_dir)
 
+    # Build parameter name -> param lookup for O(1) matching
+    model_params = {p.name: p for p in model.get_parameters()}
+
     # Build parameter mapping
     param_dict = {}
     loaded = 0
@@ -843,25 +883,12 @@ def load_qwen_weights(model: Thinker15BModel,
 
     for hf_name, array in weights.items():
         ms_name = _hf_to_ms_name(hf_name)
-        if ms_name == "lm_head.weight":
-            # Tied embeddings — skip separate lm_head
+        if ms_name is None or ms_name == "lm_head.weight":
             skipped.append(hf_name)
             continue
 
-        # Map to model parameters
-        param = None
-        for p in model.get_parameters():
-            if p.name == ms_name:
-                param = p
-                break
-
-        if param is not None:
-            # Keep norm weights in FP32; cast everything else to
-            # match the model parameter dtype (FP32 for nn.Dense default)
-            if "norm" in ms_name:
-                param_dict[param.name] = Tensor(array.astype(np.float32))
-            else:
-                param_dict[param.name] = Tensor(array.astype(np.float32))
+        if ms_name in model_params:
+            param_dict[ms_name] = Tensor(array.astype(np.float32))
             loaded += 1
         else:
             not_found.append(f"{hf_name} -> {ms_name}")
@@ -1925,7 +1952,7 @@ def main() -> None:
 
     # Freeze base model parameters
     base_param_names = set()
-    for p in model.parameters():
+    for p in model.get_parameters():
         base_param_names.add(p.name)
         # Only freeze non-SFM parameters
         if not any(key in p.name for key in
@@ -2103,7 +2130,7 @@ def main() -> None:
     log("=" * 60)
 
     # Unfreeze all parameters
-    for p in model.parameters():
+    for p in model.get_parameters():
         p.set_param_ps(True)
         p.requires_grad = True
 
