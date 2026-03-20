@@ -803,11 +803,14 @@ class ForwardLossCell(nn.Cell):
 
 
 class TrainStep(nn.Cell):
-    """Train step with @ms.jit graph compilation.
+    """Train step running in PYNATIVE_MODE (no @ms.jit).
 
-    Gradient clipping is NOT used because MS 2.2's @ms.jit cannot iterate
-    over the gradient tuple with dynamic indices (getitem non-const index).
-    Adam optimizer's adaptive learning rates handle gradient scaling.
+    The 2048-iteration DeltaNet sequential scan (x4 SFM layers) creates
+    ~8000 loop iterations in the compute graph. MS 2.2's graph compiler
+    cannot handle this — it falls back to dynamic tuple indexing which
+    triggers "getitem with non-const index" errors. Running in PYNATIVE
+    avoids graph compilation entirely. The DeltaNet loop is inherently
+    serial anyway, so graph optimization provides no benefit.
     """
 
     def __init__(self, forward_loss: ForwardLossCell, optimizer):
@@ -817,16 +820,14 @@ class TrainStep(nn.Cell):
         self.weights = optimizer.parameters
         self.grad_op = ops.GradOperation(get_by_list=True, sens_param=True)
         self.sens = Tensor([1.0], ms.float32)
-        self.depend = ops.Depend()
 
-    @ms.jit
     def construct(self, input_ids: Tensor, loss_mask: Tensor,
                   judge_label: Tensor) -> Tensor:
         loss = self.forward_loss(input_ids, loss_mask, judge_label)
         grads = self.grad_op(self.forward_loss, self.weights)(
             input_ids, loss_mask, judge_label, self.sens)
-        status = self.optimizer(grads)
-        return self.depend(loss, status)
+        self.optimizer(grads)
+        return loss
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1868,17 +1869,7 @@ def main() -> None:
         device_target="Ascend",
         device_id=device_id,
         memory_optimize_level="O1",
-        max_call_depth=100000,
     )
-
-    # Increase C stack size for deep graph compilation
-    # (DeltaNet 2048-iter loop × 4 SFM layers ≈ 41K call depth)
-    try:
-        import resource
-        resource.setrlimit(resource.RLIMIT_STACK,
-                            (256 * 1024 * 1024, resource.RLIM_INFINITY))
-    except Exception:
-        pass
 
     # Data parallel init
     use_dp = rank_size > 1
