@@ -37,6 +37,12 @@ Infrastructure (from reference train.py):
   - Checkpointing
 
 Self-contained: MindSpore 2.8 + NumPy + stdlib only.
+
+MS 2.8 optimizations applied:
+  - ms.save_checkpoint(format='safetensors', async_save='thread') for all checkpoints
+  - ms.runtime.set_memory(optimize_level='O1') for memory pool optimization
+  - ms.set_device("Ascend", device_id) new recommended device API
+  - ms.device_context.ascend.op_precision.matmul_allow_hf32(True) for DeltaNet speedup
 """
 
 import os
@@ -1988,13 +1994,14 @@ def main() -> None:
     log(f"OUTPUT_PATH:   {OUTPUT_PATH}")
     log("")
 
-    ms.set_context(
-        mode=ms.PYNATIVE_MODE,
-        device_target="Ascend",
-        device_id=device_id,
-        memory_optimize_level="O1",
-        jit_config={"jit_level": "O1"},
-    )
+    # MS 2.8: use dedicated APIs instead of deprecated set_context params
+    ms.set_context(mode=ms.PYNATIVE_MODE)
+    ms.set_device("Ascend", device_id)
+    ms.runtime.set_memory(optimize_level="O1")
+    # HF32 (19-bit) matmul: ~2x faster than FP32 with minimal precision
+    # loss. Critical for DeltaNet 16x16 state matmuls in the sequential
+    # scan loop (2048 iterations x 4 SFM layers per step).
+    ms.device_context.ascend.op_precision.matmul_allow_hf32(True)
 
     # Data parallel init
     use_dp = rank_size > 1
@@ -2210,8 +2217,11 @@ def main() -> None:
                     best_loss = avg_loss
                     if rank_id == 0:
                         ms.save_checkpoint(
-                            model, os.path.join(CKPT_DIR,
-                                                "stage1_best.ckpt"))
+                            model,
+                            os.path.join(CKPT_DIR,
+                                         "stage1_best.safetensors"),
+                            format="safetensors",
+                            async_save="thread")
 
                 # Self-evolution probe
                 if step % EVOLUTION_PROBE_STEPS == 0 and step > 0 \
@@ -2236,8 +2246,11 @@ def main() -> None:
                 # Checkpoint
                 if rank_id == 0 and step % 2000 == 0 and step > 0:
                     ckpt_path = os.path.join(
-                        CKPT_DIR, f"stage1_step_{step}.ckpt")
-                    ms.save_checkpoint(model, ckpt_path)
+                        CKPT_DIR, f"stage1_step_{step}.safetensors")
+                    ms.save_checkpoint(
+                        model, ckpt_path,
+                        format="safetensors",
+                        async_save="thread")
                     log(f"Stage 1 checkpoint: {ckpt_path}")
 
             log(f"Stage 1 complete: {step} steps, "
@@ -2436,7 +2449,10 @@ def main() -> None:
             best_loss = avg_loss
             if rank_id == 0:
                 ms.save_checkpoint(
-                    model, os.path.join(CKPT_DIR, "best.ckpt"))
+                    model,
+                    os.path.join(CKPT_DIR, "best.safetensors"),
+                    format="safetensors",
+                    async_save="thread")
                 log(f"  New best loss: {avg_loss:.4f}")
 
         # Self-evolution: probe + adapt difficulty
@@ -2465,15 +2481,22 @@ def main() -> None:
         # Periodic checkpoint (best already saved above on improvement)
         if rank_id == 0 and step % 2000 == 0 and step > 0:
             ckpt_path = os.path.join(
-                CKPT_DIR, f"stage2_step_{step}.ckpt")
-            ms.save_checkpoint(model, ckpt_path)
+                CKPT_DIR, f"stage2_step_{step}.safetensors")
+            ms.save_checkpoint(
+                model, ckpt_path,
+                format="safetensors",
+                async_save="thread")
             log(f"Stage 2 checkpoint: {ckpt_path}")
 
     # ── Training complete ──
     elapsed_total = time.time() - t0_global
 
     if rank_id == 0:
-        ms.save_checkpoint(model, os.path.join(CKPT_DIR, "final.ckpt"))
+        ms.save_checkpoint(
+            model,
+            os.path.join(CKPT_DIR, "final.safetensors"),
+            format="safetensors",
+            async_save="thread")
         log("Final checkpoint saved")
 
     results = {
