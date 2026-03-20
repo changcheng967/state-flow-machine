@@ -548,7 +548,12 @@ class DeltaNetCell(nn.Cell):
         self.HD = HD
 
     def construct(self, x: Tensor) -> Tensor:
-        """Process sequence through delta rule (parallel scan).
+        """Process sequence through delta rule (sequential scan).
+
+        Uses Python for-loop which MS 2.2 @ms.jit unrolls during graph
+        compilation. max_call_depth=100000 is set in ms.set_context() to
+        handle the 2048 iterations × 4 SFM layers. Compilation is slow
+        (~10-30 min) but the resulting graph runs efficiently.
 
         Args:
             x: (B, S, BRIDGE_DIM) hidden states from bridge.
@@ -571,24 +576,21 @@ class DeltaNetCell(nn.Cell):
         state = ops.Tile()(self.initial_state, (B, 1, 1, 1)).astype(ms.float16)  # (B, NH, HD, HD)
 
         # Sequential scan — core of state tracking.
-        # Runs in PyNative (no @ms.jit) to avoid call depth limit.
-        # Each iteration: 16x16 matmuls × 16 heads = O(4096) FLOPs.
-        outputs = []
+        outputs = ()
         for t in range(S):
             kt = K[:, t, None, :]   # (B, D, 1)
             vt = V[:, t, None, :]   # (B, D, 1)
             bt = beta[:, t, :, None, None]  # (B, NH, 1, 1)
 
-            # delta rule with 2D state per head: S = S - beta*(S@k - v)*k^T
-            # state: (B, NH, HD, HD), kt/vt: (B, D, 1) -> project per head
+            # delta rule: S = S - beta*(S@k - v)*k^T
             k_head = kt.reshape(B, NH, HD, 1)  # (B, NH, HD, 1)
             v_head = vt.reshape(B, NH, HD, 1)  # (B, NH, HD, 1)
-            residual = ops.matmul(state, k_head) - v_head  # (B, NH, HD, 1)
-            update = bt * ops.matmul(residual, k_head.transpose(0, 1, 3, 2))  # (B, NH, HD, HD)
+            residual = ops.matmul(state, k_head) - v_head
+            update = bt * ops.matmul(residual, k_head.transpose(0, 1, 3, 2))
             state = state - update
 
             out_t = state[:, :, -1, :]  # (B, NH, HD)
-            outputs.append(out_t)
+            outputs = outputs + (out_t,)
 
         stacked = ops.stack(outputs, axis=0)  # (S, B, NH, HD)
         stacked = stacked.transpose(1, 0, 2, 3)  # (B, S, NH, HD)
