@@ -276,39 +276,14 @@ import mindspore as ms
 from mindspore import nn, ops
 from mindspore.common.tensor import Tensor
 
-# ── MS 2.2 StubTensor bug workaround ─────────────────────────────────
-# In PYNATIVE_MODE, GradOperation tracing replaces intermediate tensors
-# with StubTensors. Accessing .dtype or .shape on an uninitialized
-# StubTensor crashes with "bad optional access". This monkey-patch
-# makes .dtype, .shape, and stub_sync() fall back to safe defaults.
-# During GradOperation tracing, MS 2.2 creates StubTensors for
-# intermediate values. Any operation that needs the actual value
-# (astype, arithmetic, Tensor()) calls stub_sync() which crashes.
-try:
-    from mindspore.common._stub_tensor import StubTensor as _StubTensor
-    _orig_dtype_getter = _StubTensor.dtype.fget
-    _orig_shape_getter = _StubTensor.shape.fget
-    _orig_stub_sync = _StubTensor.stub_sync
-    def _safe_dtype(self):
-        try:
-            return _orig_dtype_getter(self)
-        except (RuntimeError, ValueError):
-            return ms.float32
-    def _safe_shape(self):
-        try:
-            return _orig_shape_getter(self)
-        except (RuntimeError, ValueError):
-            return (1,)
-    def _safe_stub_sync(self):
-        try:
-            return _orig_stub_sync(self)
-        except (RuntimeError, ValueError):
-            return np.zeros(1, dtype=np.float32)
-    _StubTensor.dtype = property(_safe_dtype)
-    _StubTensor.shape = property(_safe_shape)
-    _StubTensor.stub_sync = _safe_stub_sync
-except Exception:
-    pass
+# ── MS 2.2 StubTensor note ────────────────────────────────────────────
+# GradOperation INSIDE nn.Cell.construct triggers MS 2.2's "grad
+# metagraph" builder, which traces the forward pass with StubTensors.
+# The DeltaNet's 2048-step sequential scan creates ~8000 StubTensors
+# that crash on any value-accessing operation. SOLUTION: TrainStep is
+# a plain Python class (NOT nn.Cell), so GradOperation uses the actual
+# computation graph instead of building a StubTensor grad metagraph.
+# No monkey-patching needed.
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -514,10 +489,7 @@ class TransformerBlock(nn.Cell):
 
     def construct(self, x: Tensor, cos: Tensor, sin: Tensor,
                   mask: Tensor) -> Tensor:
-        try:
-            B, S, _ = x.shape
-        except (ValueError, IndexError, RuntimeError):
-            return x  # StubTensor during GradOperation tracing
+        B, S, _ = x.shape
         NH = NUM_HEADS
         NKV = NUM_KV_HEADS
         HD = HEAD_DIM
@@ -607,10 +579,7 @@ class DeltaNetCell(nn.Cell):
         Returns:
             output: (B, S, DELTANET_HIDDEN_DIM) delta net output.
         """
-        try:
-            B, S, _ = x.shape
-        except (ValueError, IndexError, RuntimeError):
-            return x  # StubTensor during GradOperation tracing
+        B, S, _ = x.shape
         D = DELTANET_HIDDEN_DIM
         NH = self.NH
         HD = self.HD
@@ -850,24 +819,32 @@ class ForwardLossCell(nn.Cell):
         return total
 
 
-class TrainStep(nn.Cell):
-    """Train step running in PYNATIVE_MODE (no @ms.jit).
+class TrainStep:
+    """Train step — plain Python class, NOT nn.Cell.
+
+    CRITICAL: GradOperation INSIDE nn.Cell.construct triggers MS 2.2's
+    "grad metagraph" builder, which traces the entire forward pass with
+    StubTensors. The DeltaNet's 2048-step sequential scan creates
+    ~8000 StubTensors that crash on ANY value-accessing operation
+    (.dtype, .shape, astype(), Dense(), etc.).
+
+    By making TrainStep a plain Python class and calling GradOperation
+    from a regular method (not from within construct), MS 2.2 uses the
+    computation graph from the actual forward pass instead of building
+    a separate grad metagraph with StubTensors. This eliminates ALL
+    StubTensor-related crashes.
 
     Handles:
       - Gradient clipping (clip by global norm)
-      - Optional two-optimizer support for separate param group LRs
+      - Two-optimizer support for separate param group LRs
+      - set_train() pass-through to forward_loss
 
     Note: DATA_PARALLEL with gradients_mean=True auto-allreduces grads
     via GradOperation. No manual AllReduce needed.
-
-    The 2048-iteration DeltaNet sequential scan (x4 SFM layers) creates
-    ~8000 loop iterations in the compute graph. MS 2.2's graph compiler
-    cannot handle this. Running in PYNATIVE avoids graph compilation.
     """
 
     def __init__(self, forward_loss: ForwardLossCell, optimizer,
                  optimizer2=None, max_grad_norm: float = 1.0):
-        super().__init__()
         self.forward_loss = forward_loss
         self.optimizer = optimizer
         self.optimizer2 = optimizer2
@@ -881,30 +858,32 @@ class TrainStep(nn.Cell):
         self.sens = Tensor([1.0], ms.float32)
         self.max_grad_norm = max_grad_norm
 
-    def construct(self, input_ids: Tensor, loss_mask: Tensor,
-                  judge_label: Tensor) -> Tensor:
+    def set_train(self, mode: bool = True) -> None:
+        """Pass-through to forward_loss (no longer a Cell)."""
+        self.forward_loss.set_train(mode)
+
+    def step(self, input_ids: Tensor, loss_mask: Tensor,
+             judge_label: Tensor) -> Tensor:
+        """Execute one training step: forward → grad → clip → update."""
         loss = self.forward_loss(input_ids, loss_mask, judge_label)
         grads = self.grad_op(self.forward_loss, self.weights)(
             input_ids, loss_mask, judge_label, self.sens)
 
         # Gradient clipping (clip by global norm)
-        try:
-            norm_sq = Tensor(0.0, ms.float32)
-            for g in grads:
-                if g is not None:
-                    norm_sq = norm_sq + ops.reduce_sum(
-                        ops.square(g.astype(ms.float32)))
-            global_norm = ops.sqrt(norm_sq)
-            clip_coef = ops.minimum(
-                Tensor(1.0, ms.float32),
-                Tensor(self.max_grad_norm, ms.float32) /
-                ops.maximum(global_norm, Tensor(1e-6, ms.float32)))
-            grads = tuple(
-                (g.astype(ms.float32) * clip_coef
-                 if g is not None else g)
-                for g in grads)
-        except Exception:
-            pass  # Skip clipping if StubTensor issues
+        norm_sq = Tensor(0.0, ms.float32)
+        for g in grads:
+            if g is not None:
+                norm_sq = norm_sq + ops.reduce_sum(
+                    ops.square(g.astype(ms.float32)))
+        global_norm = ops.sqrt(norm_sq)
+        clip_coef = ops.minimum(
+            Tensor(1.0, ms.float32),
+            Tensor(self.max_grad_norm, ms.float32) /
+            ops.maximum(global_norm, Tensor(1e-6, ms.float32)))
+        grads = tuple(
+            (g.astype(ms.float32) * clip_coef
+             if g is not None else g)
+            for g in grads)
 
         # Apply optimizer(s)
         if self.optimizer2 is not None:
@@ -2072,7 +2051,9 @@ def main() -> None:
         for bs in [BATCH_SIZE_PER_DEVICE, 1]:
             try:
                 log(f"  Compiling Stage 1 with B={bs}...")
-                train_step_s1.set_train()
+                # Test forward pass only (TrainStep is not a Cell,
+                # so we compile the forward_loss Cell separately)
+                forward_loss.set_train(True)
                 dummy_ids = Tensor(
                     np.random.randint(0, VOCAB_SIZE,
                                      (bs, MAX_SEQ_LEN)).astype(np.int32))
@@ -2081,8 +2062,8 @@ def main() -> None:
                 dummy_mask[0, 0] = 0.0
                 dummy_judge = Tensor(
                     np.ones(bs, dtype=np.int32))
-                _ = train_step_s1(dummy_ids, dummy_mask, dummy_judge)
-                log(f"  B={bs} compilation OK")
+                _ = forward_loss(dummy_ids, dummy_mask, dummy_judge)
+                log(f"  B={bs} forward compilation OK")
                 actual_bs = bs
                 compiled = True
                 break
@@ -2152,7 +2133,7 @@ def main() -> None:
                         np.array(batch_judges, dtype=np.int32))
 
                     try:
-                        loss_val = train_step_s1(
+                        loss_val = train_step_s1.step(
                             ids_t, mask_t, judge_t)
                         accum_loss += float(loss_val.asnumpy())
                     except RuntimeError as e:
@@ -2277,13 +2258,13 @@ def main() -> None:
         forward_loss, optimizer_base_s2, optimizer2=optimizer_sfm_s2,
         max_grad_norm=MAX_GRAD_NORM)
 
-    # Compile with OOM fallback
+    # Compile with OOM fallback (forward pass only)
     actual_bs = BATCH_SIZE_PER_DEVICE
     compiled = False
     for bs in [BATCH_SIZE_PER_DEVICE, 1]:
         try:
             log(f"  Compiling Stage 2 with B={bs}...")
-            train_step_s2.set_train()
+            forward_loss.set_train(True)
             dummy_ids = Tensor(
                 np.random.randint(0, VOCAB_SIZE,
                                  (bs, MAX_SEQ_LEN)).astype(np.int32))
@@ -2292,8 +2273,8 @@ def main() -> None:
             dummy_mask[0, 0] = 0.0
             dummy_judge = Tensor(
                 np.ones(bs, dtype=np.int32))
-            _ = train_step_s2(dummy_ids, dummy_mask, dummy_judge)
-            log(f"  B={bs} compilation OK")
+            _ = forward_loss(dummy_ids, dummy_mask, dummy_judge)
+            log(f"  B={bs} forward compilation OK")
             actual_bs = bs
             compiled = True
             break
@@ -2377,7 +2358,7 @@ def main() -> None:
             judge_t = Tensor(np.array(batch_judges, dtype=np.int32))
 
             try:
-                loss_val = train_step_s2(ids_t, mask_t, judge_t)
+                loss_val = train_step_s2.step(ids_t, mask_t, judge_t)
                 accum_loss += float(loss_val.asnumpy())
                 total_samples += len(batch_ids)
             except RuntimeError as e:
