@@ -469,7 +469,6 @@ class TransformerBlock(nn.Cell):
         self.tile = ops.Tile()
         self.softmax = ops.Softmax(axis=-1)
 
-    @ms.jit
     def construct(self, x: Tensor, cos: Tensor, sin: Tensor,
                   mask: Tensor) -> Tensor:
         B, S, _ = x.shape
@@ -614,7 +613,6 @@ class CrossSystemBridge(nn.Cell):
             Tensor(np.array([0.0], dtype=np.float32)), name="bridge_gate")
         self.layer_norm = RMSNorm(HIDDEN_DIM)
 
-    @ms.jit
     def construct(self, hidden: Tensor, sfm_out: Tensor) -> Tensor:
         """Merge transformer hidden with SFM output."""
         sfm_up = self.up_proj(sfm_out.astype(ms.float32)).astype(ms.float16)
@@ -822,10 +820,10 @@ class TrainStep(nn.Cell):
         self.sqrt = ops.Sqrt()
         self.minimum = ops.Minimum()
 
-    # NOTE: No @ms.jit here! The DeltaNet sequential scan (S=2048 × 4 layers)
-    # exceeds MS 2.2's call depth limit (1000) when graph-compiled. Instead,
-    # individual loop-free sub-cells (TransformerBlock, CrossSystemBridge)
-    # are @ms.jit-decorated, and the gradient step runs in PyNative mode.
+    # @ms.jit compiles the full forward+backward into one graph.
+    # max_call_depth=100000 is set in ms.set_context() to handle the
+    # DeltaNet sequential scan (S=2048 × 4 layers ≈ 41K call depth).
+    @ms.jit
     def construct(self, input_ids: Tensor, loss_mask: Tensor,
                   judge_label: Tensor) -> Tensor:
         loss = self.forward_loss(input_ids, loss_mask, judge_label)
@@ -1880,7 +1878,17 @@ def main() -> None:
         device_target="Ascend",
         device_id=device_id,
         memory_optimize_level="O1",
+        max_call_depth=100000,
     )
+
+    # Increase C stack size for deep graph compilation
+    # (DeltaNet 2048-iter loop × 4 SFM layers ≈ 41K call depth)
+    try:
+        import resource
+        resource.setrlimit(resource.RLIMIT_STACK,
+                            (256 * 1024 * 1024, resource.RLIM_INFINITY))
+    except Exception:
+        pass
 
     # Data parallel init
     use_dp = rank_size > 1
