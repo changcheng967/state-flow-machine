@@ -368,16 +368,17 @@ def load_safetensors(model_dir: str) -> dict:
 # ══════════════════════════════════════════════════════════════════════
 
 
-def _fp16_dense(in_ch: int, out_ch: int,
+def _make_dense(in_ch: int, out_ch: int,
                 has_bias: bool = False) -> nn.Dense:
-    """Create nn.Dense with FP16 parameters."""
-    w = np.random.randn(out_ch, in_ch).astype(np.float16) * (
-        1.0 / np.sqrt(in_ch))
-    dense = nn.Dense(in_ch, out_ch, has_bias=has_bias)
-    dense.weight.set_data(Tensor(w))
-    if has_bias:
-        dense.bias.set_data(Tensor(np.zeros(out_ch, dtype=np.float16)))
-    return dense
+    """Create nn.Dense with Kaiming-like init (FP32 internally).
+
+    MindSpore 2.2 nn.Dense creates FP32 params internally.
+    Weights get overwritten by load_param_into_net() with FP16
+    safetensors data, so init dtype doesn't matter for Qwen layers.
+    For SFM layers (no pretrained weights), the construct path
+    casts inputs to FP16 so FP32 params work fine with matmul.
+    """
+    return nn.Dense(in_ch, out_ch, has_bias=has_bias)
 
 
 class RMSNorm(nn.Cell):
@@ -415,16 +416,16 @@ class TransformerBlock(nn.Cell):
         A = INTERMEDIATE_DIM
 
         # Q/K/V have bias, O does not (matching Qwen2.5-Coder-1.5B)
-        self.q_proj = _fp16_dense(H, NH * HD, has_bias=True)
-        self.k_proj = _fp16_dense(H, NKV * HD, has_bias=True)
-        self.v_proj = _fp16_dense(H, NKV * HD, has_bias=True)
-        self.o_proj = _fp16_dense(NH * HD, H, has_bias=False)
+        self.q_proj = _make_dense(H, NH * HD, has_bias=True)
+        self.k_proj = _make_dense(H, NKV * HD, has_bias=True)
+        self.v_proj = _make_dense(H, NKV * HD, has_bias=True)
+        self.o_proj = _make_dense(NH * HD, H, has_bias=False)
         self.input_norm = RMSNorm(H)
 
         # MLP: no bias on any projection
-        self.gate_proj = _fp16_dense(H, A, has_bias=False)
-        self.up_proj = _fp16_dense(H, A, has_bias=False)
-        self.down_proj = _fp16_dense(A, H, has_bias=False)
+        self.gate_proj = _make_dense(H, A, has_bias=False)
+        self.up_proj = _make_dense(H, A, has_bias=False)
+        self.down_proj = _make_dense(A, H, has_bias=False)
         self.ffn_norm = RMSNorm(H)
 
         self.scale = Tensor(HD ** -0.5, ms.float16)
@@ -492,9 +493,9 @@ class DeltaNetCell(nn.Cell):
         HD = DELTANET_HEAD_DIM  # 16
 
         # Project input to key, value, beta
-        self.key_proj = _fp16_dense(HIDDEN_DIM, D, has_bias=False)
-        self.value_proj = _fp16_dense(HIDDEN_DIM, D, has_bias=False)
-        self.beta_proj = _fp16_dense(HIDDEN_DIM, NH, has_bias=True)
+        self.key_proj = _make_dense(HIDDEN_DIM, D, has_bias=False)
+        self.value_proj = _make_dense(HIDDEN_DIM, D, has_bias=False)
+        self.beta_proj = _make_dense(HIDDEN_DIM, NH, has_bias=True)
 
         # Initial state (one per head: 16x16 identity matrix)
         init_states = np.zeros(NH, HD, HD, dtype=np.float16)
@@ -567,8 +568,8 @@ class CrossSystemBridge(nn.Cell):
 
     def __init__(self) -> None:
         super().__init__()
-        self.down_proj = _fp16_dense(HIDDEN_DIM, BRIDGE_DIM, has_bias=True)
-        self.up_proj = _fp16_dense(BRIDGE_DIM, HIDDEN_DIM, has_bias=True)
+        self.down_proj = _make_dense(HIDDEN_DIM, BRIDGE_DIM, has_bias=True)
+        self.up_proj = _make_dense(BRIDGE_DIM, HIDDEN_DIM, has_bias=True)
         self.gate_param = ms.Parameter(
             Tensor(np.array([0.0], dtype=np.float32)), name="bridge_gate")
         self.layer_norm = RMSNorm(HIDDEN_DIM)
@@ -596,8 +597,8 @@ class JudgeHead(nn.Cell):
 
     def __init__(self) -> None:
         super().__init__()
-        self.proj1 = _fp16_dense(HIDDEN_DIM, JUDGE_HIDDEN_DIM, has_bias=True)
-        self.proj2 = _fp16_dense(JUDGE_HIDDEN_DIM, 2, has_bias=True)
+        self.proj1 = _make_dense(HIDDEN_DIM, JUDGE_HIDDEN_DIM, has_bias=True)
+        self.proj2 = _make_dense(JUDGE_HIDDEN_DIM, 2, has_bias=True)
 
     def construct(self, x: Tensor) -> Tensor:
         """Returns (B, 2) logits for judge classification."""
@@ -615,8 +616,8 @@ class SurprisePredictor(nn.Cell):
 
     def __init__(self) -> None:
         super().__init__()
-        self.proj1 = _fp16_dense(HIDDEN_DIM, SURPRISE_DIM, has_bias=True)
-        self.proj2 = _fp16_dense(SURPRISE_DIM, 1, has_bias=True)
+        self.proj1 = _make_dense(HIDDEN_DIM, SURPRISE_DIM, has_bias=True)
+        self.proj2 = _make_dense(SURPRISE_DIM, 1, has_bias=True)
 
     def construct(self, x: Tensor) -> Tensor:
         """Returns (B, 1) surprise score."""
@@ -855,12 +856,12 @@ def load_qwen_weights(model: Thinker15BModel,
                 break
 
         if param is not None:
-            # Handle dtype conversion
-            if array.dtype == np.float32 and "norm" in ms_name:
-                # Keep norm weights in FP32
-                param_dict[param.name] = Tensor(array)
+            # Keep norm weights in FP32; cast everything else to
+            # match the model parameter dtype (FP32 for nn.Dense default)
+            if "norm" in ms_name:
+                param_dict[param.name] = Tensor(array.astype(np.float32))
             else:
-                param_dict[param.name] = Tensor(array.astype(np.float16))
+                param_dict[param.name] = Tensor(array.astype(np.float32))
             loaded += 1
         else:
             not_found.append(f"{hf_name} -> {ms_name}")
