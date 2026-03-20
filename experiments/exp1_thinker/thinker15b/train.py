@@ -530,9 +530,10 @@ class DeltaNetCell(nn.Cell):
         HD = DELTANET_HEAD_DIM  # 16
 
         # Project input to key, value, beta
-        self.key_proj = _make_dense(HIDDEN_DIM, D, has_bias=False)
-        self.value_proj = _make_dense(HIDDEN_DIM, D, has_bias=False)
-        self.beta_proj = _make_dense(HIDDEN_DIM, NH, has_bias=True)
+        # Input comes from bridge down_proj: BRIDGE_DIM -> here
+        self.key_proj = _make_dense(BRIDGE_DIM, D, has_bias=False)
+        self.value_proj = _make_dense(BRIDGE_DIM, D, has_bias=False)
+        self.beta_proj = _make_dense(BRIDGE_DIM, NH, has_bias=True)
 
         # Initial state (one per head: 16x16 identity matrix)
         init_states = np.zeros((NH, HD, HD), dtype=np.float16)
