@@ -1,35 +1,84 @@
 """test_image.py — Verify OpenI custom image works for training.
 
-Tests (in order, stops on first failure):
-  1. MindSpore import + version + NPU detection
-  2. Basic tensor ops (matmul, cast, reduce, etc.)
-  3. nn.Dense, nn.Embedding, nn.Cell
-  4. @ms.jit compilation (simple function)
-  5. ops.GradOperation + gradient computation
-  6. nn.AdamWeightDecay optimizer
-  7. nn.ClipByGlobalNorm (MS 2.7 should have this)
-  8. ops.ForiLoop / ops.WhileLoop (MS 2.4+ feature)
-  9. DeltaNet cell forward pass (FP16 matmuls)
-  10. DeltaNet @ms.jit compilation
-  11. Mini training step (forward + backward + optimizer)
+Tests (in order, continues on failure):
+  1. Python version
+  2. c2net path discovery
+  3. MindSpore import + version
+  4. NPU detection
+  5. Basic tensor ops
+  6. nn.Dense + nn.Embedding
+  7. @ms.jit compilation
+  8. GradOperation
+  9. AdamWeightDecay
+  10. ClipByGlobalNorm
+  11. ForiLoop / WhileLoop
+  12. Mini DeltaNet forward
+  13. DeltaNet @ms.jit
+  14. Mini training step
 
-Writes results to /cache/output/test_result.log and test_result.json.
-
-Run: python test_image.py
+Writes results to OUTPUT_PATH/test_result.log and test_result.json.
 """
+
+# ═══════════════════════════════════════════════════════════════════
+# BOOT LOG — write IMMEDIATELY before anything can fail
+# ═══════════════════════════════════════════════════════════════════
+
+def _boot_log(msg: str) -> None:
+    """Write to stdout + error.log BEFORE any imports can fail."""
+    ts = time.strftime("%H:%M:%S")
+    line = f"[{ts}] {msg}"
+    print(line, flush=True)
+    for d in ["/cache/output"]:
+        try:
+            import os
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, "test_result.log"), "a") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
 
 import sys
 import os
 import json
 import time
 
-# ── Logging: write to both stdout and /cache/output/test_result.log ──
+_boot_ts = time.strftime("%H:%M:%S")
+_boot_pid = os.getpid()
+_boot_rank = os.environ.get("RANK_ID", "?")
+_boot_log(f"test_image started pid={_boot_pid} rank={_boot_rank} python={sys.version.split()[0]}")
+
+# ═══════════════════════════════════════════════════════════════════
+# PATH DISCOVERY — c2net + fallbacks
+# ═══════════════════════════════════════════════════════════════════
+
+OUTPUT_PATH = "/cache/output"
+DATASET_PATH = "/cache/dataset"
+PRETRAIN_PATH = "/cache/pretrainmodel"
+CODE_PATH = "/cache/code"
+
+try:
+    from c2net.context import prepare, upload_output
+    _ctx = prepare()
+    OUTPUT_PATH = _ctx.output_path
+    DATASET_PATH = _ctx.dataset_path
+    PRETRAIN_PATH = _ctx.pretrain_model_path
+    CODE_PATH = _ctx.code_path
+    _boot_log(f"c2net OK: out={OUTPUT_PATH} data={DATASET_PATH} pre={PRETRAIN_PATH}")
+except Exception as e:
+    _boot_log(f"c2net not available ({e}), using default paths")
+
+os.makedirs(OUTPUT_PATH, exist_ok=True)
+
+# ═══════════════════════════════════════════════════════════════════
+# LOGGING
+# ═══════════════════════════════════════════════════════════════════
+
 _log_fh = None
 
 def log(msg: str) -> None:
     ts = time.strftime("%H:%M:%S")
     line = f"[{ts}] {msg}"
-    log(line, flush=True)
+    print(line, flush=True)
     if _log_fh is not None:
         _log_fh.write(line + "\n")
         _log_fh.flush()
@@ -37,20 +86,32 @@ def log(msg: str) -> None:
 
 def setup_log() -> None:
     global _log_fh
-    out_dir = os.environ.get("OUTPUT_PATH", "/cache/output")
-    os.makedirs(out_dir, exist_ok=True)
-    log_path = os.path.join(out_dir, "test_result.log")
+    log_path = os.path.join(OUTPUT_PATH, "test_result.log")
     _log_fh = open(log_path, "w")
     log(f"Log file: {log_path}")
+    log(f"OUTPUT_PATH: {OUTPUT_PATH}")
+    log(f"DATASET_PATH: {DATASET_PATH}")
+    log(f"PRETRAIN_PATH: {PRETRAIN_PATH}")
+    log(f"CODE_PATH: {CODE_PATH}")
+    log(f"RANK_ID: {_boot_rank}")
+    log(f"PID: {_boot_pid}")
+    log(f"Python: {sys.version}")
+    log(f"CWD: {os.getcwd()}")
 
+setup_log()
+
+# ═══════════════════════════════════════════════════════════════════
+# TEST FRAMEWORK
+# ═══════════════════════════════════════════════════════════════════
 
 passed = 0
 failed = 0
 errors = []
-results = {}  # {test_name: {"status": "pass/fail", "detail": ..., "time": ...}}
+results = {}
+
 
 def check(name: str, fn, *args, **kwargs):
-    """Run a check, report pass/fail."""
+    """Run a check, report pass/fail, always continue."""
     global passed, failed
     log(f"\n{'='*60}")
     log(f"TEST: {name}")
@@ -73,65 +134,62 @@ def check(name: str, fn, *args, **kwargs):
         results[name] = {"status": "fail", "detail": f"{type(e).__name__}: {e}", "time": round(dt, 2)}
         return None
 
-# ── 0. Setup logging ──────────────────────────────────────────────
-setup_log()
+
+# ═══════════════════════════════════════════════════════════════════
+# TESTS
+# ═══════════════════════════════════════════════════════════════════
 
 # ── 1. MindSpore import + version ─────────────────────────────────
-log("=" * 60)
+log(f"\n{'='*60}")
 log("OpenI Custom Image Test")
-log("=" * 60)
+log(f"{'='*60}")
 
-# Suppress warnings
-os.environ["GLOG_v"] = "2"
+ms_ver = "?"
+try:
+    import mindspore as ms
+    from mindspore import nn, ops, Tensor
+    ms_ver = ms.__version__
+    check(f"MindSpore version: {ms_ver}", lambda: ms_ver)
+except Exception as e:
+    check("Import MindSpore", lambda: (_ for _ in ()).throw(e))
+    log(f"FATAL: Cannot import MindSpore: {e}")
+    # Write error and exit
+    summary = {"passed": 0, "failed": 1, "total": 1, "all_passed": False,
+                "error": f"Cannot import MindSpore: {e}"}
+    with open(os.path.join(OUTPUT_PATH, "test_result.json"), "w") as f:
+        json.dump(summary, f, indent=2)
+    log("EXITING — MindSpore not available")
+    sys.exit(1)
 
-check("Import MindSpore", lambda: __import__("mindspore"))
-
-import mindspore as ms
-from mindspore import nn, ops, Tensor
 import numpy as np
-
-ms_ver = ms.__version__
-check(f"MindSpore version: {ms_ver}", lambda: ms_ver)
-
-ms_major = int(ms_ver.split(".")[0])
-ms_minor = int(ms_ver.split(".")[1])
 
 # ── 2. NPU detection ───────────────────────────────────────────────
 def test_npu():
     try:
-        ms.set_context(device_target="Ascend", device_id=0)
-        # Check if NPU is actually available by running a simple op
+        device_id = int(os.environ.get("DEVICE_ID", "0"))
+        ms.set_context(device_target="Ascend", device_id=device_id)
         x = Tensor(np.ones((2, 3), dtype=np.float32))
         y = ops.matmul(x, x.transpose(1, 0))
-        return f"Ascend NPU OK, matmul(2x3) shape={y.shape}"
+        return f"Ascend NPU OK, device_id={device_id}, matmul shape={y.shape}"
     except Exception as e:
-        return f"Ascend NPU FAILED: {e}"
+        return f"FAILED: {e}"
 
 check("NPU availability", test_npu)
 
 # ── 3. Basic tensor ops ────────────────────────────────────────────
 def test_tensor_ops():
-    # FP16 matmul
     a = Tensor(np.random.randn(2, 4, 8).astype(np.float16))
     b = Tensor(np.random.randn(2, 8, 4).astype(np.float16))
     c = ops.matmul(a, b)
-    # FP32 matmul
     d = a.astype(ms.float32)
     e = b.astype(ms.float32)
     f = ops.matmul(d, e)
-    # Cast
     g = f.astype(ms.float16)
-    # Reduce
     h = ops.reduce_sum(g)
-    # Reshape
     i = g.reshape(2, 8, 2)
-    # Tile
     j = ops.Tile()(a, (2, 1, 1))
-    # Stack
     k = ops.stack([a, b], axis=0)
-    # Sigmoid
     l = ops.sigmoid(Tensor(np.array([-1.0, 0.0, 1.0], dtype=np.float32)))
-    # Softmax
     m = ops.Softmax(axis=-1)(Tensor(np.random.randn(2, 4), dtype=np.float32))
     return "All tensor ops OK"
 
@@ -149,13 +207,12 @@ def test_nn_layers():
     e = emb(ids)
     assert e.shape == (4, 10, 128), f"Expected (4, 10, 128), got {e.shape}"
 
-    # MatMul with transpose
     mm = ops.MatMul(transpose_b=True)
     w = Tensor(np.random.randn(128, 64), dtype=np.float32)
     logits = mm(y, w)
     assert logits.shape == (4, 64), f"Expected (4, 64), got {logits.shape}"
 
-    return f"Dense(128→64), Embedding(1000,128), MatMul OK"
+    return f"Dense(128->64), Embedding(1000,128), MatMul OK"
 
 check("nn.Dense + nn.Embedding + MatMul", test_nn_layers)
 
@@ -198,7 +255,7 @@ def test_grad():
     x = Tensor(np.random.randn(4, 16), dtype=np.float32)
     y, grads = cell(x)
     assert y.shape == (4, 8)
-    assert len(grads) == 2  # weight + bias
+    assert len(grads) == 2
     return f"GradOperation OK, {len(grads)} grads, shapes={[g.shape for g in grads]}"
 
 check("ops.GradOperation (forward + backward)", test_grad)
@@ -209,10 +266,8 @@ def test_optimizer():
     params = net.trainable_params()
     lr = Tensor([0.001], ms.float32)
     opt = nn.AdamWeightDecay(params, learning_rate=lr)
-    # Try optimizer step
     grads = [Tensor(np.random.randn(*p.shape), dtype=ms.float32)
               for p in params]
-    # MS 2.7 optimizer expects a tuple
     opt(tuple(grads))
     return f"AdamWeightDecay OK, {len(params)} params"
 
@@ -225,12 +280,9 @@ def test_clip():
         g1 = Tensor(np.random.randn(4, 8), dtype=np.float32) * 10
         g2 = Tensor(np.random.randn(4, 8), dtype=np.float32) * 10
         clipped, norm = clip((g1, g2))
-        return f"ClipByGlobalNorm EXISTS, norm={float(norm):.4f}"
+        return f"ClipByGlobalNorm EXISTS & WORKS, norm={float(norm):.4f}"
     else:
-        # Try ops-based approach
-        if hasattr(ops, 'clip_by_global_norm'):
-            return "nn.ClipByGlobalNorm not found, but ops.clip_by_global_norm exists"
-        return "nn.ClipByGlobalNorm NOT FOUND (need manual clip or no clip)"
+        return "nn.ClipByGlobalNorm NOT FOUND"
 
 check("nn.ClipByGlobalNorm", test_clip)
 
@@ -241,28 +293,26 @@ def test_loop_ops():
     has_scan = hasattr(ops, 'Scan')
 
     if has_fori:
-        # Test ForiLoop
         try:
             fl = ops.ForiLoop()
             def body(x, i):
                 return x + i
             init = Tensor(0.0, ms.float32)
-            result = fl(body, 0, 10, init)  # loop from 0 to 10
+            result = fl(body, 0, 10, init)
             return f"ForiLoop EXISTS & WORKS, result={float(result):.1f}"
         except Exception as e:
             return f"ForiLoop EXISTS but FAILED: {e}"
     elif has_while:
-        return "ForiLoop not found, WhileLoop exists (can adapt)"
+        return "ForiLoop not found, WhileLoop exists"
     elif has_scan:
-        return "ForiLoop/WhileLoop not found, Scan exists (can adapt)"
+        return "ForiLoop/WhileLoop not found, Scan exists"
     else:
-        return "ForiLoop/WhileLoop/Scan NOT FOUND (need for-loop unrolling + max_call_depth)"
+        return "ForiLoop/WhileLoop/Scan NOT FOUND"
 
 check("ops.ForiLoop / WhileLoop (MS 2.4+)", test_loop_ops)
 
 # ── 10. Mini DeltaNet forward ─────────────────────────────────────
 def test_deltanet_forward():
-    """Test a minimal DeltaNet cell forward pass (no @ms.jit yet)."""
     BRIDGE_DIM = 256
     D = 256
     NH = 16
@@ -315,7 +365,6 @@ check("Mini DeltaNet forward pass (B=2, S=32)", test_deltanet_forward)
 
 # ── 11. DeltaNet @ms.jit compilation ──────────────────────────────
 def test_deltanet_jit():
-    """Test DeltaNet under @ms.jit — this is where call depth issues happen."""
     BRIDGE_DIM = 256
     D = 256
     NH = 16
@@ -360,7 +409,6 @@ def test_deltanet_jit():
 
     net = MiniDeltaNet()
     net.set_train(True)
-    # Use short sequence for quick compile test
     x = Tensor(np.random.randn(2, 64, BRIDGE_DIM).astype(np.float16))
     out = net(x)
     assert out.shape == (2, 64, D)
@@ -370,7 +418,6 @@ check("DeltaNet @ms.jit compilation (B=2, S=64)", test_deltanet_jit)
 
 # ── 12. Mini training step ─────────────────────────────────────────
 def test_training_step():
-    """Full forward + backward + optimizer step."""
     class MiniModel(nn.Cell):
         def __init__(self):
             super().__init__()
@@ -419,7 +466,10 @@ def test_training_step():
 
 check("Mini training step (forward + backward + optimizer)", test_training_step)
 
-# ── Summary + write JSON result ────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+# SUMMARY + JSON OUTPUT
+# ═══════════════════════════════════════════════════════════════════
+
 log(f"\n{'='*60}")
 log(f"SUMMARY: {passed} passed, {failed} failed out of {passed + failed}")
 log(f"{'='*60}")
@@ -439,8 +489,7 @@ log(f"Python: {sys.version}")
 log(f"NPUs available: {ms.get_context('device_num')}")
 
 # Write JSON result file
-out_dir = os.environ.get("OUTPUT_PATH", "/cache/output")
-json_path = os.path.join(out_dir, "test_result.json")
+json_path = os.path.join(OUTPUT_PATH, "test_result.json")
 summary = {
     "passed": passed,
     "failed": failed,
@@ -450,29 +499,34 @@ summary = {
     "python_version": sys.version,
     "npus": ms.get_context("device_num"),
     "tests": results,
-    "errors": [{"name": n, "error": f"{type(e).__name__}: {e}"} for n, e in errors],
+    "errors": [{"name": n, "error": f"{type(e).__name__}: {e}"}
+              for n, e in errors],
 }
 with open(json_path, "w") as f:
     json.dump(summary, f, indent=2)
 log(f"Results written to {json_path}")
 
-# Close log file
 if _log_fh is not None:
     _log_fh.close()
 
+# ═══════════════════════════════════════════════════════════════════
+# ERROR HANDLER — write error.log on any crash
+# ═══════════════════════════════════════════════════════════════════
 
-# ── Error handler: write error.log on crash ───────────────────────
+def _write_error(msg: str) -> None:
+    for d in ["/cache/output", OUTPUT_PATH]:
+        try:
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, "error.log"), "w") as f:
+                f.write(msg)
+        except Exception:
+            pass
+
 if __name__ == "__main__":
     try:
-        pass  # Tests already ran above
+        pass  # Tests ran above
     except Exception as e:
         import traceback
         msg = f"FATAL: {e}\n{traceback.format_exc()}"
         log(msg)
-        for d in ["/cache/output", out_dir]:
-            try:
-                os.makedirs(d, exist_ok=True)
-                with open(os.path.join(d, "error.log"), "w") as f:
-                    f.write(msg)
-            except Exception:
-                pass
+        _write_error(msg)
