@@ -498,7 +498,7 @@ class DeltaNetCell(nn.Cell):
         self.beta_proj = _make_dense(HIDDEN_DIM, NH, has_bias=True)
 
         # Initial state (one per head: 16x16 identity matrix)
-        init_states = np.zeros(NH, HD, HD, dtype=np.float16)
+        init_states = np.zeros((NH, HD, HD), dtype=np.float16)
         for i in range(NH):
             init_states[i] = np.eye(HD, dtype=np.float16) * 0.1
         self.initial_state = ms.Parameter(
