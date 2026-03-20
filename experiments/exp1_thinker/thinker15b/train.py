@@ -799,15 +799,14 @@ class ForwardLossCell(nn.Cell):
 
 
 class TrainStep(nn.Cell):
-    """Train step with gradient clipping via nn.ClipByGlobalNorm.
+    """Train step with @ms.jit graph compilation.
 
-    Uses @ms.jit for compilation. Gradient clipping uses the built-in
-    ClipByGlobalNorm (handles gradient tuple internally, no Python loops
-    that would cause 'getitem with non-const index' in graph mode).
+    Gradient clipping is NOT used because MS 2.2's @ms.jit cannot iterate
+    over the gradient tuple with dynamic indices (getitem non-const index).
+    Adam optimizer's adaptive learning rates handle gradient scaling.
     """
 
-    def __init__(self, forward_loss: ForwardLossCell, optimizer,
-                 max_grad_norm: float = MAX_GRAD_NORM):
+    def __init__(self, forward_loss: ForwardLossCell, optimizer):
         super().__init__()
         self.forward_loss = forward_loss
         self.optimizer = optimizer
@@ -815,19 +814,14 @@ class TrainStep(nn.Cell):
         self.grad_op = ops.GradOperation(get_by_list=True, sens_param=True)
         self.sens = Tensor([1.0], ms.float32)
         self.depend = ops.Depend()
-        self.clip_op = nn.ClipByGlobalNorm(max_grad_norm)
 
-    # @ms.jit compiles the full forward+backward into one graph.
-    # max_call_depth=100000 is set in ms.set_context() to handle the
-    # DeltaNet sequential scan (S=2048 × 4 layers ≈ 41K call depth).
     @ms.jit
     def construct(self, input_ids: Tensor, loss_mask: Tensor,
                   judge_label: Tensor) -> Tensor:
         loss = self.forward_loss(input_ids, loss_mask, judge_label)
         grads = self.grad_op(self.forward_loss, self.weights)(
             input_ids, loss_mask, judge_label, self.sens)
-        clipped, _ = self.clip_op(grads)
-        status = self.optimizer(clipped)
+        status = self.optimizer(grads)
         return self.depend(loss, status)
 
 
@@ -1990,7 +1984,7 @@ def main() -> None:
         )
 
         forward_loss = ForwardLossCell(model, cos_t, sin_t, causal_mask)
-        train_step_s1 = TrainStep(forward_loss, optimizer_s1, MAX_GRAD_NORM)
+        train_step_s1 = TrainStep(forward_loss, optimizer_s1)
 
         # Compile with OOM fallback
         actual_bs = BATCH_SIZE_PER_DEVICE
@@ -2188,7 +2182,7 @@ def main() -> None:
 
     # Rebuild training cells
     forward_loss = ForwardLossCell(model, cos_t, sin_t, causal_mask)
-    train_step_s2 = TrainStep(forward_loss, optimizer_s2, MAX_GRAD_NORM)
+    train_step_s2 = TrainStep(forward_loss, optimizer_s2)
 
     # Compile with OOM fallback
     actual_bs = BATCH_SIZE_PER_DEVICE
