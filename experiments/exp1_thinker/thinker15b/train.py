@@ -799,10 +799,11 @@ class ForwardLossCell(nn.Cell):
 
 
 class TrainStep(nn.Cell):
-    """Manual train step with manual clip-by-global-norm.
+    """Train step with gradient clipping via nn.ClipByGlobalNorm.
 
-    Uses @ms.jit for compilation. Manual gradient clipping avoids
-    nn.ClipByGlobalNorm issues in MS 2.2.
+    Uses @ms.jit for compilation. Gradient clipping uses the built-in
+    ClipByGlobalNorm (handles gradient tuple internally, no Python loops
+    that would cause 'getitem with non-const index' in graph mode).
     """
 
     def __init__(self, forward_loss: ForwardLossCell, optimizer,
@@ -814,11 +815,7 @@ class TrainStep(nn.Cell):
         self.grad_op = ops.GradOperation(get_by_list=True, sens_param=True)
         self.sens = Tensor([1.0], ms.float32)
         self.depend = ops.Depend()
-        self.max_norm = Tensor(max_grad_norm, ms.float32)
-        self.eps = Tensor(1e-6, ms.float32)
-        self.one = Tensor(1.0, ms.float32)
-        self.sqrt = ops.Sqrt()
-        self.minimum = ops.Minimum()
+        self.clip_op = nn.ClipByGlobalNorm(max_grad_norm)
 
     # @ms.jit compiles the full forward+backward into one graph.
     # max_call_depth=100000 is set in ms.set_context() to handle the
@@ -829,12 +826,7 @@ class TrainStep(nn.Cell):
         loss = self.forward_loss(input_ids, loss_mask, judge_label)
         grads = self.grad_op(self.forward_loss, self.weights)(
             input_ids, loss_mask, judge_label, self.sens)
-        total_norm_sq = Tensor(0.0, ms.float32)
-        for g in grads:
-            total_norm_sq = total_norm_sq + ops.reduce_sum(g * g)
-        global_norm = self.sqrt(total_norm_sq + self.eps)
-        clip_coef = self.minimum(self.max_norm / global_norm, self.one)
-        clipped = tuple(g * clip_coef for g in grads)
+        clipped, _ = self.clip_op(grads)
         status = self.optimizer(clipped)
         return self.depend(loss, status)
 
