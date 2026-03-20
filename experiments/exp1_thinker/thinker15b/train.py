@@ -43,6 +43,10 @@ MS 2.8 optimizations applied:
   - ms.runtime.set_memory(optimize_level='O1') for memory pool optimization
   - ms.set_device("Ascend", device_id) new recommended device API
   - ms.device_context.ascend.op_precision.matmul_allow_hf32(True) for DeltaNet speedup
+  - mint.matmul + mint.sigmoid in DeltaNet loop (aclnn backend, faster than ops in PyNative)
+  - MS_ENABLE_LCCL=1 for faster single-node 4-NPU communication
+  - MS_DEV_GRAPH_KERNEL_FLAGS with GroupedMatmul,Reshape cluster ops fusion
+  - ms.runtime.empty_cache() between stages and after evolution probes
 """
 
 import os
@@ -84,10 +88,15 @@ os.environ.update({
     "ASCEND_GLOBAL_LOG_LEVEL": "3",
     "GLOG_v": "2",
     "HCCL_CONNECT_TIMEOUT": "1800",
+    # MS 2.8: LCCL — faster than HCCL for single-node 4-NPU setup
+    "MS_ENABLE_LCCL": "1",
     # MS 2.8: graph kernel optimizations for Ascend
+    # --enable_cluster_ops: fuse matmul+reshape, group matmuls
     "MS_DEV_GRAPH_KERNEL_FLAGS": "--enable_expand_ops=Split,Tile,"
                                   "--disable_inline_reducesort,"
-                                  "--enable_parallel_fusion=true",
+                                  "--enable_parallel_fusion=true,"
+                                  "--enable_cluster_ops=GroupedMatmul,"
+                                  "Reshape",
 })
 
 # ── Paths (c2net + local fallback) ──────────────────────────────────
@@ -282,7 +291,7 @@ print(f"[worker] RANK_ID={os.environ.get('RANK_ID')}, "
 # ── MindSpore imports (AFTER env vars) ───────────────────────────────
 import numpy as np
 import mindspore as ms
-from mindspore import nn, ops, value_and_grad
+from mindspore import nn, ops, value_and_grad, mint
 from mindspore.common.tensor import Tensor
 
 # ── StubTensor safety net (MS 2.8 compatibility) ────────────────────
@@ -639,12 +648,18 @@ class DeltaNetCell(nn.Cell):
         x_f32 = x.astype(ms.float32)
         K = self.key_proj(x_f32)                    # (B, S, D) FP32
         V = self.value_proj(x_f32)                   # (B, S, D) FP32
-        beta = ops.sigmoid(self.beta_proj(x_f32))    # (B, S, NH) FP32
+        # MS 2.8: mint ops use optimized aclnn kernels (faster than
+        # ops in PyNative mode on Ascend). Only functional ops in the
+        # hot DeltaNet loop — NOT nn layers (those would break weight
+        # loading due to mint.nn.Linear vs nn.Dense param differences).
+        beta = mint.sigmoid(self.beta_proj(x_f32))    # (B, S, NH) FP32
 
         # Initialize state: broadcast to batch, keep FP32 for precision
         state = ops.Tile()(self.initial_state, (B, 1, 1, 1))  # (B, NH, HD, HD) FP32
 
         # Sequential scan — core of state tracking.
+        # 2048 iterations x 4 SFM blocks = 8192 matmuls per step.
+        # mint.matmul uses aclnn backend (faster than ops TBE/GE).
         outputs = ()
         for t in range(S):
             kt = K[:, t, None, :]   # (B, D, 1)
@@ -654,8 +669,8 @@ class DeltaNetCell(nn.Cell):
             # delta rule: S = S - beta*(S@k - v)*k^T
             k_head = kt.reshape(B, NH, HD, 1)  # (B, NH, HD, 1)
             v_head = vt.reshape(B, NH, HD, 1)  # (B, NH, HD, 1)
-            residual = ops.matmul(state, k_head) - v_head
-            update = bt * ops.matmul(residual, k_head.transpose(0, 1, 3, 2))
+            residual = mint.matmul(state, k_head) - v_head
+            update = bt * mint.matmul(residual, k_head.transpose(0, 1, 3, 2))
             state = state - update
 
             out_t = state[:, :, -1, :]  # (B, NH, HD)
@@ -2232,6 +2247,10 @@ def main() -> None:
                     difficulty_tracker.update(acc)
                     log(f"  Probe accuracy: {acc:.3f}, "
                         f"difficulty: {difficulty_tracker.difficulty:.1f}")
+                    # MS 2.8: free probe memory (50 eval-only forwards
+                    # without backward accumulate cached activations)
+                    gc.collect()
+                    ms.runtime.empty_cache()
 
                 # Logging
                 if step % 50 == 0 or step <= 3:
@@ -2261,6 +2280,11 @@ def main() -> None:
     # Save Stage 1 results before Stage 2 overwrites step/best_loss
     stage1_steps_done = step if compiled else 0
     stage1_best_loss = best_loss if compiled else float("inf")
+
+    # MS 2.8: free Stage 1 computation graphs and cached ops before
+    # building Stage 2 (different param set = different graph)
+    gc.collect()
+    ms.runtime.empty_cache()
 
     # ═══════════════════════════════════════════════════════════════════
     # STAGE 2: Full fine-tuning (unfreeze base + SFM)
@@ -2465,6 +2489,9 @@ def main() -> None:
             log(f"  Probe accuracy: {acc:.3f}, "
                 f"difficulty: {difficulty_tracker.difficulty:.1f} "
                 f"-> {new_diff:.1f}")
+            # MS 2.8: free probe memory
+            gc.collect()
+            ms.runtime.empty_cache()
 
         # Logging
         if step % 50 == 0 or step <= 3:
