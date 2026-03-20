@@ -477,10 +477,10 @@ class TransformerBlock(nn.Cell):
         HD = HEAD_DIM
         NG = NUM_GROUPS
 
-        h = self.input_norm(x)
-        Q = self.q_proj(h).reshape(B, S, NH, HD).transpose(0, 2, 1, 3)
-        K = self.k_proj(h).reshape(B, S, NKV, HD).transpose(0, 2, 1, 3)
-        V = self.v_proj(h).reshape(B, S, NKV, HD).transpose(0, 2, 1, 3)
+        h = self.input_norm(x).astype(ms.float32)
+        Q = self.q_proj(h).reshape(B, S, NH, HD).transpose(0, 2, 1, 3).astype(ms.float16)
+        K = self.k_proj(h).reshape(B, S, NKV, HD).transpose(0, 2, 1, 3).astype(ms.float16)
+        V = self.v_proj(h).reshape(B, S, NKV, HD).transpose(0, 2, 1, 3).astype(ms.float16)
 
         # GQA: tile KV heads to match Q heads (repeat 6x)
         K = self.tile(K, (1, NG, 1, 1))
@@ -496,14 +496,14 @@ class TransformerBlock(nn.Cell):
         attn = self.softmax(attn)
         out = ops.matmul(attn, V)
         out = out.transpose(0, 2, 1, 3).reshape(B, S, NH * HD)
-        out = self.o_proj(out)
+        out = self.o_proj(out.astype(ms.float32)).astype(ms.float16)
         x = x + out
 
         # SwiGLU FFN
-        h = self.ffn_norm(x)
-        gate = ops.silu(self.gate_proj(h))
-        up = self.up_proj(h)
-        x = x + self.down_proj(gate * up)
+        h = self.ffn_norm(x).astype(ms.float32)
+        gate = ops.silu(self.gate_proj(h)).astype(ms.float16)
+        up = self.up_proj(h).astype(ms.float16)
+        x = x + self.down_proj((gate * up).astype(ms.float32)).astype(ms.float16)
         return x
 
 
@@ -558,9 +558,10 @@ class DeltaNetCell(nn.Cell):
         HD = self.HD
 
         # Project all positions at once
-        K = self.key_proj(x).reshape(B, S, NH, HD)    # (B, S, NH, 16)
-        V = self.value_proj(x).reshape(B, S, NH, HD)  # (B, S, NH, 16)
-        beta = ops.sigmoid(self.beta_proj(x))          # (B, S, NH)
+        x_f32 = x.astype(ms.float32)
+        K = self.key_proj(x_f32).reshape(B, S, NH, HD).astype(ms.float16)
+        V = self.value_proj(x_f32).reshape(B, S, NH, HD).astype(ms.float16)
+        beta = ops.sigmoid(self.beta_proj(x_f32))          # (B, S, NH)
 
         # Initialize state: broadcast to batch
         state = ops.broadcast_to(
@@ -612,16 +613,8 @@ class CrossSystemBridge(nn.Cell):
         self.layer_norm = RMSNorm(HIDDEN_DIM)
 
     def construct(self, hidden: Tensor, sfm_out: Tensor) -> Tensor:
-        """Merge transformer hidden with SFM output.
-
-        Args:
-            hidden: (B, S, HIDDEN_DIM) from transformer layer.
-            sfm_out: (B, S, BRIDGE_DIM) from DeltaNet.
-
-        Returns:
-            modified: (B, S, HIDDEN_DIM)
-        """
-        sfm_up = self.up_proj(sfm_out)
+        """Merge transformer hidden with SFM output."""
+        sfm_up = self.up_proj(sfm_out.astype(ms.float32)).astype(ms.float16)
         gate = ops.sigmoid(self.gate_param.astype(hidden.dtype))
         return self.layer_norm(hidden + gate * sfm_up)
 
@@ -639,8 +632,7 @@ class JudgeHead(nn.Cell):
 
     def construct(self, x: Tensor) -> Tensor:
         """Returns (B, 2) logits for judge classification."""
-        # x: (B, S, H) -> take last token -> (B, H)
-        last = x[:, -1, :]
+        last = x[:, -1, :].astype(ms.float32)
         h = ops.gelu(self.proj1(last))
         return self.proj2(h)
 
@@ -658,7 +650,7 @@ class SurprisePredictor(nn.Cell):
 
     def construct(self, x: Tensor) -> Tensor:
         """Returns (B, 1) surprise score."""
-        last = x[:, -1, :]
+        last = x[:, -1, :].astype(ms.float32)
         h = ops.gelu(self.proj1(last))
         return self.proj2(h)
 
@@ -719,7 +711,8 @@ class Thinker15BModel(nn.Cell):
             x = self.layers[i](x, cos, sin, mask)
             if i in self.sfm_layer_set:
                 # Project to bridge dim, run DeltaNet, bridge back
-                sfm_input = self.bridges[sfm_idx].down_proj(x)
+                sfm_input = self.bridges[sfm_idx].down_proj(
+                    x.astype(ms.float32)).astype(ms.float16)
                 sfm_out = self.deltanets[sfm_idx](sfm_input)
                 x = self.bridges[sfm_idx](x, sfm_out)
                 sfm_idx += 1
@@ -727,9 +720,9 @@ class Thinker15BModel(nn.Cell):
         x = self.norm(x)
 
         # LM head (tied embeddings)
-        h2 = x.reshape((-1, HIDDEN_DIM))
+        h2 = x.reshape((-1, HIDDEN_DIM)).astype(ms.float32)
         logits = self.matmul(h2, self.embedding.embedding_table)
-        logits = logits.reshape(B, x.shape[1], VOCAB_SIZE)
+        logits = logits.reshape(B, x.shape[1], VOCAB_SIZE).astype(ms.float16)
 
         # Judge head
         judge_logits = self.judge_head(x)
