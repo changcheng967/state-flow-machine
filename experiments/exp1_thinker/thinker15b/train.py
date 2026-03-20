@@ -36,7 +36,7 @@ Infrastructure (from reference train.py):
   - Convergence-based stopping
   - Checkpointing
 
-Self-contained: MindSpore 2.2 + NumPy + stdlib only.
+Self-contained: MindSpore 2.8 + NumPy + stdlib only.
 """
 
 import os
@@ -68,6 +68,42 @@ except Exception:
 import subprocess
 warnings.filterwarnings("ignore")
 
+# ── CANN 9.0 activation (BEFORE importing MindSpore) ───────────────
+# Training tasks don't source .bashrc, so CANN 9.0 paths from the
+# custom install are missing. We replicate what .bashrc's __fix_cann
+# does: source our CANN 9.0 set_env.sh and strip the old pre-installed
+# CANN paths from PATH/LD_LIBRARY_PATH/PYTHONPATH.
+_CANN_ENV_SH = "/home/ma-user/Ascend/cann/set_env.sh"
+_OLD_CANN_PREFIXES = (
+    "/usr/local/Ascend/ascend-toolkit",
+    "/usr/local/Ascend/toolbox",
+)
+
+def _activate_cann():
+    """Source CANN 9.0 env and strip old pre-installed CANN paths."""
+    if not os.path.isfile(_CANN_ENV_SH):
+        return  # Pre-installed CANN already on PATH — no fix needed
+
+    try:
+        proc = subprocess.run(
+            f"bash -c 'source {_CANN_ENV_SH} 2>/dev/null && env'",
+            shell=True, capture_output=True, text=True, timeout=30)
+    except Exception:
+        return
+
+    for line in proc.stdout.splitlines():
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        # Strip old CANN paths from PATH-like vars
+        if key in ("PATH", "LD_LIBRARY_PATH", "PYTHONPATH"):
+            filtered = [p for p in value.split(":")
+                        if not any(old in p for old in _OLD_CANN_PREFIXES)]
+            value = ":".join(filtered)
+        os.environ[key] = value
+
+_activate_cann()
+
 # ── Environment vars (BEFORE importing MindSpore) ────────────────────
 os.environ.update({
     "MS_COMPILER_CACHE_ENABLE": "1",
@@ -78,10 +114,13 @@ os.environ.update({
     "ASCEND_GLOBAL_LOG_LEVEL": "3",
     "GLOG_v": "2",
     "HCCL_CONNECT_TIMEOUT": "1800",
-    # Graph kernel optimizations for Ascend
+    # LCCL: faster single-node 4-NPU communication (CANN 9)
+    "MS_ENABLE_LCCL": "1",
+    # Graph kernel optimizations for Ascend (CANN 9)
     "MS_DEV_GRAPH_KERNEL_FLAGS": "--enable_expand_ops=Split,Tile,"
                                   "--disable_inline_reducesort,"
-                                  "--enable_parallel_fusion=true",
+                                  "--enable_parallel_fusion=true,"
+                                  "--cluster_ops=GroupedMatmul,Reshape",
 })
 
 # ── Paths (c2net + local fallback) ──────────────────────────────────
@@ -277,11 +316,13 @@ print(f"[worker] RANK_ID={os.environ.get('RANK_ID')}, "
 import numpy as np
 import mindspore as ms
 from mindspore import nn, ops, value_and_grad
+from mindspore import mint
 from mindspore.common.tensor import Tensor
 
-# ── StubTensor safety net ──────────────────────────────────────────
-# Patches StubTensor.dtype/shape/stub_sync to prevent crashes during
-# gradient metagraph tracing. Safety net for edge cases.
+# ── StubTensor safety net (MS 2.8 compatibility) ────────────────────
+# MS 2.8 uses ms.value_and_grad which avoids StubTensor grad metagraph
+# tracing entirely. However, we keep these patches as a safety net in
+# case any internal MS 2.8 path still triggers StubTensors.
 try:
     from mindspore.common._stub_tensor import StubTensor as _StubTensor
     _orig_dtype_getter = _StubTensor.dtype.fget
@@ -632,7 +673,7 @@ class DeltaNetCell(nn.Cell):
         x_f32 = x.astype(ms.float32)
         K = self.key_proj(x_f32)                    # (B, S, D) FP32
         V = self.value_proj(x_f32)                   # (B, S, D) FP32
-        beta = ops.sigmoid(self.beta_proj(x_f32))    # (B, S, NH) FP32
+        beta = mint.sigmoid(self.beta_proj(x_f32))    # (B, S, NH) FP32
 
         # Initialize state: broadcast to batch, keep FP32 for precision
         state = ops.Tile()(self.initial_state, (B, 1, 1, 1))  # (B, NH, HD, HD) FP32
@@ -647,8 +688,8 @@ class DeltaNetCell(nn.Cell):
             # delta rule: S = S - beta*(S@k - v)*k^T
             k_head = kt.reshape(B, NH, HD, 1)  # (B, NH, HD, 1)
             v_head = vt.reshape(B, NH, HD, 1)  # (B, NH, HD, 1)
-            residual = ops.matmul(state, k_head) - v_head
-            update = bt * ops.matmul(residual, k_head.transpose(0, 1, 3, 2))
+            residual = mint.matmul(state, k_head) - v_head
+            update = bt * mint.matmul(residual, k_head.transpose(0, 1, 3, 2))
             state = state - update
 
             out_t = state[:, :, -1, :]  # (B, NH, HD)
@@ -865,9 +906,13 @@ class ForwardLossCell(nn.Cell):
 class TrainStep:
     """Train step — plain Python class, NOT nn.Cell.
 
-    Uses ms.value_and_grad (from mindspore, not mindspore.ops) which
-    avoids StubTensor grad metagraph tracing entirely. Manual
-    ops.AllReduce handles DATA_PARALLEL gradient sync.
+    MS 2.8 adaptation: Uses ms.value_and_grad instead of ops.GradOperation.
+    value_and_grad uses _pynative_forward_run internally (NOT grad metagraph
+    tracing), so it never creates StubTensors. This is the clean solution
+    that eliminates the entire StubTensor crash cascade.
+
+    Since value_and_grad doesn't auto-allreduce via DATA_PARALLEL, we
+    add manual ops.AllReduce after gradient computation.
 
     Handles:
       - Gradient clipping (clip by global norm)
@@ -1009,7 +1054,7 @@ def load_qwen_weights(model: Thinker15BModel,
             not_found.append(f"{hf_name} -> {ms_name}")
 
     if param_dict:
-        # load_param_into_net returns (param_not_load, ckpt_not_load)
+        # MS 2.8: load_param_into_net returns (param_not_load, ckpt_not_load)
         _unused, _ = ms.load_param_into_net(model, param_dict)
         log(f"Loaded {loaded} Qwen tensors, skipped {len(skipped)} "
             f"(tied lm_head)")
@@ -1985,11 +2030,18 @@ def main() -> None:
 
     ms.set_context(
         mode=ms.PYNATIVE_MODE,
-        device_target="Ascend",
-        device_id=device_id,
-        memory_optimize_level="O1",
         jit_config={"jit_level": "O1"},
     )
+    ms.set_device("Ascend", device_id)
+    ms.runtime.set_memory(optimize_level="O1")
+
+    # HF32 (19-bit) matmul: ~2x faster than FP32, critical for DeltaNet
+    # 16×16 state matmuls running 2048 steps × 4 SFM layers per sample.
+    try:
+        ms.device_context.ascend.op_precision.matmul_allow_hf32(True)
+        log("HF32 matmul enabled")
+    except Exception:
+        log("HF32 matmul not available (OK for older CANN)")
 
     # Data parallel init
     use_dp = rank_size > 1
@@ -2207,7 +2259,9 @@ def main() -> None:
                         ms.save_checkpoint(
                             model,
                             os.path.join(CKPT_DIR,
-                                         "stage1_best.ckpt"))
+                                         "stage1_best.safetensors"),
+                            format="safetensors",
+                            async_save="thread")
 
                 # Self-evolution probe
                 if step % EVOLUTION_PROBE_STEPS == 0 and step > 0 \
@@ -2218,6 +2272,11 @@ def main() -> None:
                     difficulty_tracker.update(acc)
                     log(f"  Probe accuracy: {acc:.3f}, "
                         f"difficulty: {difficulty_tracker.difficulty:.1f}")
+                    # MS 2.8: free probe memory (50 eval-only forwards
+                    # without backward accumulate cached activations)
+                    gc.collect()
+                    ms.runtime.empty_cache()
+
                 # Logging
                 if step % 50 == 0 or step <= 3:
                     dt = time.time() - t_start
@@ -2231,8 +2290,10 @@ def main() -> None:
                 # Checkpoint
                 if rank_id == 0 and step % 2000 == 0 and step > 0:
                     ckpt_path = os.path.join(
-                        CKPT_DIR, f"stage1_step_{step}.ckpt")
-                    ms.save_checkpoint(model, ckpt_path)
+                        CKPT_DIR, f"stage1_step_{step}.safetensors")
+                    ms.save_checkpoint(model, ckpt_path,
+                                       format="safetensors",
+                                       async_save="thread")
                     log(f"Stage 1 checkpoint: {ckpt_path}")
 
             log(f"Stage 1 complete: {step} steps, "
@@ -2243,6 +2304,10 @@ def main() -> None:
     # Save Stage 1 results before Stage 2 overwrites step/best_loss
     stage1_steps_done = step if compiled else 0
     stage1_best_loss = best_loss if compiled else float("inf")
+
+    # Free Stage 1 cached memory before Stage 2 allocates new optimizers
+    gc.collect()
+    ms.runtime.empty_cache()
 
     # ═════════════════════════════════════════════════════════════════
     # STAGE 2: Full fine-tuning (unfreeze base + SFM)
@@ -2431,7 +2496,8 @@ def main() -> None:
             best_loss = avg_loss
             if rank_id == 0:
                 ms.save_checkpoint(
-                    model, os.path.join(CKPT_DIR, "best.ckpt"))
+                    model, os.path.join(CKPT_DIR, "best.safetensors"),
+                    format="safetensors", async_save="thread")
                 log(f"  New best loss: {avg_loss:.4f}")
 
         # Self-evolution: probe + adapt difficulty
@@ -2444,6 +2510,10 @@ def main() -> None:
             log(f"  Probe accuracy: {acc:.3f}, "
                 f"difficulty: {difficulty_tracker.difficulty:.1f} "
                 f"-> {new_diff:.1f}")
+            # MS 2.8: free probe memory
+            gc.collect()
+            ms.runtime.empty_cache()
+
         # Logging
         if step % 50 == 0 or step <= 3:
             dt = time.time() - t_start
@@ -2459,8 +2529,9 @@ def main() -> None:
         # Periodic checkpoint (best already saved above on improvement)
         if rank_id == 0 and step % 2000 == 0 and step > 0:
             ckpt_path = os.path.join(
-                CKPT_DIR, f"stage2_step_{step}.ckpt")
-            ms.save_checkpoint(model, ckpt_path)
+                CKPT_DIR, f"stage2_step_{step}.safetensors")
+            ms.save_checkpoint(model, ckpt_path,
+                               format="safetensors", async_save="thread")
             log(f"Stage 2 checkpoint: {ckpt_path}")
 
     # ── Training complete ──
@@ -2468,7 +2539,8 @@ def main() -> None:
 
     if rank_id == 0:
         ms.save_checkpoint(
-            model, os.path.join(CKPT_DIR, "final.ckpt"))
+            model, os.path.join(CKPT_DIR, "final.safetensors"),
+            format="safetensors", async_save="thread")
         log("Final checkpoint saved")
 
     results = {
