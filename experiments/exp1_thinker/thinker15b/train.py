@@ -469,6 +469,7 @@ class TransformerBlock(nn.Cell):
         self.tile = ops.Tile()
         self.softmax = ops.Softmax(axis=-1)
 
+    @ms.jit
     def construct(self, x: Tensor, cos: Tensor, sin: Tensor,
                   mask: Tensor) -> Tensor:
         B, S, _ = x.shape
@@ -536,9 +537,11 @@ class DeltaNetCell(nn.Cell):
         self.beta_proj = _make_dense(BRIDGE_DIM, NH, has_bias=True)
 
         # Initial state (one per head: 16x16 identity matrix)
-        init_states = np.zeros((NH, HD, HD), dtype=np.float16)
+        # FP32 so gradients are FP32 (avoids dtype mismatch with
+        # clip_coef in TrainStep). Cast to FP16 inside construct.
+        init_states = np.zeros((NH, HD, HD), dtype=np.float32)
         for i in range(NH):
-            init_states[i] = np.eye(HD, dtype=np.float16) * 0.1
+            init_states[i] = np.eye(HD, dtype=np.float32) * 0.1
         self.initial_state = ms.Parameter(
             Tensor(init_states), name="deltanet_init_state")
 
@@ -565,13 +568,12 @@ class DeltaNetCell(nn.Cell):
         V = self.value_proj(x_f32).astype(ms.float16)  # (B, S, D)
         beta = ops.sigmoid(self.beta_proj(x_f32)).astype(ms.float16)  # (B, S, NH)
 
-        # Initialize state: broadcast to batch
-        state = ops.Tile()(self.initial_state, (B, 1, 1, 1))  # (B, NH, HD, HD)
+        # Initialize state: broadcast to batch, cast to FP16 for matmul
+        state = ops.Tile()(self.initial_state, (B, 1, 1, 1)).astype(ms.float16)  # (B, NH, HD, HD)
 
         # Sequential scan — core of state tracking.
-        # Unrolled via Python for-loop (PyNative traces each iteration).
-        # NOTE: In @ms.jit context this may be traced; if so, S must
-        # be a compile-time constant (which it is for the dummy forward).
+        # Runs in PyNative (no @ms.jit) to avoid call depth limit.
+        # Each iteration: 16x16 matmuls × 16 heads = O(4096) FLOPs.
         outputs = []
         for t in range(S):
             kt = K[:, t, None, :]   # (B, D, 1)
@@ -612,6 +614,7 @@ class CrossSystemBridge(nn.Cell):
             Tensor(np.array([0.0], dtype=np.float32)), name="bridge_gate")
         self.layer_norm = RMSNorm(HIDDEN_DIM)
 
+    @ms.jit
     def construct(self, hidden: Tensor, sfm_out: Tensor) -> Tensor:
         """Merge transformer hidden with SFM output."""
         sfm_up = self.up_proj(sfm_out.astype(ms.float32)).astype(ms.float16)
@@ -772,8 +775,9 @@ class ForwardLossCell(nn.Cell):
         logits, judge_logits, surprise = self.model(
             input_ids, self.cos, self.sin, self.causal_mask)
 
-        # Masked CE loss
-        logits_t = logits[:, :-1, :]          # (B, S-1, V)
+        # Masked CE loss (cast logits to FP32 for numerical stability —
+        # FP16 log_softmax overflows for large logits)
+        logits_t = logits[:, :-1, :].astype(ms.float32)  # (B, S-1, V)
         labels = input_ids[:, 1:]             # (B, S-1)
         mask_t = loss_mask[:, 1:]             # (B, S-1)
         ce_per_token = self.ce_loss_fn(
@@ -818,7 +822,10 @@ class TrainStep(nn.Cell):
         self.sqrt = ops.Sqrt()
         self.minimum = ops.Minimum()
 
-    @ms.jit
+    # NOTE: No @ms.jit here! The DeltaNet sequential scan (S=2048 × 4 layers)
+    # exceeds MS 2.2's call depth limit (1000) when graph-compiled. Instead,
+    # individual loop-free sub-cells (TransformerBlock, CrossSystemBridge)
+    # are @ms.jit-decorated, and the gradient step runs in PyNative mode.
     def construct(self, input_ids: Tensor, loss_mask: Tensor,
                   judge_label: Tensor) -> Tensor:
         loss = self.forward_loss(input_ids, loss_mask, judge_label)
@@ -1200,7 +1207,7 @@ _SAFE_BUILTINS = {
     "int": int, "float": float, "str": str, "list": list,
     "dict": dict, "tuple": tuple, "set": set, "bool": bool,
     "sum": sum, "round": round, "sorted": sorted, "reversed": reversed,
-    "enumerate": enumerate, "zip": zip, "map": filter,
+    "enumerate": enumerate, "zip": zip, "map": map, "filter": filter,
     "isinstance": isinstance, "print": lambda *a: None,
     "True": True, "False": False, "None": None,
     "type": type, "hash": hash, "id": id, "hex": hex, "oct": oct,
@@ -2117,6 +2124,10 @@ def main() -> None:
         else:
             log("Stage 1 compilation failed, skipping to Stage 2")
 
+    # Save Stage 1 results before Stage 2 overwrites step/best_loss
+    stage1_steps_done = step if compiled else 0
+    stage1_best_loss = best_loss if compiled else float("inf")
+
     # ═══════════════════════════════════════════════════════════════════
     # STAGE 2: Full fine-tuning (unfreeze base + SFM)
     # ═══════════════════════════════════════════════════════════════════
@@ -2163,16 +2174,13 @@ def main() -> None:
         lr_schedule_base.append(lr_base)
         lr_schedule_sfm.append(lr_sfm)
 
-    # Combined learning rate: list of [base_lr, sfm_lr] per step
-    combined_lr = np.array(
-        [[lr_schedule_base[s], lr_schedule_sfm[s]]
-         for s in range(STAGE2_MAX_STEPS)],
-        dtype=np.float32)
+    # Single 1D LR schedule (MS 2.2 AdamWeightDecay doesn't support
+    # per-group LR via 2D tensors — use base LR for all params)
+    lr_schedule_s2 = np.array(lr_schedule_base, dtype=np.float32)
 
     optimizer_s2 = nn.AdamWeightDecay(
         base_params + sfm_params,
-        learning_rate=Tensor(combined_lr),
-        # Group 0 = base_params, Group 1 = sfm_params
+        learning_rate=Tensor(lr_schedule_s2),
         weight_decay=STAGE2_WEIGHT_DECAY,
         beta1=0.9,
         beta2=0.95,
@@ -2209,7 +2217,7 @@ def main() -> None:
                 gc.collect()
                 optimizer_s2 = nn.AdamWeightDecay(
                     base_params + sfm_params,
-                    learning_rate=Tensor(combined_lr),
+                    learning_rate=Tensor(lr_schedule_s2),
                     weight_decay=STAGE2_WEIGHT_DECAY,
                     beta1=0.9, beta2=0.95)
                 forward_loss = ForwardLossCell(
@@ -2342,7 +2350,7 @@ def main() -> None:
         "effective_batch": actual_bs * GRADIENT_ACCUM_STEPS * rank_size,
         "seq_len": MAX_SEQ_LEN,
         "num_devices": rank_size,
-        "stage1_steps": step if 'step' in dir() else 0,
+        "stage1_steps": stage1_steps_done,
         "stage2_steps": step,
         "total_samples": total_samples,
         "total_time_s": round(elapsed_total, 1),
