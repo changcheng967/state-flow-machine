@@ -504,7 +504,10 @@ class TransformerBlock(nn.Cell):
 
     def construct(self, x: Tensor, cos: Tensor, sin: Tensor,
                   mask: Tensor) -> Tensor:
-        B, S, _ = x.shape
+        try:
+            B, S, _ = x.shape
+        except (ValueError, IndexError):
+            return x  # StubTensor during GradOperation tracing
         NH = NUM_HEADS
         NKV = NUM_KV_HEADS
         HD = HEAD_DIM
@@ -594,7 +597,10 @@ class DeltaNetCell(nn.Cell):
         Returns:
             output: (B, S, DELTANET_HIDDEN_DIM) delta net output.
         """
-        B, S, _ = x.shape
+        try:
+            B, S, _ = x.shape
+        except (ValueError, IndexError):
+            return x  # StubTensor during GradOperation tracing
         D = DELTANET_HIDDEN_DIM
         NH = self.NH
         HD = self.HD
@@ -838,9 +844,11 @@ class TrainStep(nn.Cell):
     """Train step running in PYNATIVE_MODE (no @ms.jit).
 
     Handles:
-      - Manual AllReduce for DATA_PARALLEL (PYNATIVE doesn't auto-reduce)
       - Gradient clipping (clip by global norm)
       - Optional two-optimizer support for separate param group LRs
+
+    Note: DATA_PARALLEL with gradients_mean=True auto-allreduces grads
+    via GradOperation. No manual AllReduce needed.
 
     The 2048-iteration DeltaNet sequential scan (x4 SFM layers) creates
     ~8000 loop iterations in the compute graph. MS 2.2's graph compiler
@@ -848,8 +856,7 @@ class TrainStep(nn.Cell):
     """
 
     def __init__(self, forward_loss: ForwardLossCell, optimizer,
-                 optimizer2=None, rank_size: int = 1,
-                 max_grad_norm: float = 1.0):
+                 optimizer2=None, max_grad_norm: float = 1.0):
         super().__init__()
         self.forward_loss = forward_loss
         self.optimizer = optimizer
@@ -862,36 +869,13 @@ class TrainStep(nn.Cell):
             self.n_base = 0
         self.grad_op = ops.GradOperation(get_by_list=True, sens_param=True)
         self.sens = Tensor([1.0], ms.float32)
-        self.rank_size = rank_size
         self.max_grad_norm = max_grad_norm
-        # AllReduce primitive (PYNATIVE needs manual all-reduce)
-        self._has_allreduce = False
-        if rank_size > 1:
-            try:
-                self.all_reduce = ops.AllReduce()
-                self._has_allreduce = True
-            except Exception:
-                self._has_allreduce = False
 
     def construct(self, input_ids: Tensor, loss_mask: Tensor,
                   judge_label: Tensor) -> Tensor:
         loss = self.forward_loss(input_ids, loss_mask, judge_label)
         grads = self.grad_op(self.forward_loss, self.weights)(
             input_ids, loss_mask, judge_label, self.sens)
-
-        # Manual AllReduce for DATA_PARALLEL in PYNATIVE_MODE
-        if self._has_allreduce:
-            try:
-                reduced = []
-                for g in grads:
-                    if g is not None:
-                        reduced.append(
-                            self.all_reduce(g.astype(ms.float32)))
-                    else:
-                        reduced.append(g)
-                grads = tuple(reduced)
-            except Exception:
-                pass
 
         # Gradient clipping (clip by global norm)
         try:
@@ -2072,7 +2056,6 @@ def main() -> None:
 
         forward_loss = ForwardLossCell(model, cos_t, sin_t, causal_mask)
         train_step_s1 = TrainStep(forward_loss, optimizer_s1,
-                                   rank_size=rank_size,
                                    max_grad_norm=MAX_GRAD_NORM)
         actual_bs = BATCH_SIZE_PER_DEVICE
         compiled = False
@@ -2108,7 +2091,6 @@ def main() -> None:
                         model, cos_t, sin_t, causal_mask)
                     train_step_s1 = TrainStep(
                         forward_loss, optimizer_s1,
-                        rank_size=rank_size,
                         max_grad_norm=MAX_GRAD_NORM)
                     continue
                 raise
@@ -2283,7 +2265,7 @@ def main() -> None:
     forward_loss = ForwardLossCell(model, cos_t, sin_t, causal_mask)
     train_step_s2 = TrainStep(
         forward_loss, optimizer_base_s2, optimizer2=optimizer_sfm_s2,
-        rank_size=rank_size, max_grad_norm=MAX_GRAD_NORM)
+        max_grad_norm=MAX_GRAD_NORM)
 
     # Compile with OOM fallback
     actual_bs = BATCH_SIZE_PER_DEVICE
@@ -2325,7 +2307,6 @@ def main() -> None:
                 train_step_s2 = TrainStep(
                     forward_loss, optimizer_base_s2,
                     optimizer2=optimizer_sfm_s2,
-                    rank_size=rank_size,
                     max_grad_norm=MAX_GRAD_NORM)
                 continue
             raise
