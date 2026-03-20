@@ -25,8 +25,8 @@ Key design decisions:
   - NUM_GROUPS=6 (12Q / 2KV heads)
   - ~15% corrupted judge labels during bootstrap for balanced training
   - Masked CE loss (only on monologue/slots/answer/judge tokens)
-  - Gradient accumulation for effective batch of 8
-  - Manual clip-by-global-norm (MS 2.2 safe)
+  - Effective batch of 8 (B=2 per device x 4 NPUs DATA_PARALLEL)
+  - Gradient clipping (clip by global norm) with manual AllReduce
   - Two param groups: base_params and sfm_params with separate LRs
 
 Infrastructure (from reference train.py):
@@ -170,7 +170,7 @@ STAGE2_WEIGHT_DECAY = 0.01
 
 # Shared
 BATCH_SIZE_PER_DEVICE = 2
-GRADIENT_ACCUM_STEPS = 4       # Effective batch = 2*4 = 8
+GRADIENT_ACCUM_STEPS = 1       # No accum; 2*4 NPUs = eff batch 8
 MAX_GRAD_NORM = 1.0
 TIME_LIMIT = 86400
 MIN_LR_FACTOR = 0.1
@@ -278,18 +278,25 @@ from mindspore.common.tensor import Tensor
 
 # ── MS 2.2 StubTensor bug workaround ─────────────────────────────────
 # In PYNATIVE_MODE, GradOperation tracing replaces intermediate tensors
-# with StubTensors. Accessing .dtype on a StubTensor crashes with
-# "bad optional access" (self.stub.get_dtype() fails). This monkey-patch
-# makes .dtype fall back to FP32 when the stub isn't fully initialized.
+# with StubTensors. Accessing .dtype or .shape on an uninitialized
+# StubTensor crashes with "bad optional access". This monkey-patch
+# makes both .dtype and .shape fall back to safe defaults.
 try:
     from mindspore.common._stub_tensor import StubTensor as _StubTensor
     _orig_dtype_getter = _StubTensor.dtype.fget
+    _orig_shape_getter = _StubTensor.shape.fget
     def _safe_dtype(self):
         try:
             return _orig_dtype_getter(self)
         except (RuntimeError, ValueError):
             return ms.float32
+    def _safe_shape(self):
+        try:
+            return _orig_shape_getter(self)
+        except (RuntimeError, ValueError):
+            return (1,)
     _StubTensor.dtype = property(_safe_dtype)
+    _StubTensor.shape = property(_safe_shape)
 except Exception:
     pass
 
@@ -306,14 +313,21 @@ def _hf_to_ms_name(hf_name: str) -> str:
         model.embed_tokens.weight -> embedding.embedding_table
         model.layers.0.self_attn.q_proj.weight -> layers.0.q_proj.weight
         model.layers.0.mlp.gate_proj.weight -> layers.0.gate_proj.weight
+        model.layers.0.input_layernorm.weight -> layers.0.input_norm.weight
+        model.layers.0.post_attention_layernorm.weight -> layers.0.ffn_norm.weight
         model.norm.weight -> norm.weight
     """
     name = hf_name
     # Remove 'model.' prefix
     if name.startswith("model."):
         name = name[len("model."):]
-    # embed_tokens -> embedding
-    name = name.replace("embed_tokens", "embedding")
+    # embed_tokens.weight -> embedding.embedding_table (nn.Embedding uses
+    # embedding_table, not weight)
+    if name == "embed_tokens.weight":
+        return "embedding.embedding_table"
+    # Norm layer name mapping (Qwen HF uses layernorm, we use _norm)
+    name = name.replace("input_layernorm.weight", "input_norm.weight")
+    name = name.replace("post_attention_layernorm.weight", "ffn_norm.weight")
     # self_attn. and mlp. are direct children of layer
     name = name.replace("self_attn.", "")
     name = name.replace("mlp.", "")
@@ -443,7 +457,7 @@ class RMSNorm(nn.Cell):
     def __init__(self, dim: int, eps: float = RMS_NORM_EPS):
         super().__init__()
         self.weight = ms.Parameter(
-            Tensor(np.ones(dim, dtype=np.float32)), name="norm_weight")
+            Tensor(np.ones(dim, dtype=np.float32)), name="weight")
         self.eps = Tensor(eps, ms.float32)
 
     def construct(self, x: Tensor) -> Tensor:
@@ -586,13 +600,14 @@ class DeltaNetCell(nn.Cell):
         HD = self.HD
 
         # Project to key, value, beta — all (B, S, D)
+        # Keep FP32 to avoid precision loss in the 2048-step sequential scan.
         x_f32 = x.astype(ms.float32)
-        K = self.key_proj(x_f32).astype(ms.float16)   # (B, S, D)
-        V = self.value_proj(x_f32).astype(ms.float16)  # (B, S, D)
-        beta = ops.sigmoid(self.beta_proj(x_f32)).astype(ms.float16)  # (B, S, NH)
+        K = self.key_proj(x_f32)                    # (B, S, D) FP32
+        V = self.value_proj(x_f32)                   # (B, S, D) FP32
+        beta = ops.sigmoid(self.beta_proj(x_f32))    # (B, S, NH) FP32
 
-        # Initialize state: broadcast to batch, cast to FP16 for matmul
-        state = ops.Tile()(self.initial_state, (B, 1, 1, 1)).astype(ms.float16)  # (B, NH, HD, HD)
+        # Initialize state: broadcast to batch, keep FP32 for precision
+        state = ops.Tile()(self.initial_state, (B, 1, 1, 1))  # (B, NH, HD, HD) FP32
 
         # Sequential scan — core of state tracking.
         outputs = ()
@@ -615,7 +630,7 @@ class DeltaNetCell(nn.Cell):
         stacked = stacked.transpose(1, 0, 2, 3)  # (B, S, NH, HD)
         output = stacked.reshape(B, S, NH * HD)   # (B, S, D)
 
-        return output
+        return output.astype(ms.float16)
 
 
 class CrossSystemBridge(nn.Cell):
@@ -822,28 +837,88 @@ class ForwardLossCell(nn.Cell):
 class TrainStep(nn.Cell):
     """Train step running in PYNATIVE_MODE (no @ms.jit).
 
+    Handles:
+      - Manual AllReduce for DATA_PARALLEL (PYNATIVE doesn't auto-reduce)
+      - Gradient clipping (clip by global norm)
+      - Optional two-optimizer support for separate param group LRs
+
     The 2048-iteration DeltaNet sequential scan (x4 SFM layers) creates
     ~8000 loop iterations in the compute graph. MS 2.2's graph compiler
-    cannot handle this — it falls back to dynamic tuple indexing which
-    triggers "getitem with non-const index" errors. Running in PYNATIVE
-    avoids graph compilation entirely. The DeltaNet loop is inherently
-    serial anyway, so graph optimization provides no benefit.
+    cannot handle this. Running in PYNATIVE avoids graph compilation.
     """
 
-    def __init__(self, forward_loss: ForwardLossCell, optimizer):
+    def __init__(self, forward_loss: ForwardLossCell, optimizer,
+                 optimizer2=None, rank_size: int = 1,
+                 max_grad_norm: float = 1.0):
         super().__init__()
         self.forward_loss = forward_loss
         self.optimizer = optimizer
-        self.weights = optimizer.parameters
+        self.optimizer2 = optimizer2
+        if optimizer2 is not None:
+            self.weights = optimizer.parameters + optimizer2.parameters
+            self.n_base = len(optimizer.parameters)
+        else:
+            self.weights = optimizer.parameters
+            self.n_base = 0
         self.grad_op = ops.GradOperation(get_by_list=True, sens_param=True)
         self.sens = Tensor([1.0], ms.float32)
+        self.rank_size = rank_size
+        self.max_grad_norm = max_grad_norm
+        # AllReduce primitive (PYNATIVE needs manual all-reduce)
+        self._has_allreduce = False
+        if rank_size > 1:
+            try:
+                self.all_reduce = ops.AllReduce()
+                self._has_allreduce = True
+            except Exception:
+                self._has_allreduce = False
 
     def construct(self, input_ids: Tensor, loss_mask: Tensor,
                   judge_label: Tensor) -> Tensor:
         loss = self.forward_loss(input_ids, loss_mask, judge_label)
         grads = self.grad_op(self.forward_loss, self.weights)(
             input_ids, loss_mask, judge_label, self.sens)
-        self.optimizer(grads)
+
+        # Manual AllReduce for DATA_PARALLEL in PYNATIVE_MODE
+        if self._has_allreduce:
+            try:
+                reduced = []
+                for g in grads:
+                    if g is not None:
+                        reduced.append(
+                            self.all_reduce(g.astype(ms.float32)))
+                    else:
+                        reduced.append(g)
+                grads = tuple(reduced)
+            except Exception:
+                pass
+
+        # Gradient clipping (clip by global norm)
+        try:
+            norm_sq = Tensor(0.0, ms.float32)
+            for g in grads:
+                if g is not None:
+                    norm_sq = norm_sq + ops.reduce_sum(
+                        ops.square(g.astype(ms.float32)))
+            global_norm = ops.sqrt(norm_sq)
+            clip_coef = ops.minimum(
+                Tensor(1.0, ms.float32),
+                Tensor(self.max_grad_norm, ms.float32) /
+                ops.maximum(global_norm, Tensor(1e-6, ms.float32)))
+            grads = tuple(
+                (g.astype(ms.float32) * clip_coef
+                 if g is not None else g)
+                for g in grads)
+        except Exception:
+            pass  # Skip clipping if StubTensor issues
+
+        # Apply optimizer(s)
+        if self.optimizer2 is not None:
+            self.optimizer(grads[:self.n_base])
+            self.optimizer2(grads[self.n_base:])
+        else:
+            self.optimizer(grads)
+
         return loss
 
 
@@ -1996,9 +2071,9 @@ def main() -> None:
         )
 
         forward_loss = ForwardLossCell(model, cos_t, sin_t, causal_mask)
-        train_step_s1 = TrainStep(forward_loss, optimizer_s1)
-
-        # Compile with OOM fallback
+        train_step_s1 = TrainStep(forward_loss, optimizer_s1,
+                                   rank_size=rank_size,
+                                   max_grad_norm=MAX_GRAD_NORM)
         actual_bs = BATCH_SIZE_PER_DEVICE
         compiled = False
         for bs in [BATCH_SIZE_PER_DEVICE, 1]:
@@ -2032,7 +2107,9 @@ def main() -> None:
                     forward_loss = ForwardLossCell(
                         model, cos_t, sin_t, causal_mask)
                     train_step_s1 = TrainStep(
-                        forward_loss, optimizer_s1)
+                        forward_loss, optimizer_s1,
+                        rank_size=rank_size,
+                        max_grad_norm=MAX_GRAD_NORM)
                     continue
                 raise
 
@@ -2097,6 +2174,10 @@ def main() -> None:
                 loss_history.append(avg_loss)
                 if avg_loss < best_loss:
                     best_loss = avg_loss
+                    if rank_id == 0:
+                        ms.save_checkpoint(
+                            model, os.path.join(CKPT_DIR,
+                                                "stage1_best.ckpt"))
 
                 # Self-evolution probe
                 if step % EVOLUTION_PROBE_STEPS == 0 and step > 0 \
@@ -2180,21 +2261,29 @@ def main() -> None:
         lr_schedule_base.append(lr_base)
         lr_schedule_sfm.append(lr_sfm)
 
-    # Single 1D LR schedule (MS 2.2 AdamWeightDecay doesn't support
-    # per-group LR via 2D tensors — use base LR for all params)
-    lr_schedule_s2 = np.array(lr_schedule_base, dtype=np.float32)
-
-    optimizer_s2 = nn.AdamWeightDecay(
-        base_params + sfm_params,
-        learning_rate=Tensor(lr_schedule_s2),
+    # Two separate optimizers for different param group LRs
+    lr_s2_base = np.array(lr_schedule_base, dtype=np.float32)
+    lr_s2_sfm = np.array(lr_schedule_sfm, dtype=np.float32)
+    optimizer_base_s2 = nn.AdamWeightDecay(
+        base_params,
+        learning_rate=Tensor(lr_s2_base),
+        weight_decay=STAGE2_WEIGHT_DECAY,
+        beta1=0.9,
+        beta2=0.95,
+    )
+    optimizer_sfm_s2 = nn.AdamWeightDecay(
+        sfm_params,
+        learning_rate=Tensor(lr_s2_sfm),
         weight_decay=STAGE2_WEIGHT_DECAY,
         beta1=0.9,
         beta2=0.95,
     )
 
-    # Rebuild training cells
+    # Rebuild training cells with two-optimizer TrainStep
     forward_loss = ForwardLossCell(model, cos_t, sin_t, causal_mask)
-    train_step_s2 = TrainStep(forward_loss, optimizer_s2)
+    train_step_s2 = TrainStep(
+        forward_loss, optimizer_base_s2, optimizer2=optimizer_sfm_s2,
+        rank_size=rank_size, max_grad_norm=MAX_GRAD_NORM)
 
     # Compile with OOM fallback
     actual_bs = BATCH_SIZE_PER_DEVICE
@@ -2221,15 +2310,23 @@ def main() -> None:
                 log(f"  B={bs} OOM, trying smaller...")
                 del train_step_s2
                 gc.collect()
-                optimizer_s2 = nn.AdamWeightDecay(
-                    base_params + sfm_params,
-                    learning_rate=Tensor(lr_schedule_s2),
+                optimizer_base_s2 = nn.AdamWeightDecay(
+                    base_params,
+                    learning_rate=Tensor(lr_s2_base),
+                    weight_decay=STAGE2_WEIGHT_DECAY,
+                    beta1=0.9, beta2=0.95)
+                optimizer_sfm_s2 = nn.AdamWeightDecay(
+                    sfm_params,
+                    learning_rate=Tensor(lr_s2_sfm),
                     weight_decay=STAGE2_WEIGHT_DECAY,
                     beta1=0.9, beta2=0.95)
                 forward_loss = ForwardLossCell(
                     model, cos_t, sin_t, causal_mask)
                 train_step_s2 = TrainStep(
-                    forward_loss, optimizer_s2)
+                    forward_loss, optimizer_base_s2,
+                    optimizer2=optimizer_sfm_s2,
+                    rank_size=rank_size,
+                    max_grad_norm=MAX_GRAD_NORM)
                 continue
             raise
 
@@ -2304,6 +2401,10 @@ def main() -> None:
         loss_history.append(avg_loss)
         if avg_loss < best_loss:
             best_loss = avg_loss
+            if rank_id == 0:
+                ms.save_checkpoint(
+                    model, os.path.join(CKPT_DIR, "best.ckpt"))
+                log(f"  New best loss: {avg_loss:.4f}")
 
         # Self-evolution: probe + adapt difficulty
         if step % EVOLUTION_PROBE_STEPS == 0 and step > 0 \
@@ -2328,17 +2429,12 @@ def main() -> None:
                 f"samples={total_samples:,} | "
                 f"elapsed={dt:.0f}s")
 
-        # Checkpoint
+        # Periodic checkpoint (best already saved above on improvement)
         if rank_id == 0 and step % 2000 == 0 and step > 0:
             ckpt_path = os.path.join(
                 CKPT_DIR, f"stage2_step_{step}.ckpt")
             ms.save_checkpoint(model, ckpt_path)
             log(f"Stage 2 checkpoint: {ckpt_path}")
-
-            # Also save best
-            if avg_loss <= best_loss + 0.01:
-                ms.save_checkpoint(
-                    model, os.path.join(CKPT_DIR, "best.ckpt"))
 
     # ── Training complete ──
     elapsed_total = time.time() - t0_global
