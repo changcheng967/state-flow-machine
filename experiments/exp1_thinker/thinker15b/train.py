@@ -556,6 +556,8 @@ class DeltaNetCell(nn.Cell):
         """
         B, S, _ = x.shape
         D = DELTANET_HIDDEN_DIM
+        NH = self.NH
+        HD = self.HD
 
         # Project to key, value, beta — all (B, S, D)
         x_f32 = x.astype(ms.float32)
