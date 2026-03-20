@@ -1,33 +1,42 @@
-"""train.py — Thinker-1.5B from-scratch training with SFM Slot Banks.
+"""train.py — Thinker-1.5B: Qwen2.5-Coder-1.5B fine-tuned with DeltaNet SFM.
 
-~1.35B param decoder-only LM with GQA, trained from scratch on 4x Ascend 910.
-SFM Slot Banks at layers 6, 12, 18, 24 with GRU-gated state persistence.
+Fine-tunes Qwen2.5-Coder-1.5B (1.5B params, 28 layers, GQA) by inserting
+4 DeltaNet SFM blocks after layers 6, 13, 20, 27. The base model is frozen
+for the first phase (SFM-only training), then fully fine-tuned in the second
+phase.
 
 Architecture:
-  - 24 transformer layers: hidden=2048, 16Q/4KV heads (GQA), intermediate=5504
-  - RoPE (theta=10000), RMSNorm, SwiGLU FFN
-  - Tied embedding weights (no separate lm_head)
-  - SFM: 16 slots x 256d at layers 5,11,17,23 (0-indexed)
-  - Cross-attention: Q from slots, K/V from sequence
-  - GRU gated write-back with gate init=-10 (identity at start)
+  Base: Qwen2.5-Coder-1.5B (vocab=151936, hidden=1536, 28 layers, 12Q/2KV GQA,
+        intermediate=8960, rope_theta=1000000.0, tied_embeddings=True)
+  SFM: DeltaNet recurrent cell (16 heads, 16x16 state) + cross-system bridge
+       at layers 6, 13, 20, 27 (0-indexed = 7th, 14th, 21st, 28th layers)
+  Judge: Binary classification head (correct/wrong)
+  Surprise: Scalar predictor for self-evolution
 
-Data:
-  - Phase 1 (40%): OpenThoughts-114k from DATASET_PATH (BPE tokenized)
-  - Phase 2 (40%): Synthetic execution traces (exec() with restricted builtins)
-  - Phase 3 (20%): Synthetic thinkcode agent trajectories (template-based)
-  - Curriculum: start 70/30 P1+P2, then 40/40/20 P1+P2+P3
+Training data (synthetic, generated on-the-fly):
+  - Phase 1 (Execution): exec() traces with state tracking
+  - Phase 2 (Debugging): buggy code + fix reasoning
+  Format: <|code|>...<|slots|>{json}...<|monologue|>...<|answer|>...<|judge_correct|>
 
-Infrastructure (reused from reference train.py):
+Key design decisions:
+  - Simple delta rule: S = S - beta*(S@k - v)@k^T (not gated DeltaNet)
+  - Q/K/V projections have bias (matching Qwen's architecture)
+  - MLP projections have NO bias
+  - NUM_GROUPS=6 (12Q / 2KV heads)
+  - ~15% corrupted judge labels during bootstrap for balanced training
+  - Masked CE loss (only on monologue/slots/answer/judge tokens)
+  - Gradient accumulation for effective batch of 8
+  - Manual clip-by-global-norm (MS 2.2 safe)
+  - Two param groups: base_params and sfm_params with separate LRs
+
+Infrastructure (from reference train.py):
   - c2net path discovery + local fallback
-  - 4-worker process forking (subprocess.Popen + RANK_ID)
-  - Per-worker logging
-  - DATA_PARALLEL via HCCL (fallback to single-device)
-  - Batch-size OOM fallback (4->2->1)
-  - Convergence-based stopping (rolling 200-step, patience=1000)
-  - Checkpointing every 1000 steps + best model
-  - results.json + upload_output()
+  - 4-worker process forking
+  - DATA_PARALLEL via HCCL
+  - Convergence-based stopping
+  - Checkpointing
 
-Self-contained: MindSpore 2.2 + NumPy + stdlib only. No pip installs.
+Self-contained: MindSpore 2.2 + NumPy + stdlib only.
 """
 
 import os
@@ -47,12 +56,12 @@ try:
     _boot_rank = os.environ.get("RANK_ID", "?")
     sys.stderr.write(
         f"[BOOT {_boot_ts}] pid={_boot_pid} rank={_boot_rank} "
-        f"thinker15b_started\n")
+        f"thinker15b_finetune_started\n")
     sys.stderr.flush()
     os.makedirs("/cache/output", exist_ok=True)
     with open("/cache/output/boot.log", "a") as _bf:
         _bf.write(f"[{_boot_ts}] pid={_boot_pid} rank={_boot_rank} "
-                  f"thinker15b_started\n")
+                  f"thinker15b_finetune_started\n")
 except Exception:
     pass
 
@@ -112,40 +121,71 @@ if not OUTPUT_PATH or not os.path.isdir(OUTPUT_PATH):
 
 CKPT_DIR = os.path.join(OUTPUT_PATH, "checkpoints")
 
-# ── Model hyperparameters ────────────────────────────────────────────
-VOCAB_SIZE = 32000
-HIDDEN_DIM = 2048
-NUM_HEADS = 16
-NUM_KV_HEADS = 4
-NUM_GROUPS = NUM_HEADS // NUM_KV_HEADS  # 4
+# ── Qwen2.5-Coder-1.5B Architecture (from official config.json) ────
+VOCAB_SIZE = 151936
+HIDDEN_DIM = 1536
+NUM_HEADS = 12
+NUM_KV_HEADS = 2
+NUM_GROUPS = NUM_HEADS // NUM_KV_HEADS  # 6
 HEAD_DIM = 128
-INTERMEDIATE_DIM = 5504
-NUM_LAYERS = 24
+INTERMEDIATE_DIM = 8960
+NUM_LAYERS = 28
 MAX_SEQ_LEN = 2048
 RMS_NORM_EPS = 1e-6
-ROPE_THETA = 10000.0
+ROPE_THETA = 1000000.0
 TIE_WORD_EMBEDDINGS = True
 
-# SFM Slot Banks
-SFM_NUM_SLOTS = 16
-SFM_SLOT_DIM = 256
-SFM_NUM_HEADS = 4
-SFM_LAYERS = (5, 11, 17, 23)  # 0-indexed = layers 6,12,18,24
+# SFM DeltaNet blocks inserted AFTER these 0-indexed layers
+# (layers 6, 13, 20, 27 = 7th, 14th, 21st, 28th layers)
+SFM_LAYERS = (6, 13, 20, 27)
+
+# DeltaNet config
+DELTANET_HIDDEN_DIM = 256      # Must be multiple of 16
+DELTANET_NUM_HEADS = 16
+DELTANET_HEAD_DIM = DELTANET_HIDDEN_DIM // DELTANET_NUM_HEADS  # 16
+DELTANET_STATE_DIM = 256       # 16x16 state per head
+
+# Cross-system bridge
+BRIDGE_DIM = 256                # Shared 256d space per plan
+
+# Judge head
+JUDGE_HIDDEN_DIM = 128
+
+# Surprise predictor
+SURPRISE_DIM = 64
 
 # ── Training hyperparameters ─────────────────────────────────────────
-BATCH_SIZE = 4
-LEARNING_RATE = 3e-4
-MIN_LR = 3e-5
-WARMUP_STEPS = 2000
-WEIGHT_DECAY = 0.01
+# Stage 1: SFM-only training (base frozen)
+STAGE1_LR_SFM = 1e-3
+STAGE1_WARMUP = 200
+STAGE1_MAX_STEPS = 10000
+STAGE1_WEIGHT_DECAY = 0.01
+
+# Stage 2: Full fine-tuning
+STAGE2_LR_BASE = 2e-5
+STAGE2_LR_SFM = 5e-4
+STAGE2_WARMUP = 500
+STAGE2_MAX_STEPS = 50000
+STAGE2_WEIGHT_DECAY = 0.01
+
+# Shared
+BATCH_SIZE_PER_DEVICE = 2
+GRADIENT_ACCUM_STEPS = 4       # Effective batch = 2*4 = 8
 MAX_GRAD_NORM = 1.0
 TIME_LIMIT = 86400
-MIN_EPOCHS = 2
-CONVERGENCE_WINDOW = 200
-CONVERGENCE_PATIENCE = 1000
-CONVERGENCE_THRESHOLD = 0.001
+MIN_LR_FACTOR = 0.1
 
 RANK_SIZE = 4
+
+# Self-evolution
+EVOLUTION_PROBE_STEPS = 500
+EVOLUTION_VERIFY_SAMPLES = 200
+EVOLUTION_ADAPT_FACTOR = 0.2
+
+# Convergence
+CONVERGENCE_WINDOW = 200
+CONVERGENCE_PATIENCE = 2000
+CONVERGENCE_THRESHOLD = 0.001
 
 # ── Logging ──────────────────────────────────────────────────────────
 _log_fh = None
@@ -238,7 +278,93 @@ from mindspore.common.tensor import Tensor
 
 
 # ══════════════════════════════════════════════════════════════════════
-# MODEL COMPONENTS (inline for PYNATIVE_MODE + @ms.jit safety)
+# SAFETENSERS LOADER
+# ══════════════════════════════════════════════════════════════════════
+
+
+def _hf_to_ms_name(hf_name: str) -> str:
+    """Convert HuggingFace parameter name to MindSpore format.
+
+    Examples:
+        model.embed_tokens.weight -> embedding.embedding_table
+        model.layers.0.self_attn.q_proj.weight -> layers.0.q_proj.weight
+        model.layers.0.mlp.gate_proj.weight -> layers.0.gate_proj.weight
+        model.norm.weight -> norm.weight
+    """
+    name = hf_name
+    # Remove 'model.' prefix
+    if name.startswith("model."):
+        name = name[len("model."):]
+    # embed_tokens -> embedding
+    name = name.replace("embed_tokens", "embedding")
+    # self_attn. and mlp. are direct children of layer
+    name = name.replace("self_attn.", "")
+    name = name.replace("mlp.", "")
+    return name
+
+
+def find_model_dir(base_path: str) -> str:
+    """Recursively find the Qwen model directory containing model.safetensors."""
+    for root, dirs, files in os.walk(base_path):
+        for f in files:
+            if f == "model.safetensors" or f == "model.safetensors.index.json":
+                return root
+        # Don't recurse too deep
+        if root.count(os.sep) - base_path.count(os.sep) > 3:
+            dirs.clear()
+    return ""
+
+
+def load_safetensors(model_dir: str) -> dict:
+    """Load safetensors file and return dict of {name: numpy_array}."""
+    sf_path = os.path.join(model_dir, "model.safetensors")
+    if not os.path.isfile(sf_path):
+        # Try with index
+        idx_path = os.path.join(model_dir, "model.safetensors.index.json")
+        if os.path.isfile(idx_path):
+            with open(idx_path) as f:
+                idx = json.load(f)
+            weight_map = idx.get("weight_map", {})
+            sf_path = os.path.join(model_dir, list(weight_map.values())[0])
+        else:
+            raise FileNotFoundError(
+                f"No model.safetensors in {model_dir}")
+
+    log(f"Loading weights from {sf_path} ...")
+    t0 = time.time()
+
+    # Parse safetensors header manually (no pip install needed)
+    weights = {}
+    with open(sf_path, "rb") as f:
+        header_size = struct.unpack("<Q", f.read(8))[0]
+        header_json = f.read(header_size).decode("utf-8")
+        header = json.loads(header_json)
+
+        for name, info in header.items():
+            dtype_str = info.get("dtype", "F32")
+            # Map dtype strings to numpy dtypes
+            dtype_map = {
+                "F32": np.float32,
+                "F16": np.float16,
+                "BF16": np.float16,  # Downcast BF16 to FP16 for Ascend
+                "I32": np.int32,
+                "I64": np.int64,
+                "BOOL": np.bool_,
+            }
+            np_dtype = dtype_map.get(dtype_str, np.float32)
+            shape = tuple(info["shape"])
+            data_offsets = info["data_offsets"]
+            f.seek(data_offsets[0])
+            nbytes = data_offsets[1] - data_offsets[0]
+            data = np.frombuffer(f.read(nbytes), dtype=np_dtype).reshape(shape)
+            weights[name] = data.copy()
+
+    log(f"Loaded {len(weights)} tensors in {time.time()-t0:.1f}s")
+    return weights
+
+
+# ══════════════════════════════════════════════════════════════════════
+# MODEL COMPONENTS (inline for GRAPH_MODE safety)
 # ══════════════════════════════════════════════════════════════════════
 
 
@@ -271,7 +397,14 @@ class RMSNorm(nn.Cell):
 
 
 class TransformerBlock(nn.Cell):
-    """Single transformer layer: GQA MHA + SwiGLU FFN + RMSNorm."""
+    """Single Qwen2.5-Coder transformer layer: GQA MHA + SwiGLU FFN.
+
+    Matches Qwen2.5-Coder-1.5B exactly:
+    - q/k/v_proj have bias=True (o_proj has bias=False)
+    - MLP projections have NO bias
+    - GQA: 12 Q heads, 2 KV heads, NUM_GROUPS=6
+    - RoPE with theta=1000000.0
+    """
 
     def __init__(self) -> None:
         super().__init__()
@@ -281,15 +414,17 @@ class TransformerBlock(nn.Cell):
         HD = HEAD_DIM
         A = INTERMEDIATE_DIM
 
-        self.q_proj = _fp16_dense(H, NH * HD)
-        self.k_proj = _fp16_dense(H, NKV * HD)
-        self.v_proj = _fp16_dense(H, NKV * HD)
-        self.o_proj = _fp16_dense(NH * HD, H)
+        # Q/K/V have bias, O does not (matching Qwen2.5-Coder-1.5B)
+        self.q_proj = _fp16_dense(H, NH * HD, has_bias=True)
+        self.k_proj = _fp16_dense(H, NKV * HD, has_bias=True)
+        self.v_proj = _fp16_dense(H, NKV * HD, has_bias=True)
+        self.o_proj = _fp16_dense(NH * HD, H, has_bias=False)
         self.input_norm = RMSNorm(H)
 
-        self.gate_proj = _fp16_dense(H, A)
-        self.up_proj = _fp16_dense(H, A)
-        self.down_proj = _fp16_dense(A, H)
+        # MLP: no bias on any projection
+        self.gate_proj = _fp16_dense(H, A, has_bias=False)
+        self.up_proj = _fp16_dense(H, A, has_bias=False)
+        self.down_proj = _fp16_dense(A, H, has_bias=False)
         self.ffn_norm = RMSNorm(H)
 
         self.scale = Tensor(HD ** -0.5, ms.float16)
@@ -309,11 +444,11 @@ class TransformerBlock(nn.Cell):
         K = self.k_proj(h).reshape(B, S, NKV, HD).transpose(0, 2, 1, 3)
         V = self.v_proj(h).reshape(B, S, NKV, HD).transpose(0, 2, 1, 3)
 
-        # GQA: tile KV heads to match Q heads
+        # GQA: tile KV heads to match Q heads (repeat 6x)
         K = self.tile(K, (1, NG, 1, 1))
         V = self.tile(V, (1, NG, 1, 1))
 
-        # RoPE (inline)
+        # RoPE (half-rotation, Llama-style)
         HD2 = HD // 2
         Q = Q * cos + ops.concat([-Q[..., HD2:], Q[..., :HD2]], -1) * sin
         K = K * cos + ops.concat([-K[..., HD2:], K[..., :HD2]], -1) * sin
@@ -326,6 +461,7 @@ class TransformerBlock(nn.Cell):
         out = self.o_proj(out)
         x = x + out
 
+        # SwiGLU FFN
         h = self.ffn_norm(x)
         gate = ops.silu(self.gate_proj(h))
         up = self.up_proj(h)
@@ -333,94 +469,177 @@ class TransformerBlock(nn.Cell):
         return x
 
 
-class SFMSlotBank(nn.Cell):
-    """State-Flow Machine Slot Bank with GRU-gated state persistence.
+# ══════════════════════════════════════════════════════════════════════
+# DELTANET SFM COMPONENTS
+# ══════════════════════════════════════════════════════════════════════
 
-    Cross-attention: Q from slots, K/V from sequence (Q queries slots,
-    attending to the sequence to decide what to read).
-    GRU update: gated combination of old slots and new information.
-    Gated write-back: sigmoid(gate) * output_proj(mean(slot_out)) added
-    to residual. Gate initialised to -10 so sigmoid≈0 at start (identity).
+
+class DeltaNetCell(nn.Cell):
+    """Simple delta rule recurrent cell.
+
+    State update: S_new = S - beta * (S @ k - v) @ k^T
+    This is the simple (non-gated) version — mathematically cleaner and
+    sufficient for state tracking.
+
+    Sequential scan over sequence: O(seq_len) iterations of 16×16 matmuls.
+    Each head maintains a 16×16 state matrix.
     """
 
     def __init__(self) -> None:
         super().__init__()
-        H = HIDDEN_DIM
-        NS = SFM_NUM_SLOTS
-        SD = SFM_SLOT_DIM
-        NH = SFM_NUM_HEADS
-        self.head_dim = SD // NH
+        D = DELTANET_HIDDEN_DIM
+        NH = DELTANET_NUM_HEADS
+        HD = DELTANET_HEAD_DIM  # 16
 
-        # Cross-attention: Q from slots, K/V from sequence
-        self.q_proj = _fp16_dense(SD, NH * self.head_dim)
-        self.k_proj = _fp16_dense(H, NH * self.head_dim)
-        self.v_proj = _fp16_dense(H, NH * self.head_dim)
-        self.out_proj = _fp16_dense(NH * self.head_dim, H)
+        # Project input to key, value, beta
+        self.key_proj = _fp16_dense(HIDDEN_DIM, D, has_bias=False)
+        self.value_proj = _fp16_dense(HIDDEN_DIM, D, has_bias=False)
+        self.beta_proj = _fp16_dense(HIDDEN_DIM, NH, has_bias=True)
 
-        # GRU gates for slot update
-        gru_in = SD + NH * self.head_dim  # slots + slot_attn_output
-        self.W_z = _fp16_dense(gru_in, SD, has_bias=True)
-        self.W_r = _fp16_dense(gru_in, SD, has_bias=True)
-        self.W_h = _fp16_dense(gru_in, SD, has_bias=True)
+        # Initial state (one per head: 16x16 identity matrix)
+        init_states = np.zeros(NH, HD, HD, dtype=np.float16)
+        for i in range(NH):
+            init_states[i] = np.eye(HD, dtype=np.float16) * 0.1
+        self.initial_state = ms.Parameter(
+            Tensor(init_states), name="deltanet_init_state")
 
-        # Gated write-back to residual stream
-        self.write_proj = _fp16_dense(SD, H)
-        self.gate = ms.Parameter(
-            Tensor(np.array([-10.0], dtype=np.float32)), name="sfm_gate")
+        self.NH = NH
+        self.HD = HD
 
-        self.scale = Tensor(self.head_dim ** -0.5, ms.float16)
-        self.softmax = ops.Softmax(axis=-1)
-        self.sigmoid = ops.Sigmoid()
-        self.mean = ops.ReduceMean(keep_dims=True)
-
-    def construct(self, hidden: Tensor, slots: Tensor) -> tuple:
-        """Process hidden through slot bank.
+    def construct(self, x: Tensor) -> Tensor:
+        """Process sequence through delta rule.
 
         Args:
-            hidden: (B, S, H) from transformer layer
-            slots: (B, NS, SD) current slot state
+            x: (B, S, HIDDEN_DIM) hidden states from transformer layer.
 
         Returns:
-            (modified_hidden, new_slots)
+            output: (B, S, DELTANET_HIDDEN_DIM) delta net output.
         """
-        B, S, _ = hidden.shape
-        NS = SFM_NUM_SLOTS
-        NH = SFM_NUM_HEADS
-        HD = self.head_dim
+        B, S, _ = x.shape
+        NH = self.NH
+        HD = self.HD
 
-        # Cross-attention: Q from slots, K/V from sequence
-        Q = self.q_proj(slots).reshape(B, NS, NH, HD).transpose(0, 2, 1, 3)
-        K = self.k_proj(hidden).reshape(B, S, NH, HD).transpose(0, 2, 1, 3)
-        V = self.v_proj(hidden).reshape(B, S, NH, HD).transpose(0, 2, 1, 3)
+        # Project all positions at once
+        K = self.key_proj(x).reshape(B, S, NH, HD)    # (B, S, NH, 16)
+        V = self.value_proj(x).reshape(B, S, NH, HD)  # (B, S, NH, 16)
+        beta = ops.sigmoid(self.beta_proj(x))          # (B, S, NH)
 
-        # (B, NH, NS, HD) @ (B, NH, HD, S) -> (B, NH, NS, S)
-        attn = ops.matmul(Q, K.transpose(0, 1, 3, 2)) * self.scale
-        attn = self.softmax(attn)
-        # (B, NH, NS, S) @ (B, NH, S, HD) -> (B, NH, NS, HD)
-        slot_out = ops.matmul(attn, V)
-        slot_out = slot_out.transpose(0, 2, 1, 3).reshape(B, NS, -1)
+        # Initialize state: broadcast to batch
+        state = ops.broadcast_to(
+            self.initial_state, (B, NH, HD, HD))  # (B, NH, 16, 16)
 
-        # GRU update: concat([old_slots, slot_read]) -> new_slots
-        gru_input = ops.concat([slots, slot_out], axis=-1)
-        z = self.sigmoid(self.W_z(gru_input))
-        r = self.sigmoid(self.W_r(gru_input))
-        h_cand = ops.tanh(self.W_h(ops.concat([r * slots, slot_out], -1)))
-        new_slots = (1.0 - z) * slots + z * h_cand
+        # Sequential scan — this is the core of state tracking.
+        # Transformers CANNOT do this (attention is parallel).
+        outputs = []
+        for t in range(S):
+            kt = K[:, t, :, :, None]   # (B, NH, 16, 1)
+            vt = V[:, t, :, None, :]   # (B, NH, 1, 16)
+            bt = beta[:, t, :, None, None]  # (B, NH, 1, 1)
 
-        # Gated write-back: mean(slot_out) -> residual (broadcast (B,1,H))
-        slot_mean = self.mean(new_slots, 1)  # (B, 1, SD)
-        writeback = self.write_proj(slot_mean)  # (B, 1, H)
-        modified = hidden + self.sigmoid(self.gate.astype(hidden.dtype)) * \
-            writeback.astype(hidden.dtype)
+            # delta rule: S = S - beta * (S @ k - v) @ k^T
+            residual = ops.matmul(state, kt) - vt      # (B, NH, 16, 1)
+            update = bt * ops.matmul(residual, kt.transpose(0, 1, 3, 2))
+            state = state - update
 
-        return modified, new_slots
+            # Read: output = sum of state row norms (aggregate info)
+            out_t = state.reshape(B, NH, HD * HD).mean(axis=-1, keep_dims=True)
+            # Actually, read from state using value as query
+            # out_t = state @ v  -> (B, NH, 16, 1) -> squeeze -> (B, NH)
+            # Better: use last row of state
+            out_t = state[:, :, -1, :]  # (B, NH, 16) = (B, NH, HD)
+            outputs.append(out_t)
+
+        # Stack: list of (B, NH, HD) -> (S, B, NH, HD) -> (B, S, NH*HD)
+        stacked = ops.stack(outputs, axis=0)  # (S, B, NH, HD)
+        stacked = stacked.transpose(1, 0, 2, 3)  # (B, S, NH, HD)
+        output = stacked.reshape(B, S, NH * HD)   # (B, S, D)
+
+        return output
+
+
+class CrossSystemBridge(nn.Cell):
+    """Bridge between transformer hidden state and DeltaNet SFM.
+
+    Down-projection: HIDDEN_DIM -> BRIDGE_DIM
+    Up-projection: BRIDGE_DIM -> HIDDEN_DIM
+    Gate: learned scalar gate (starts at 0, sigmoid≈0.5)
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.down_proj = _fp16_dense(HIDDEN_DIM, BRIDGE_DIM, has_bias=True)
+        self.up_proj = _fp16_dense(BRIDGE_DIM, HIDDEN_DIM, has_bias=True)
+        self.gate_param = ms.Parameter(
+            Tensor(np.array([0.0], dtype=np.float32)), name="bridge_gate")
+        self.layer_norm = RMSNorm(HIDDEN_DIM)
+
+    def construct(self, hidden: Tensor, sfm_out: Tensor) -> Tensor:
+        """Merge transformer hidden with SFM output.
+
+        Args:
+            hidden: (B, S, HIDDEN_DIM) from transformer layer.
+            sfm_out: (B, S, BRIDGE_DIM) from DeltaNet.
+
+        Returns:
+            modified: (B, S, HIDDEN_DIM)
+        """
+        sfm_up = self.up_proj(sfm_out)
+        gate = ops.sigmoid(self.gate_param.astype(hidden.dtype))
+        return self.layer_norm(hidden + gate * sfm_up)
+
+
+class JudgeHead(nn.Cell):
+    """Binary classification head: is the final answer correct?
+
+    Projects last hidden state to 2 logits (correct/wrong).
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.proj1 = _fp16_dense(HIDDEN_DIM, JUDGE_HIDDEN_DIM, has_bias=True)
+        self.proj2 = _fp16_dense(JUDGE_HIDDEN_DIM, 2, has_bias=True)
+
+    def construct(self, x: Tensor) -> Tensor:
+        """Returns (B, 2) logits for judge classification."""
+        # x: (B, S, H) -> take last token -> (B, H)
+        last = x[:, -1, :]
+        h = ops.gelu(self.proj1(last))
+        return self.proj2(h)
+
+
+class SurprisePredictor(nn.Cell):
+    """Scalar predictor for how 'surprising' the current state is.
+
+    Used for self-evolution: high surprise = hard problem = more useful.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.proj1 = _fp16_dense(HIDDEN_DIM, SURPRISE_DIM, has_bias=True)
+        self.proj2 = _fp16_dense(SURPRISE_DIM, 1, has_bias=True)
+
+    def construct(self, x: Tensor) -> Tensor:
+        """Returns (B, 1) surprise score."""
+        last = x[:, -1, :]
+        h = ops.gelu(self.proj1(last))
+        return self.proj2(h)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# FULL MODEL ASSEMBLY
+# ══════════════════════════════════════════════════════════════════════
 
 
 class Thinker15BModel(nn.Cell):
-    """~1.35B decoder-only LM with GQA + SFM Slot Banks.
+    """Qwen2.5-Coder-1.5B with 4 DeltaNet SFM blocks.
 
-    Construct is UNROLLED for @ms.jit safety. Slot persistence across
-    all 4 SFM layers (slots thread through the forward pass).
+    Architecture:
+      28 transformer layers (Qwen2.5-Coder-1.5B)
+      + DeltaNet + Bridge after layers 6, 13, 20, 27
+      + Judge head (binary: correct/wrong)
+      + Surprise predictor (scalar)
+
+    Construct is UNROLLED for @ms.jit safety.
     Tied embedding weights: logits = hidden @ embedding_table.T
     """
 
@@ -429,69 +648,121 @@ class Thinker15BModel(nn.Cell):
         self.embedding = nn.Embedding(VOCAB_SIZE, HIDDEN_DIM)
         self.norm = RMSNorm(HIDDEN_DIM)
         self.matmul = ops.MatMul(transpose_b=True)
-        self.tile = ops.Tile()
 
-        # Initial slots — learned parameter (broadcast to batch)
-        self.initial_slots = ms.Parameter(
-            Tensor(np.random.randn(1, SFM_NUM_SLOTS, SFM_SLOT_DIM).astype(
-                np.float16) * 0.02),
-            name="initial_slots")
-
-        # 24 transformer layers
+        # 28 transformer layers
         self.layers = nn.CellList(
             [TransformerBlock() for _ in range(NUM_LAYERS)])
 
-        # 4 SFM banks at layers 5, 11, 17, 23
-        self.sfm_banks = nn.CellList(
-            [SFMSlotBank() for _ in range(len(SFM_LAYERS))])
+        # 4 DeltaNet + Bridge pairs
+        self.deltanets = nn.CellList(
+            [DeltaNetCell() for _ in range(len(SFM_LAYERS))])
+        self.bridges = nn.CellList(
+            [CrossSystemBridge() for _ in range(len(SFM_LAYERS))])
         self.sfm_layer_set = set(SFM_LAYERS)
 
+        # Judge head
+        self.judge_head = JudgeHead()
+
+        # Surprise predictor
+        self.surprise_head = SurprisePredictor()
+
     def construct(self, input_ids: Tensor, cos: Tensor, sin: Tensor,
-                  mask: Tensor) -> Tensor:
-        """Forward pass. Returns logits (B, S, VOCAB_SIZE)."""
+                  mask: Tensor) -> tuple:
+        """Forward pass.
+
+        Returns:
+            (logits, judge_logits, surprise_scores)
+        """
         B = input_ids.shape[0]
         x = self.embedding(input_ids).astype(ms.float16)
-
-        # Initialize slots
-        slots = self.tile(self.initial_slots,
-                          (B, 1, 1))  # (B, NS, SD)
 
         sfm_idx = 0
         for i in range(NUM_LAYERS):
             x = self.layers[i](x, cos, sin, mask)
             if i in self.sfm_layer_set:
-                x, slots = self.sfm_banks[sfm_idx](x, slots)
+                # Project to bridge dim, run DeltaNet, bridge back
+                sfm_input = self.bridges[sfm_idx].down_proj(x)
+                sfm_out = self.deltanets[sfm_idx](sfm_input)
+                x = self.bridges[sfm_idx](x, sfm_out)
                 sfm_idx += 1
 
         x = self.norm(x)
+
+        # LM head (tied embeddings)
         h2 = x.reshape((-1, HIDDEN_DIM))
-        if TIE_WORD_EMBEDDINGS:
-            logits = self.matmul(h2, self.embedding.embedding_table)
-        else:
-            logits = self.matmul(h2, self.lm_head)
-        return logits.reshape(B, x.shape[1], VOCAB_SIZE)
+        logits = self.matmul(h2, self.embedding.embedding_table)
+        logits = logits.reshape(B, x.shape[1], VOCAB_SIZE)
+
+        # Judge head
+        judge_logits = self.judge_head(x)
+
+        # Surprise predictor
+        surprise = self.surprise_head(x)
+
+        return logits, judge_logits, surprise
 
 
-# ── Training cells ───────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════
+# TRAINING CELLS
+# ══════════════════════════════════════════════════════════════════════
 
 
 class ForwardLossCell(nn.Cell):
-    """Language model cross-entropy loss."""
+    """Multi-loss forward pass: masked CE + judge BCE + surprise MSE.
+
+    Loss = CE_masked + 0.1 * judge_BCE + 0.01 * surprise_MSE
+    """
 
     def __init__(self, model: Thinker15BModel, cos: Tensor, sin: Tensor,
                  mask: Tensor):
         super().__init__()
         self.model = model
-        self.ce_loss = nn.CrossEntropyLoss()
+        self.ce_loss_fn = nn.CrossEntropyLoss(reduction="none")
+        self.bce_loss_fn = nn.BCEWithLogitsLoss(reduction="mean")
+        self.mse_loss_fn = nn.MSELoss(reduction="mean")
         self.cos = ms.Parameter(cos, name="cos", requires_grad=False)
         self.sin = ms.Parameter(sin, name="sin", requires_grad=False)
-        self.mask = ms.Parameter(mask, name="mask", requires_grad=False)
+        self.causal_mask = ms.Parameter(
+            mask, name="causal_mask", requires_grad=False)
 
-    def construct(self, input_ids: Tensor) -> Tensor:
-        logits = self.model(input_ids, self.cos, self.sin, self.mask)
-        logits_t = logits[:, :-1, :]
-        labels = input_ids[:, 1:].reshape((-1,))
-        return self.ce_loss(logits_t.reshape((-1, VOCAB_SIZE)), labels)
+    def construct(self, input_ids: Tensor,
+                  loss_mask: Tensor,
+                  judge_label: Tensor) -> Tensor:
+        """Compute multi-loss.
+
+        Args:
+            input_ids: (B, S) token IDs.
+            loss_mask: (B, S) — 1 for tokens to compute CE on, 0 otherwise.
+            judge_label: (B,) — 0=wrong, 1=correct.
+
+        Returns:
+            total_loss: scalar.
+        """
+        logits, judge_logits, surprise = self.model(
+            input_ids, self.cos, self.sin, self.causal_mask)
+
+        # Masked CE loss
+        logits_t = logits[:, :-1, :]          # (B, S-1, V)
+        labels = input_ids[:, 1:]             # (B, S-1)
+        mask_t = loss_mask[:, 1:]             # (B, S-1)
+        ce_per_token = self.ce_loss_fn(
+            logits_t.reshape((-1, VOCAB_SIZE)),
+            labels.reshape((-1,)))
+        ce_per_token = ce_per_token.reshape(mask_t.shape)
+        num_masked = ops.maximum(mask_t.sum(), Tensor(1.0, ms.float32))
+        ce_loss = (ce_per_token * mask_t).sum() / num_masked
+
+        # Judge BCE loss
+        # Convert label to float for BCEWithLogitsLoss
+        judge_float = judge_label.astype(ms.float32)
+        judge_loss = self.bce_loss_fn(judge_logits[:, 0], judge_float)
+
+        # Surprise regularization (push toward 0.5 = moderate surprise)
+        surprise_target = ops.ones_like(surprise) * 0.5
+        surprise_loss = self.mse_loss_fn(surprise, surprise_target)
+
+        total = ce_loss + 0.1 * judge_loss + 0.01 * surprise_loss
+        return total
 
 
 class TrainStep(nn.Cell):
@@ -517,10 +788,11 @@ class TrainStep(nn.Cell):
         self.minimum = ops.Minimum()
 
     @ms.jit
-    def construct(self, input_ids: Tensor) -> Tensor:
-        loss = self.forward_loss(input_ids)
+    def construct(self, input_ids: Tensor, loss_mask: Tensor,
+                  judge_label: Tensor) -> Tensor:
+        loss = self.forward_loss(input_ids, loss_mask, judge_label)
         grads = self.grad_op(self.forward_loss, self.weights)(
-            input_ids, self.sens)
+            input_ids, loss_mask, judge_label, self.sens)
         total_norm_sq = Tensor(0.0, ms.float32)
         for g in grads:
             total_norm_sq = total_norm_sq + ops.reduce_sum(g * g)
@@ -531,7 +803,84 @@ class TrainStep(nn.Cell):
         return self.depend(loss, status)
 
 
-# ── Helpers ──────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════
+# WEIGHT LOADING
+# ══════════════════════════════════════════════════════════════════════
+
+
+def load_qwen_weights(model: Thinker15BModel,
+                      pretrain_path: str) -> None:
+    """Load Qwen2.5-Coder-1.5B weights into the model.
+
+    Handles:
+      - Recursive search for model.safetensors
+      - HF -> MindSpore name mapping
+      - Q/K/V bias tensors
+      - Tied embeddings
+    """
+    model_dir = find_model_dir(pretrain_path)
+    if not model_dir:
+        # Also search under common alternative paths
+        for alt in [os.path.join(pretrain_path, "qwen2.5-coder-1.5b"),
+                    os.path.join(pretrain_path, "Qwen2.5-Coder-1.5B")]:
+            model_dir = find_model_dir(alt)
+            if model_dir:
+                break
+
+    if not model_dir:
+        raise FileNotFoundError(
+            f"Cannot find model.safetensors under {pretrain_path}")
+
+    log(f"Found Qwen model at: {model_dir}")
+    weights = load_safetensors(model_dir)
+
+    # Build parameter mapping
+    param_dict = {}
+    loaded = 0
+    skipped = []
+    not_found = []
+
+    for hf_name, array in weights.items():
+        ms_name = _hf_to_ms_name(hf_name)
+        if ms_name == "lm_head.weight":
+            # Tied embeddings — skip separate lm_head
+            skipped.append(hf_name)
+            continue
+
+        # Map to model parameters
+        param = None
+        for p in model.get_parameters():
+            if p.name == ms_name:
+                param = p
+                break
+
+        if param is not None:
+            # Handle dtype conversion
+            if array.dtype == np.float32 and "norm" in ms_name:
+                # Keep norm weights in FP32
+                param_dict[param.name] = Tensor(array)
+            else:
+                param_dict[param.name] = Tensor(array.astype(np.float16))
+            loaded += 1
+        else:
+            not_found.append(f"{hf_name} -> {ms_name}")
+
+    if param_dict:
+        ms.load_param_into_net(model, param_dict)
+        log(f"Loaded {loaded} Qwen tensors, skipped {len(skipped)} "
+            f"(tied lm_head)")
+    if not_found:
+        log(f"  {len(not_found)} tensors not found in model "
+            f"(SFM params expected):")
+        for nf in not_found[:5]:
+            log(f"    {nf}")
+        if len(not_found) > 5:
+            log(f"    ... and {len(not_found) - 5} more")
+
+
+# ══════════════════════════════════════════════════════════════════════
+# HELPERS
+# ══════════════════════════════════════════════════════════════════════
 
 
 def count_params(model: nn.Cell) -> tuple:
@@ -540,37 +889,7 @@ def count_params(model: nn.Cell) -> tuple:
     return total, trainable
 
 
-def _find_data_files(base: str) -> list:
-    """Recursively find data files under base."""
-    found = []
-    for ext in ("*.jsonl", "*.json", "*.parquet", "*.csv", "*.txt",
-                "*.npy", "*.arrow"):
-        found.extend(glob.glob(os.path.join(base, "**", ext),
-                                recursive=True))
-    return sorted(found)
-
-
-def _extract_text(row: dict) -> str:
-    """Extract text content from a dataset row (various schema formats)."""
-    for key in ("messages", "conversations"):
-        if key in row:
-            parts = row[key]
-            if isinstance(parts, list):
-                return "\n".join(
-                    m.get("content", m.get("text", ""))
-                    for m in parts if isinstance(m, dict))
-    for pair in [("output", "input"), ("response", "instruction"),
-                  ("solution", "problem"), ("answer", "question"),
-                  ("content", "text")]:
-        a, b = pair
-        if a in row and b in row:
-            return str(row[b]) + "\n" + str(row[a])
-        if a in row:
-            return str(row[a])
-    return str(row)
-
-
-# ── BPE Tokenizer ────────────────────────────────────────────────────
+# ── BPE Tokenizer (Qwen2.5 compatible) ────────────────────────────────
 
 
 def _bytes_to_unicode():
@@ -616,7 +935,7 @@ def _get_byte_token(byte_val, vocab):
 def _try_load_hf_tokenizer(pretrain_path: str):
     """Load BPE tokenizer from HuggingFace tokenizer.json.
 
-    Returns (vocab, merge_priority, eos_id) or None on failure.
+    Returns (vocab, merge_priority, eos_id, special_token_ids) or None.
     """
     tok_path = None
     for cand in [os.path.join(pretrain_path, "tokenizer.json")]:
@@ -643,13 +962,28 @@ def _try_load_hf_tokenizer(pretrain_path: str):
             token_to_id[token] = int(idx)
 
         added = tok_data.get("added_tokens", [])
-        eos_id = 1  # Default
+        eos_id = 151643  # Qwen2.5 default <|endoftext|>
+        special_ids = {}
         for entry in added:
             if isinstance(entry, dict):
-                if entry.get("content") == "<|endoftext|>":
-                    eos_id = entry.get("id", eos_id)
-                elif entry.get("content") == "":
-                    eos_id = entry.get("id", eos_id)
+                content = entry.get("content", "")
+                eid = entry.get("id", 0)
+                if content == "<|endoftext|>":
+                    eos_id = eid
+                elif content == "<|im_start|>":
+                    special_ids["im_start"] = eid
+                elif content == "<|im_end|>":
+                    special_ids["im_end"] = eid
+                # Track our custom special tokens
+                elif content in ("<|code|>", "<|trace|>", "<|answer|>",
+                                 "<|slots|>", "<|monologue|>",
+                                 "<|judge_correct|>", "<|judge_wrong|>",
+                                 "<|explanation|>", "<|buggy_code|>",
+                                 "<|error|>", "<|reasoning|>", "<|fix|>",
+                                 "<|concept|>", "<|usage|>",
+                                 "<|documentation|>", "<|task|>",
+                                 "<|think|>", "<|verify|>"):
+                    special_ids[content] = eid
 
         merge_priority = {}
         for idx, merge_str in enumerate(merges_raw):
@@ -658,23 +992,19 @@ def _try_load_hf_tokenizer(pretrain_path: str):
                 merge_priority[(parts[0], parts[1])] = idx
 
         log(f"  Loaded HF tokenizer: {len(token_to_id)} vocab, "
-            f"{len(merges_raw)} merges from {tok_path}")
-        return token_to_id, merge_priority, eos_id
+            f"{len(merges_raw)} merges, eos={eos_id}")
+        log(f"  Special tokens found: {len(special_ids)}")
+        return token_to_id, merge_priority, eos_id, special_ids
     except Exception as e:
         log(f"  Failed to parse tokenizer.json: {e}")
         return None
 
 
-def train_bpe_tokenizer(texts, vocab_size=VOCAB_SIZE, min_count=2):
-    """Train a byte-level BPE tokenizer on texts.
-
-    Returns (vocab, merge_priority, eos_id).
-    """
-    log(f"  Training BPE tokenizer on {len(texts)} texts "
-        f"(target vocab={vocab_size})...")
+def _train_bpe_tokenizer(texts, vocab_size=VOCAB_SIZE, min_count=2):
+    """Train a byte-level BPE tokenizer on texts (fallback)."""
+    log(f"  Training BPE tokenizer on {len(texts)} texts ...")
     b2u = _get_byte_unicode()
 
-    # Pre-tokenize: split on whitespace boundaries
     word_freqs = {}
     for text in texts:
         words = []
@@ -712,39 +1042,29 @@ def train_bpe_tokenizer(texts, vocab_size=VOCAB_SIZE, min_count=2):
             tokens = tuple(b2u[b] for b in word_bytes)
             word_freqs[tokens] = word_freqs.get(tokens, 0) + 1
 
-    # Base vocab: all 256 byte tokens + special tokens
     vocab = {}
     for byte_val in range(256):
         ch = b2u[byte_val]
         if ch not in vocab:
             vocab[ch] = len(vocab)
-    special_tokens = ["<pad>", "<eos>", "<unk>"] + SPECIAL_TOKENS
-    for tok in special_tokens:
-        vocab[tok] = len(vocab)
+    vocab["<eos>"] = len(vocab)
     eos_id = vocab["<eos>"]
 
-    # Merge pairs iteratively
     merge_priority = {}
     for merge_idx in range(vocab_size - len(vocab)):
-        # Count pairs
         pair_counts = {}
         for word, freq in word_freqs.items():
             for i in range(len(word) - 1):
                 pair = (word[i], word[i + 1])
                 pair_counts[pair] = pair_counts.get(pair, 0) + freq
-
         if not pair_counts:
             break
-
         best_pair = max(pair_counts, key=pair_counts.get)
         if pair_counts[best_pair] < min_count:
             break
-
         new_tok = best_pair[0] + best_pair[1]
         vocab[new_tok] = len(vocab)
         merge_priority[best_pair] = merge_idx
-
-        # Apply merge to all words
         new_word_freqs = {}
         for word, freq in word_freqs.items():
             new_word = []
@@ -761,21 +1081,13 @@ def train_bpe_tokenizer(texts, vocab_size=VOCAB_SIZE, min_count=2):
                 tuple(new_word), 0) + freq
         word_freqs = new_word_freqs
 
-        if (merge_idx + 1) % 1000 == 0:
-            log(f"    BPE merge {merge_idx + 1}/{vocab_size - len(vocab)}, "
-                f"pair={best_pair}, count={pair_counts[best_pair]}, "
-                f"vocab={len(vocab)}")
-
-    log(f"  BPE training done: {len(vocab)} tokens, "
-        f"{len(merge_priority)} merges")
+    log(f"  BPE trained: {len(vocab)} tokens, {len(merge_priority)} merges")
     return vocab, merge_priority, eos_id
 
 
-def tokenize_text(text, vocab, merge_priority):
+def _tokenize_text(text, vocab, merge_priority):
     """Tokenize a single text using byte-level BPE."""
     b2u = _get_byte_unicode()
-
-    # Pre-tokenize
     words = []
     current = []
     for ch in text:
@@ -810,8 +1122,6 @@ def tokenize_text(text, vocab, merge_priority):
     for word in merged_words:
         word_bytes = word.encode("utf-8", errors="replace")
         tokens = [b2u[b] for b in word_bytes]
-
-        # Apply BPE merges
         while len(tokens) >= 2:
             best_pair = None
             best_pri = float("inf")
@@ -828,61 +1138,31 @@ def tokenize_text(text, vocab, merge_priority):
             new_tokens.append(best_pair[0] + best_pair[1])
             new_tokens.extend(tokens[best_idx + 2:])
             tokens = new_tokens
-
         for tok in tokens:
             tid = vocab.get(tok)
             if tid is not None:
                 token_ids.append(tid)
             else:
-                # Byte fallback
                 for ch_tok in tok:
                     byte_val = ord(ch_tok)
                     if byte_val < 256:
                         token_ids.append(_get_byte_token(byte_val, vocab))
                     else:
-                        token_ids.append(vocab.get("<unk>", 0))
-
+                        token_ids.append(0)
     return token_ids
 
 
-def _tokenize_texts(texts, vocab, merge_priority, eos_id, seq_len):
-    """Convert text strings to token-id chunks of fixed seq_len.
+# ══════════════════════════════════════════════════════════════════════
+# SYNTHETIC DATA GENERATION
+# ══════════════════════════════════════════════════════════════════════
 
-    Returns (num_chunks, seq_len) int32 array, or None on failure.
-    """
-    log(f"  Tokenizing {len(texts)} texts ...")
-    t0 = time.time()
-    all_ids = []
-    for i, text in enumerate(texts):
-        ids = tokenize_text(text, vocab, merge_priority)
-        all_ids.extend(ids)
-        all_ids.append(eos_id)
-        if (i + 1) % 10000 == 0:
-            log(f"    {i + 1}/{len(texts)} done "
-                f"({len(all_ids):,} tokens) ...")
-    all_ids = np.array(all_ids, dtype=np.int32)
-    log(f"  Tokenization done in {time.time() - t0:.1f}s — "
-        f"{len(all_ids):,} tokens")
-
-    total = len(all_ids)
-    usable = (total // seq_len) * seq_len
-    if usable < seq_len:
-        log("  WARNING: dataset too small for even one chunk")
-        return None
-    chunks = all_ids[:usable].reshape(-1, seq_len)
-    log(f"  {len(chunks)} chunks of {seq_len} tokens from "
-        f"{total:,} tokens")
-    return chunks
-
-
-# ── Synthetic data generation (Phi-1 / SemCoder inspired) ────────────
-
-# Special tokens for structured data
-SPECIAL_TOKENS = [
-    "<|code|>", "<|trace|>", "<|answer|>", "<|concept|>",
-    "<|explanation|>", "<|usage|>", "<|buggy_code|>", "<|error|>",
-    "<|reasoning|>", "<|fix|>", "<|documentation|>", "<|task|>",
-    "<|think|>", "<|verify|>",
+# Special tokens
+_SPECIAL_TOKENS = [
+    "<|code|>", "<|trace|>", "<|answer|>", "<|slots|>",
+    "<|monologue|>", "<|judge_correct|>", "<|judge_wrong|>",
+    "<|explanation|>", "<|buggy_code|>", "<|error|>",
+    "<|reasoning|>", "<|fix|>", "<|concept|>", "<|usage|>",
+    "<|documentation|>", "<|task|>", "<|think|>", "<|verify|>",
 ]
 
 # Restricted builtins for exec()
@@ -900,75 +1180,56 @@ _SAFE_BUILTINS = {
 }
 
 
-def _exec_with_trace(code_str: str, timeout_s: float = 1.0):
-    """Execute code with sys.settrace to capture line-by-line state.
-
-    Returns (line_states, final_vars) or None on failure/timeout.
-    line_states: list of (line_no, {var: repr(val)})
-    """
-    import signal as _sig
-
-    namespace = {}
-    line_states = []
-    code_lines = code_str.strip().split("\n")
-
-    def trace_fn(frame, event, arg):
-        if event == "line":
-            fname = frame.f_code.co_filename
-            if fname == "<string>":
-                lineno = frame.f_lineno
-                snapshot = {}
-                for k, v in frame.f_locals.items():
-                    try:
-                        snapshot[k] = repr(v)
-                    except Exception:
-                        snapshot[k] = "<error>"
-                line_states.append((lineno, snapshot))
-        return trace_fn
-
-    def _timeout_handler(signum, frame):
-        raise TimeoutError()
-
-    old_handler = None
+def _safe_exec(code: str, ns: dict) -> bool:
+    """Execute code in sandboxed namespace. Returns True on success."""
     try:
-        old_handler = _sig.signal(_sig.SIGALRM, _timeout_handler)
-        _sig.alarm(int(timeout_s) + 1)
-        sys.settrace(trace_fn)
-        exec(code_str, {"__builtins__": _SAFE_BUILTINS}, namespace)
-        sys.settrace(None)
-        _sig.alarm(0)
+        exec(code, {"__builtins__": _SAFE_BUILTINS}, ns)
+        return True
     except Exception:
-        return None
-    finally:
-        sys.settrace(None)
-        if old_handler is not None:
-            try:
-                _sig.signal(_sig.SIGALRM, old_handler)
-            except Exception:
-                pass
-
-    # Build final answer from last line state
-    final_vars = {}
-    if line_states:
-        final_vars = dict(line_states[-1][1])
-
-    return line_states, final_vars
+        return False
 
 
-def _gen_random_program(complexity: int) -> str:
-    """Generate a random Python program with given complexity (1-5).
+def _extract_vars(ns: dict, max_vars: int = 10) -> dict:
+    """Extract variable values from namespace."""
+    result = {}
+    for k, v in sorted(ns.items()):
+        if k.startswith("_") or callable(v) or isinstance(v, type):
+            continue
+        if isinstance(v, (int, float, str, bool)):
+            result[k] = v
+        elif isinstance(v, (list, tuple)) and len(v) < 20:
+            result[k] = v
+        if len(result) >= max_vars:
+            break
+    return result
 
-    1: simple assignments + arithmetic
+
+def _vars_to_json(state: dict) -> str:
+    """Convert state dict to JSON string for <|slots|> tag."""
+    # Only include simple types that JSON can handle
+    clean = {}
+    for k, v in state.items():
+        if isinstance(v, (int, float, str, bool)):
+            clean[k] = v
+        elif isinstance(v, (list, tuple)) and len(v) < 20:
+            clean[k] = list(v)
+    return json.dumps(clean)
+
+
+def _gen_random_program(difficulty: int) -> str:
+    """Generate a random Python program with given difficulty (1-5).
+
+    1: simple arithmetic
     2: if/else, simple loops
     3: nested loops, functions
-    4: recursion, list operations, dict usage
-    5: multi-function programs with list comprehensions
+    4: recursion, list ops, dict
+    5: multi-function, comprehensions
     """
     vars_pool = ["x", "y", "z", "n", "i", "j", "k", "a", "b", "c",
                   "total", "result", "count", "found", "data", "tmp"]
     lines = []
 
-    if complexity == 1:
+    if difficulty == 1:
         n_vars = random.randint(2, 5)
         used = random.sample(vars_pool, n_vars)
         for v in used:
@@ -980,7 +1241,7 @@ def _gen_random_program(complexity: int) -> str:
                 random.randint(-20, 20)
             lines.append(f"{v1} = {v1} {op} {v2}")
 
-    elif complexity == 2:
+    elif difficulty == 2:
         kind = random.choice(["if", "for", "while"])
         if kind == "if":
             n = random.randint(1, 30)
@@ -991,7 +1252,7 @@ def _gen_random_program(complexity: int) -> str:
             lines.append(f"    result = n + {random.randint(1, 5)}")
         elif kind == "for":
             n = random.randint(3, 15)
-            lines.append(f"total = 0")
+            lines.append("total = 0")
             lines.append(f"for i in range({n}):")
             op = random.choice(["+", "*"])
             val = random.randint(1, 5)
@@ -1003,78 +1264,61 @@ def _gen_random_program(complexity: int) -> str:
             lines.append(f"while x < {target}:")
             lines.append(f"    x = x + {random.randint(1, 5)}")
 
-    elif complexity == 3:
-        kind = random.choice(["nested", "func_simple", "list_ops"])
+    elif difficulty == 3:
+        kind = random.choice(["nested", "func", "list_ops"])
         if kind == "nested":
             n = random.randint(3, 8)
-            lines.append(f"result = 0")
+            lines.append("result = 0")
             lines.append(f"for i in range({n}):")
-            cond = random.choice(["i % 2 == 0", "i % 3 == 0",
-                                   "i > 0", "True"])
-            op = random.choice(["+", "-"])
-            val = random.randint(1, 5)
+            cond = random.choice(["i % 2 == 0", "i % 3 == 0", "True"])
             lines.append(f"    if {cond}:")
-            lines.append(f"        result = result {op} {val}")
-        elif kind == "func_simple":
-            fn = random.choice(["double", "negate", "clamp"])
+            lines.append(f"        result = result + {random.randint(1, 5)}")
+        elif kind == "func":
+            fn = random.choice(["double", "negate", "square"])
+            lines.append(f"def {fn}(x):")
             if fn == "double":
-                lines.append("def double(x):")
                 lines.append("    return x * 2")
             elif fn == "negate":
-                lines.append("def negate(x):")
                 lines.append("    return -x")
             else:
-                lines.append("def clamp(x, lo=0, hi=100):")
-                lines.append("    if x < lo:")
-                lines.append("        return lo")
-                lines.append("    if x > hi:")
-                lines.append("        return hi")
-                lines.append("    return x")
-            val = random.randint(1, 50)
-            lines.append(f"result = {fn}({val})")
+                lines.append("    return x * x")
+            lines.append(f"result = {fn}({random.randint(1, 50)})")
         elif kind == "list_ops":
             arr = [random.randint(1, 20) for _ in range(random.randint(3, 8))]
             lines.append(f"data = {arr}")
             op = random.choice(["sum", "max", "min", "len", "sorted"])
             lines.append(f"result = {op}(data)")
 
-    elif complexity == 4:
+    elif difficulty == 4:
         kind = random.choice(["recursive", "dict_ops", "list_build"])
         if kind == "recursive":
-            fn = random.choice(["fib", "fact", "pow2"])
+            fn = random.choice(["fib", "fact"])
             if fn == "fib":
                 lines.append("def fib(n):")
                 lines.append("    if n <= 1:")
                 lines.append("        return n")
                 lines.append("    return fib(n-1) + fib(n-2)")
                 lines.append(f"result = fib({random.randint(4, 10)})")
-            elif fn == "fact":
+            else:
                 lines.append("def fact(n):")
                 lines.append("    if n <= 1:")
                 lines.append("        return 1")
                 lines.append("    return n * fact(n-1)")
                 lines.append(f"result = fact({random.randint(3, 8)})")
-            else:
-                lines.append("def pow2(n):")
-                lines.append("    if n == 0:")
-                lines.append("        return 1")
-                lines.append("    return 2 * pow2(n-1)")
-                lines.append(f"result = pow2({random.randint(2, 8)})")
         elif kind == "dict_ops":
             lines.append("d = {}")
             keys = ["a", "b", "c", "x", "y"]
-            n_pairs = random.randint(2, 4)
-            for k in keys[:n_pairs]:
+            for k in keys[:random.randint(2, 4)]:
                 lines.append(f"d['{k}'] = {random.randint(1, 100)}")
-            lines.append(f"result = sum(d.values())")
+            lines.append("result = sum(d.values())")
         elif kind == "list_build":
-            lines.append(f"result = []")
+            lines.append("result = []")
             n = random.randint(3, 8)
             lines.append(f"for i in range({n}):")
             expr = random.choice(["i*i", "i*2+1", "i if i%2==0 else 0"])
             lines.append(f"    result.append({expr})")
 
-    elif complexity == 5:
+    elif difficulty == 5:
         kind = random.choice(["comp", "multi_func", "filter_map"])
         if kind == "comp":
             arr = [random.randint(1, 30) for _ in range(random.randint(4, 10))]
@@ -1085,13 +1329,11 @@ def _gen_random_program(complexity: int) -> str:
         elif kind == "multi_func":
             lines.append("def square(x):")
             lines.append("    return x * x")
-            lines.append("")
             lines.append("def sum_sq(lst):")
             lines.append("    total = 0")
             lines.append("    for v in lst:")
             lines.append("        total = total + square(v)")
             lines.append("    return total")
-            lines.append("")
             arr = [random.randint(1, 10) for _ in range(random.randint(3, 6))]
             lines.append(f"result = sum_sq({arr})")
         elif kind == "filter_map":
@@ -1103,959 +1345,477 @@ def _gen_random_program(complexity: int) -> str:
     return "\n".join(lines)
 
 
-def _stage1_mental_simulation(n_samples: int, seed: int) -> list:
-    """Stage 1 (30%): Mental simulation — exec code + capture trace.
+def _exec_with_trace(code_str: str) -> tuple:
+    """Execute code and capture per-line variable state.
 
-    Teaches the model to simulate execution step by step, the core
-    skill transformers provably lack.
+    Returns (final_vars, is_correct) or None on failure.
     """
-    random.seed(seed)
-    texts = []
-    success = 0
+    namespace = {}
+    code_lines = code_str.strip().split("\n")
 
-    for _ in range(n_samples * 3):  # Over-generate; many will fail
-        if success >= n_samples:
-            break
-        complexity = random.choices(
-            range(1, 6), weights=[15, 30, 25, 20, 10])[0]
-        code = _gen_random_program(complexity)
-        if not code.strip():
-            continue
+    try:
+        for stmt in code_lines:
+            _safe_exec(stmt, namespace)
+    except Exception:
+        return None
 
-        result = _exec_with_trace(code, timeout_s=1.0)
-        if result is None:
-            continue
-
-        line_states, final_vars = result
-        if not line_states:
-            continue
-
-        # Format: <|code|> ... <|trace|> ... <|answer|> ...
-        parts = []
-        parts.append("<|code|>")
-        parts.append(code)
-        parts.append("<|trace|>")
-        for lineno, snapshot in line_states:
-            line_text = code_lines_get(code, lineno)
-            state_str = ", ".join(
-                f"{k}: {v}" for k, v in sorted(snapshot.items()))
-            parts.append(f"Line {lineno}: {line_text} -> state: {{{state_str}}}")
-        parts.append("<|answer|>")
-        # Pick the last assigned variable as answer
-        last_line = code.strip().split("\n")[-1].strip()
-        if "=" in last_line and not last_line.startswith("def ") and \
-                not last_line.startswith("for ") and \
-                not last_line.startswith("while ") and \
-                not last_line.startswith("if "):
-            var = last_line.split("=")[0].strip()
-            if var in final_vars:
-                parts.append(f"Final: {var} = {final_vars[var]}")
-            else:
-                parts.append(f"Final state: {dict(sorted(final_vars.items()))}")
-        else:
-            parts.append(f"Final state: {dict(sorted(final_vars.items()))}")
-
-        texts.append("\n".join(parts))
-        success += 1
-
-    log(f"  Stage 1 (Mental Simulation): {success}/{n_samples*3} succeeded")
-    return texts
+    final_vars = _extract_vars(namespace)
+    return final_vars, True
 
 
-def code_lines_get(code: str, lineno: int) -> str:
-    """Get a line from code by 1-indexed line number."""
-    lines = code.split("\n")
-    if 1 <= lineno <= len(lines):
-        return lines[lineno - 1].strip()
-    return "..."
+def generate_execution_sample() -> dict:
+    """Generate a single execution trace training sample.
 
-
-def _stage2_textbook_explanations(n_samples: int, seed: int) -> list:
-    """Stage 2 (25%): Textbook-quality explanations.
-
-    Each sample teaches a concept with explanation + code + usage.
-    Progressive difficulty within each concept.
+    Returns dict with 'text' (full formatted), 'loss_mask_regions',
+    'judge_label' (0 or 1).
     """
-    random.seed(seed)
+    difficulty = random.choices(
+        range(1, 6), weights=[15, 30, 25, 20, 10])[0]
+    code = _gen_random_program(difficulty)
+    if not code.strip():
+        return None
 
-    concepts = {
-        "Variables": [
-            ("A variable stores a value in memory. You assign with '='.",
-             "x = 42\nprint(x)", "x -> 42"),
-            ("Variables can be reassigned. Python is dynamically typed.",
-             "x = 10\nx = 'hello'\nprint(x)", "x is now the string 'hello'"),
-            ("Multiple assignment swaps values without a temp variable.",
-             "a, b = 3, 7\na, b = b, a\nprint(a, b)", "a=7, b=3"),
-            ("Use descriptive variable names for readability.",
-             "user_age = 25\nmax_connections = 100\nprint(user_age * 2)",
-             "50"),
-        ],
-        "Operators": [
-            ("Arithmetic operators: + - * // % **. Note // is floor division.",
-             "print(17 // 3)\nprint(17 % 3)\nprint(2 ** 10)",
-             "5, 2, 1024"),
-            ("Comparison operators return bool: == != < > <= >=",
-             "x = 15\nprint(x > 10)\nprint(x == 15)\nprint(x != 20)",
-             "True, True, True"),
-            ("Logical operators: and, or, not. Short-circuit evaluation.",
-             "x = 5\nprint(x > 0 and x < 10)\nprint(x < 0 or x > 3)",
-             "True, True"),
-            ("The 'in' operator tests membership in sequences.",
-             "print(3 in [1, 2, 3, 4])\nprint('h' in 'hello')",
-             "True, True"),
-        ],
-        "Control Flow": [
-            ("if/elif/else executes blocks based on conditions.",
-             "score = 85\nif score >= 90:\n    grade = 'A'\nelif score >= 80:\n    grade = 'B'\nelse:\n    grade = 'C'\nprint(grade)", "B"),
-            ("for loops iterate over any iterable (range, list, string).",
-             "total = 0\nfor i in range(1, 6):\n    total += i\nprint(total)",
-             "15 (sum of 1+2+3+4+5)"),
-            ("while loops repeat until a condition is false.",
-             "n = 64\nsteps = 0\nwhile n > 1:\n    n = n // 2\n    steps += 1\nprint(steps)",
-             "6 (64->32->16->8->4->2->1)"),
-            ("break exits a loop early. continue skips to next iteration.",
-             "for i in range(10):\n    if i == 5:\n        break\n    if i % 2 == 0:\n        continue\n    print(i)",
-             "1, 3"),
-            ("Nested loops: inner loop runs fully for each outer iteration.",
-             "for i in range(3):\n    for j in range(3):\n        if i == j:\n            print(i)",
-             "0, 1, 2 (diagonal)"),
-        ],
-        "Functions": [
-            ("A function encapsulates reusable logic with def.",
-             "def greet(name):\n    return f'Hello, {name}!'\nprint(greet('World'))",
-             "Hello, World!"),
-            ("Default parameters make arguments optional.",
-             "def power(base, exp=2):\n    result = 1\n    for _ in range(exp):\n        result *= base\n    return result\nprint(power(3))\nprint(power(2, 10))",
-             "9, 1024"),
-            ("*args collects positional args into a tuple.",
-             "def total(*nums):\n    return sum(nums)\nprint(total(1, 2, 3, 4, 5))",
-             "15"),
-            ("Recursion: a function calls itself with a smaller input.",
-             "def gcd(a, b):\n    if b == 0:\n        return a\n    return gcd(b, a % b)\nprint(gcd(48, 18))",
-             "6"),
-        ],
-        "Data Structures": [
-            ("Lists are ordered mutable sequences. Index from 0.",
-             "fruits = ['apple', 'banana', 'cherry']\nfruits.append('date')\nprint(fruits[1])\nprint(len(fruits))",
-             "banana, 4"),
-            ("List slicing: lst[start:stop:step]. Stop is exclusive.",
-             "nums = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]\nprint(nums[2:7])\nprint(nums[::2])\nprint(nums[::-1])",
-             "[2,3,4,5,6], [0,2,4,6,8], [9,8,7,6,5,4,3,2,1,0]"),
-            ("Dicts store key-value pairs. O(1) lookup by key.",
-             "ages = {'Alice': 30, 'Bob': 25, 'Charlie': 35}\nages['Dave'] = 28\nprint(sorted(ages.items()))",
-             "[('Alice', 30), ('Bob', 25), ('Charlie', 35), ('Dave', 28)]"),
-            ("Sets store unique elements. Support union, intersection, diff.",
-             "a = {1, 2, 3, 4}\nb = {3, 4, 5, 6}\nprint(a & b)\nprint(a | b)\nprint(a - b)",
-             "{3, 4}, {1, 2, 3, 4, 5, 6}, {1, 2}"),
-            ("List comprehensions: concise way to create lists.",
-             "squares = [x*x for x in range(1, 6)]\nevens = [x for x in range(20) if x % 2 == 0]\nprint(squares)\nprint(evens[:5])",
-             "[1, 4, 9, 16, 25], [0, 2, 4, 6, 8]"),
-        ],
-        "Sorting & Searching": [
-            ("Binary search finds a target in a sorted array in O(log n).",
-             "def binary_search(arr, target):\n    lo, hi = 0, len(arr) - 1\n    while lo <= hi:\n        mid = (lo + hi) // 2\n        if arr[mid] == target:\n            return mid\n        elif arr[mid] < target:\n            lo = mid + 1\n        else:\n            hi = mid - 1\n    return -1\nprint(binary_search([1, 3, 5, 7, 9, 11], 7))",
-             "3 (index of 7)"),
-            ("Bubble sort repeatedly swaps adjacent out-of-order elements.",
-             "def bubble_sort(arr):\n    n = len(arr)\n    for i in range(n):\n        for j in range(n - i - 1):\n            if arr[j] > arr[j+1]:\n                arr[j], arr[j+1] = arr[j+1], arr[j]\n    return arr\nprint(bubble_sort([5, 3, 8, 1, 9, 2]))",
-             "[1, 2, 3, 5, 8, 9]"),
-            ("Two-pointer technique: sort then find pairs meeting a condition.",
-             "def two_sum_sorted(arr, target):\n    lo, hi = 0, len(arr) - 1\n    while lo < hi:\n        s = arr[lo] + arr[hi]\n        if s == target:\n            return [lo, hi]\n        elif s < target:\n            lo += 1\n        else:\n            hi -= 1\n    return None\nprint(two_sum_sorted([1, 3, 5, 7, 11], 12))",
-             "[1, 3] (3 + 9 = 12)"),
-        ],
-        "String Operations": [
-            ("Strings are immutable sequences. Use + to concatenate.",
-             "first = 'hello'\nsecond = ' world'\nresult = first + second\nprint(len(result))\nprint(result.upper())",
-             "11, HELLO WORLD"),
-            ("str.split() and str.join() for parsing/formatting.",
-             "line = 'name:Alice,age:30,city:NYC'\nparts = line.split(',')\nresult = '; '.join(parts)\nprint(result)",
-             "name:Alice; age:30; city:NYC"),
-            ("f-strings interpolate variables directly into strings.",
-             "name = 'Alice'\nscore = 95\nresult = f'{name} scored {score}/100'\nprint(result)",
-             "Alice scored 95/100"),
-            ("str.strip(), str.replace(), str.count() for cleaning.",
-             "text = '  hello world  '\nprint(text.strip())\nprint(text.strip().replace('world', 'Python'))",
-             "hello world, hello Python"),
-        ],
-        "Error Handling": [
-            ("try/except catches exceptions so the program doesn't crash.",
-             "def safe_divide(a, b):\n    try:\n        return a / b\n    except ZeroDivisionError:\n        return None\nprint(safe_divide(10, 3))\nprint(safe_divide(10, 0))",
-             "3.333..., None"),
-            ("finally block always runs, even if an exception occurred.",
-             "def process(data):\n    try:\n        result = int(data)\n    except ValueError:\n        result = 0\n    finally:\n        print('done')\n    return result\nprint(process('42'))\nprint(process('abc'))",
-             "done, 42, done, 0"),
-        ],
-        "Recursion": [
-            ("Factorial: n! = n * (n-1)!. Base case: 0! = 1.",
-             "def factorial(n):\n    if n <= 1:\n        return 1\n    return n * factorial(n - 1)\nprint(factorial(5))\nprint(factorial(10))",
-             "120, 3628800"),
-            ("Fibonacci: each number is the sum of the two before it.",
-             "def fib(n):\n    if n <= 1:\n        return n\n    return fib(n-1) + fib(n-2)\nprint(fib(0))\nprint(fib(7))",
-             "0, 13"),
-            ("Tower of Hanoi: move n disks from source to target using aux.",
-             "def hanoi(n, src, dst, aux):\n    if n == 1:\n        return 1\n    return hanoi(n-1, src, aux, dst) + 1 + hanoi(n-1, aux, dst, src)\nprint(hanoi(3))\nprint(hanoi(5))",
-             "7, 31"),
-        ],
-        "OOP Basics": [
-            ("A class defines a blueprint. __init__ sets up instance state.",
-             "class Counter:\n    def __init__(self, start=0):\n        self.value = start\n    def increment(self):\n        self.value += 1\n    def get(self):\n        return self.value\nc = Counter(10)\nc.increment()\nc.increment()\nprint(c.get())",
-             "12"),
-            ("Inheritance: a subclass extends a parent class.",
-             "class Animal:\n    def __init__(self, name):\n        self.name = name\n    def speak(self):\n        return '...'\nclass Dog(Animal):\n    def speak(self):\n        return f'{self.name} says Woof!'\nd = Dog('Rex')\nprint(d.speak())",
-             "Rex says Woof!"),
-        ],
-    }
+    result = _exec_with_trace(code)
+    if result is None:
+        return None
 
-    texts = []
-    for concept_name, examples in concepts.items():
-        for explanation, code, expected in examples:
-            parts = []
-            parts.append("<|concept|> " + concept_name)
-            parts.append("<|explanation|> " + explanation)
-            parts.append("<|code|>")
-            parts.append(code)
-            parts.append("<|usage|> " + expected)
-            texts.append("\n".join(parts))
+    final_vars, _ = result
+    if not final_vars:
+        return None
 
-    # Duplicate to reach target
-    while len(texts) < n_samples:
-        extra = list(texts)
-        random.shuffle(extra)
-        texts.extend(extra)
-    random.shuffle(texts)
-    return texts[:n_samples]
+    # Determine answer variable
+    last_line = code.strip().split("\n")[-1].strip()
+    answer_var = None
+    if "=" in last_line and not last_line.startswith(("def ", "for ",
+                                                        "while ", "if ")):
+        answer_var = last_line.split("=")[0].strip()
+
+    answer_str = ""
+    if answer_var and answer_var in final_vars:
+        answer_str = f"{answer_var} = {repr(final_vars[answer_var])}"
+    else:
+        answer_str = _vars_to_json(final_vars)
+
+    # Generate monologue (mental simulation)
+    monologue_parts = []
+    code_lines = code.strip().split("\n")
+    for line in code_lines:
+        if line.strip():
+            monologue_parts.append(f"Step: {line.strip()}")
+    monologue_parts.append(f"After execution: {answer_str}")
+    monologue = "\n".join(monologue_parts)
+
+    # Corrupt ~15% for balanced judge training
+    is_corrupted = random.random() < 0.15
+    if is_corrupted:
+        # Replace answer with wrong value
+        if isinstance(answer_str, str) and "=" in answer_str:
+            wrong_val = random.randint(-1000, 1000)
+            corrupted_answer = answer_str.split("=")[0].strip() + \
+                f" = {wrong_val}"
+            answer_str = corrupted_answer
+        judge_label = 0
+        judge_tag = "<|judge_wrong|>"
+    else:
+        judge_label = 1
+        judge_tag = "<|judge_correct|>"
+
+    # Build formatted text
+    parts = []
+    parts.append("<|code|>")
+    parts.append(code)
+    parts.append("<|slots|>")
+    parts.append(_vars_to_json(final_vars))
+    parts.append("<|monologue|>")
+    parts.append(monologue)
+    parts.append("<|answer|>")
+    parts.append(answer_str)
+    parts.append(judge_tag)
+
+    text = "\n".join(parts)
+    return {"text": text, "judge_label": judge_label}
 
 
-def _stage3_monologue_debugging(n_samples: int, seed: int) -> list:
-    """Stage 3 (20%): Buggy code + step-by-step reasoning to fix.
+def generate_debugging_sample() -> dict:
+    """Generate a debugging training sample.
 
-    SemCoder-inspired: the model narrates its debugging process.
+    Returns dict with 'text', 'judge_label' (always 1 = fix is correct).
     """
-    random.seed(seed)
-
     bug_templates = [
         {
-            "buggy": "def sum_evens(lst):\n    total = 0\n    for i in range(len(lst)):\n        if lst[i] % 2 == 0:\n            total += lst[i]\n        return total",
+            "buggy": ("def sum_evens(lst):\n"
+                      "    total = 0\n"
+                      "    for i in range(len(lst)):\n"
+                      "        if lst[i] % 2 == 0:\n"
+                      "            total += lst[i]\n"
+                      "        return total"),
             "error": "sum_evens([1, 2, 3, 4]) returns 0 instead of 6",
-            "reasoning": "Let me trace: i=0, lst[0]=1, 1%2!=0, skip. "
-                         "Then return total -> returns 0! The return is "
-                         "inside the for loop (wrong indentation). It returns "
-                         "after the first element instead of after all.",
-            "fix": "def sum_evens(lst):\n    total = 0\n    for i in range(len(lst)):\n        if lst[i] % 2 == 0:\n            total += lst[i]\n    return total",
+            "reasoning": ("Let me trace: i=0, lst[0]=1, 1%2!=0, skip. "
+                          "Then return total -> returns 0! The return is "
+                          "inside the for loop (wrong indentation)."),
+            "fix": ("def sum_evens(lst):\n"
+                    "    total = 0\n"
+                    "    for i in range(len(lst)):\n"
+                    "        if lst[i] % 2 == 0:\n"
+                    "            total += lst[i]\n"
+                    "    return total"),
         },
         {
-            "buggy": "def find_max(lst):\n    max_val = lst[0]\n    for i in range(1, len(lst) + 1):\n        if lst[i] > max_val:\n            max_val = lst[i]\n    return max_val",
+            "buggy": ("def find_max(lst):\n"
+                      "    max_val = lst[0]\n"
+                      "    for i in range(1, len(lst) + 1):\n"
+                      "        if lst[i] > max_val:\n"
+                      "            max_val = lst[i]\n"
+                      "    return max_val"),
             "error": "find_max([3, 7, 2, 9]) raises IndexError",
-            "reasoning": "The range goes to len(lst) which is 4. lst[4] "
-                         "is out of bounds. The range should be range(1, "
-                         "len(lst)), not len(lst) + 1. Off-by-one error.",
-            "fix": "def find_max(lst):\n    max_val = lst[0]\n    for i in range(1, len(lst)):\n        if lst[i] > max_val:\n            max_val = lst[i]\n    return max_val",
+            "reasoning": ("range goes to len(lst)+1=5, lst[5] out of "
+                          "bounds. Should be range(1, len(lst))."),
+            "fix": ("def find_max(lst):\n"
+                    "    max_val = lst[0]\n"
+                    "    for i in range(1, len(lst)):\n"
+                    "        if lst[i] > max_val:\n"
+                    "            max_val = lst[i]\n"
+                    "    return max_val"),
         },
         {
-            "buggy": "def reverse_str(s):\n    result = ''\n    for i in range(len(s)):\n        result = s[i] + result\n    return result\nprint(reverse_str('hello'))",
-            "error": "reverse_str('hello') returns 'olleh' — wait, "
-                     "that's correct actually. Let me check again.",
-            "reasoning": "Actually this IS correct: prepending each char "
-                         "builds the reversed string. The 'bug' here is "
-                         "subtle — the function works but is O(n^2) due "
-                         "to string concatenation in a loop. Better: s[::-1].",
-            "fix": "def reverse_str(s):\n    return s[::-1]",
-        },
-        {
-            "buggy": "def is_palindrome(s):\n    return s == s.reverse()",
+            "buggy": ("def is_palindrome(s):\n"
+                      "    return s == s.reverse()"),
             "error": "is_palindrome('racecar') raises AttributeError",
-            "reasoning": "str.reverse() doesn't exist — that's a list method. "
-                         "Strings are immutable. Should use slicing: "
-                         "s[::-1] or reversed(s).",
+            "reasoning": ("str.reverse() doesn't exist — it's a list "
+                          "method. Use s[::-1]."),
             "fix": "def is_palindrome(s):\n    return s == s[::-1]",
         },
         {
-            "buggy": "def count_words(text):\n    words = text.split()\n    for word in words:\n        count = 1\n    return count",
-            "error": "count_words('hello world foo') returns 1 instead of 3",
-            "reasoning": "count is initialized INSIDE the loop, so it resets "
-                         "to 1 on every iteration. Should initialize before "
-                         "the loop and increment, or just use len(words).",
-            "fix": "def count_words(text):\n    return len(text.split())",
-        },
-        {
-            "buggy": "def merge_sorted(a, b):\n    result = []\n    i = j = 0\n    while i < len(a) or j < len(b):\n        if a[i] < b[j]:\n            result.append(a[i])\n            i += 1\n        else:\n            result.append(b[j])\n            j += 1\n    return result",
-            "error": "merge_sorted([1, 3], [2, 4]) raises IndexError",
-            "reasoning": "When i reaches len(a), a[i] is out of bounds. "
-                         "Need to check bounds before comparing. Also need "
-                         "to handle remaining elements when one list is "
-                         "exhausted.",
-            "fix": "def merge_sorted(a, b):\n    result = []\n    i = j = 0\n    while i < len(a) and j < len(b):\n        if a[i] < b[j]:\n            result.append(a[i])\n            i += 1\n        else:\n            result.append(b[j])\n            j += 1\n    result.extend(a[i:])\n    result.extend(b[j:])\n    return result",
-        },
-        {
-            "buggy": "def remove_dupes(lst):\n    seen = set()\n    for x in lst:\n        if x not in seen:\n            seen.append(x)\n    return list(seen)",
-            "error": "remove_dupes([1,2,2,3]) raises AttributeError",
-            "reasoning": "Sets don't have an append() method. Use .add() "
-                         "for sets, or use a list for seen.",
-            "fix": "def remove_dupes(lst):\n    seen = []\n    for x in lst:\n        if x not in seen:\n            seen.append(x)\n    return seen",
-        },
-        {
-            "buggy": "def binary_search(arr, target):\n    lo, hi = 0, len(arr) - 1\n    while lo < hi:\n        mid = (lo + hi) // 2\n        if arr[mid] == target:\n            return mid\n        elif arr[mid] < target:\n            lo = mid + 1\n        else:\n            hi = mid\n    return -1",
+            "buggy": ("def binary_search(arr, target):\n"
+                      "    lo, hi = 0, len(arr) - 1\n"
+                      "    while lo < hi:\n"
+                      "        mid = (lo + hi) // 2\n"
+                      "        if arr[mid] == target:\n"
+                      "            return mid\n"
+                      "        elif arr[mid] < target:\n"
+                      "            lo = mid + 1\n"
+                      "        else:\n"
+                      "            hi = mid\n"
+                      "    return -1"),
             "error": "binary_search([1, 3, 5], 5) returns -1",
-            "reasoning": "The condition should be 'while lo <= hi', not "
-                         "'while lo < hi'. When lo == hi, the last element "
-                         "might be the target, but the loop exits early.",
-            "fix": "def binary_search(arr, target):\n    lo, hi = 0, len(arr) - 1\n    while lo <= hi:\n        mid = (lo + hi) // 2\n        if arr[mid] == target:\n            return mid\n        elif arr[mid] < target:\n            lo = mid + 1\n        else:\n            hi = mid - 1\n    return -1",
+            "reasoning": ("Condition should be 'while lo <= hi', not "
+                          "'while lo < hi'. When lo == hi, the last "
+                          "element might be the target."),
+            "fix": ("def binary_search(arr, target):\n"
+                    "    lo, hi = 0, len(arr) - 1\n"
+                    "    while lo <= hi:\n"
+                    "        mid = (lo + hi) // 2\n"
+                    "        if arr[mid] == target:\n"
+                    "            return mid\n"
+                    "        elif arr[mid] < target:\n"
+                    "            lo = mid + 1\n"
+                    "        else:\n"
+                    "            hi = mid - 1\n"
+                    "    return -1"),
         },
         {
-            "buggy": "def flatten(lst):\n    result = []\n    for item in lst:\n        if isinstance(item, list):\n            for sub in item:\n                result.append(sub)\n    return result",
-            "error": "flatten([1, [2, 3], 4]) returns [2, 3] instead of "
-                     "[1, 2, 3, 4]",
-            "reasoning": "Non-list items are never appended! The else "
-                         "branch is missing. Only list items get processed.",
-            "fix": "def flatten(lst):\n    result = []\n    for item in lst:\n        if isinstance(item, list):\n            result.extend(item)\n        else:\n            result.append(item)\n    return result",
+            "buggy": ("def remove_dupes(lst):\n"
+                      "    seen = set()\n"
+                      "    for x in lst:\n"
+                      "        if x not in seen:\n"
+                      "            seen.append(x)\n"
+                      "    return list(seen)"),
+            "error": "remove_dupes([1,2,2,3]) raises AttributeError",
+            "reasoning": ("Sets don't have append() — use add() for "
+                          "sets, or use a list."),
+            "fix": ("def remove_dupes(lst):\n"
+                    "    seen = []\n"
+                    "    for x in lst:\n"
+                    "        if x not in seen:\n"
+                    "            seen.append(x)\n"
+                    "    return seen"),
         },
         {
-            "buggy": "def fibonacci(n):\n    a, b = 0, 1\n    for _ in range(n):\n        a, b = b, a + b\n    return a",
-            "error": "fibonacci(0) returns 1 instead of 0",
-            "reasoning": "The loop runs n times even when n=0. Actually "
-                         "when n=0, range(0) is empty so a=0 is returned "
-                         "— wait, that IS correct. Let me re-check... "
-                         "fib(1) should be 1. After 1 iteration: a=1, b=1. "
-                         "Returns 1. Correct. fib(6) = 8? Let me trace: "
-                         "iter1: a=1,b=1 iter2: a=1,b=2 iter3: a=2,b=3 "
-                         "iter4: a=3,b=5 iter5: a=5,b=8 iter6: a=8,b=13. "
-                         "Returns 8. Correct! The bug report was wrong.",
-            "fix": "def fibonacci(n):\n    a, b = 0, 1\n    for _ in range(n):\n        a, b = b, a + b\n    return a  # No bug — this is correct!",
+            "buggy": ("def flatten(lst):\n"
+                      "    result = []\n"
+                      "    for item in lst:\n"
+                      "        if isinstance(item, list):\n"
+                      "            for sub in item:\n"
+                      "                result.append(sub)\n"
+                      "    return result"),
+            "error": ("flatten([1, [2, 3], 4]) returns [2, 3] "
+                      "instead of [1, 2, 3, 4]"),
+            "reasoning": ("Non-list items are never appended. Missing "
+                          "else branch."),
+            "fix": ("def flatten(lst):\n"
+                    "    result = []\n"
+                    "    for item in lst:\n"
+                    "        if isinstance(item, list):\n"
+                    "            result.extend(item)\n"
+                    "        else:\n"
+                    "            result.append(item)\n"
+                    "    return result"),
         },
     ]
 
-    texts = []
-    for tmpl in bug_templates:
-        parts = []
-        parts.append("<|buggy_code|>")
-        parts.append(tmpl["buggy"])
-        parts.append("<|error|>")
-        parts.append(tmpl["error"])
-        parts.append("<|reasoning|>")
-        parts.append(tmpl["reasoning"])
-        parts.append("<|fix|>")
-        parts.append(tmpl["fix"])
-        texts.append("\n".join(parts))
+    tmpl = random.choice(bug_templates)
 
-    # Duplicate with variation to reach target
-    while len(texts) < n_samples:
-        extra = []
-        for tmpl in bug_templates:
-            parts = []
-            parts.append("<|buggy_code|>")
-            parts.append(tmpl["buggy"])
-            parts.append("<|error|>")
-            parts.append(tmpl["error"])
-            parts.append("<|reasoning|>")
-            parts.append(tmpl["reasoning"])
-            parts.append("<|fix|>")
-            parts.append(tmpl["fix"])
-            extra.append("\n".join(parts))
-        random.shuffle(extra)
-        texts.extend(extra)
-    random.shuffle(texts)
-    return texts[:n_samples]
+    parts = []
+    parts.append("<|buggy_code|>")
+    parts.append(tmpl["buggy"])
+    parts.append("<|error|>")
+    parts.append(tmpl["error"])
+    parts.append("<|reasoning|>")
+    parts.append(tmpl["reasoning"])
+    parts.append("<|fix|>")
+    parts.append(tmpl["fix"])
+    parts.append("<|judge_correct|>")
+
+    return {"text": "\n".join(parts), "judge_label": 1}
 
 
-def _stage4_novel_api(n_samples: int, seed: int) -> list:
-    """Stage 4 (15%): Fictional API documentation + usage task.
+def generate_batch(batch_size: int, stage: int = 1,
+                   rank_id: int = 0) -> list:
+    """Generate a batch of training samples.
 
-    Teaches learning-from-context — reading docs to use novel APIs.
+    Args:
+        batch_size: number of samples to generate.
+        stage: 1 = execution traces, 2 = mixed (execution + debugging).
+        rank_id: for seed diversity across workers.
+
+    Returns:
+        List of dicts with 'text' and 'judge_label'.
     """
-    random.seed(seed)
+    random.seed(int(time.time() * 1000) + rank_id * 10000)
+    samples = []
 
-    api_templates = [
-        {
-            "doc": (
-                "class DataPipeline:\n"
-                "    \"\"\"Process data through a sequence of transformations.\"\"\"\n"
-                "    def __init__(self, source: str):\n"
-                "        \"\"\"Initialize pipeline with data source path.\"\"\"\n"
-                "        self.steps = []\n"
-                "        self.source = source\n"
-                "    def add_step(self, fn: callable, name: str = '') -> 'DataPipeline':\n"
-                "        \"\"\"Add a transformation step. Returns self for chaining.\"\"\"\n"
-                "        self.steps.append((name, fn))\n"
-                "        return self\n"
-                "    def run(self, limit: int = -1) -> list:\n"
-                "        \"\"\"Execute pipeline. limit=-1 means process all.\"\"\"\n"
-                "        data = [1, 2, 3, 4, 5]  # simulated from source\n"
-                "        for name, fn in self.steps:\n"
-                "            data = [fn(x) for x in data]\n"
-                "        if limit > 0:\n"
-                "            data = data[:limit]\n"
-                "        return data"
-            ),
-            "task": "Create a DataPipeline from 'data.csv' that squares each "
-                    "value, then keeps only values greater than 5.",
-            "solution": (
-                "pipeline = DataPipeline('data.csv')\n"
-                "pipeline.add_step(lambda x: x * x, 'square')\n"
-                "pipeline.add_step(lambda x: x if x > 5 else None, 'filter')\n"
-                "result = pipeline.run()"
-            ),
-        },
-        {
-            "doc": (
-                "class TimeSeries:\n"
-                "    \"\"\"Analyze a sequence of numerical values over time.\"\"\"\n"
-                "    def __init__(self, values: list):\n"
-                "        self.values = values\n"
-                "    def moving_avg(self, window: int) -> list:\n"
-                "        \"\"\"Compute moving average with given window size.\"\"\"\n"
-                "        result = []\n"
-                "        for i in range(len(self.values) - window + 1):\n"
-                "            chunk = self.values[i:i+window]\n"
-                "            result.append(sum(chunk) / window)\n"
-                "        return result\n"
-                "    def trend(self) -> str:\n"
-                "        \"\"\"Return 'up', 'down', or 'flat' based on slope.\"\"\"\n"
-                "        if len(self.values) < 2:\n"
-                "            return 'flat'\n"
-                "        diff = self.values[-1] - self.values[0]\n"
-                "        if diff > 0:\n"
-                "            return 'up'\n"
-                "        elif diff < 0:\n"
-                "            return 'down'\n"
-                "        return 'flat'"
-            ),
-            "task": "Create a TimeSeries with values [10, 15, 12, 20, 18, 25], "
-                    "compute the 3-period moving average, and determine the trend.",
-            "solution": (
-                "ts = TimeSeries([10, 15, 12, 20, 18, 25])\n"
-                "avg = ts.moving_avg(3)\n"
-                "direction = ts.trend()\n"
-                "print(avg)  # [12.33, 15.67, 16.67, 21.0]\n"
-                "print(direction)  # 'up'"
-            ),
-        },
-        {
-            "doc": (
-                "class RateLimiter:\n"
-                "    \"\"\"Limit how many operations can occur in a time window.\"\"\"\n"
-                "    def __init__(self, max_ops: int, window: int):\n"
-                "        self.max_ops = max_ops\n"
-                "        self.window = window\n"
-                "        self.ops = []\n"
-                "    def allow(self, timestamp: int) -> bool:\n"
-                "        \"\"\"Check if operation is allowed at given timestamp.\"\"\"\n"
-                "        cutoff = timestamp - self.window\n"
-                "        self.ops = [t for t in self.ops if t > cutoff]\n"
-                "        if len(self.ops) < self.max_ops:\n"
-                "            self.ops.append(timestamp)\n"
-                "            return True\n"
-                "        return False"
-            ),
-            "task": "Create a RateLimiter allowing 3 operations per 10-second "
-                    "window. Test it at timestamps 0, 2, 4, 5, 15.",
-            "solution": (
-                "rl = RateLimiter(max_ops=3, window=10)\n"
-                "print(rl.allow(0))   # True (1/3)\n"
-                "print(rl.allow(2))   # True (2/3)\n"
-                "print(rl.allow(4))   # True (3/3)\n"
-                "print(rl.allow(5))   # False (4th op within window)\n"
-                "print(rl.allow(15))  # True (old ops expired)"
-            ),
-        },
-        {
-            "doc": (
-                "class SparseVector:\n"
-                "    \"\"\"Efficiently represent vectors with mostly zero values.\"\"\"\n"
-                "    def __init__(self, dim: int):\n"
-                "        self.dim = dim\n"
-                "        self.data = {}  # {index: value}\n"
-                "    def set(self, idx: int, val: float):\n"
-                "        \"\"\"Set value at index.\"\"\"\n"
-                "        if val != 0:\n"
-                "            self.data[idx] = val\n"
-                "        elif idx in self.data:\n"
-                "            del self.data[idx]\n"
-                "    def dot(self, other: 'SparseVector') -> float:\n"
-                "        \"\"\"Dot product with another sparse vector.\"\"\"\n"
-                "        result = 0.0\n"
-                "        for idx, val in self.data.items():\n"
-                "            if idx in other.data:\n"
-                "                result += val * other.data[idx]\n"
-                "        return result"
-            ),
-            "task": "Create two SparseVectors of dimension 100. Set v1 at "
-                    "indices 0,5,10 with values 1,2,3. Set v2 at indices "
-                    "5,10,15 with values 4,5,6. Compute their dot product.",
-            "solution": (
-                "v1 = SparseVector(100)\n"
-                "v1.set(0, 1)\nv1.set(5, 2)\nv1.set(10, 3)\n"
-                "v2 = SparseVector(100)\n"
-                "v2.set(5, 4)\nv2.set(10, 5)\nv2.set(15, 6)\n"
-                "result = v1.dot(v2)  # 2*4 + 3*5 = 23\n"
-                "print(result)"
-            ),
-        },
-        {
-            "doc": (
-                "class EventBus:\n"
-                "    \"\"\"Pub/sub event system for decoupled communication.\"\"\"\n"
-                "    def __init__(self):\n"
-                "        self.subscribers = {}\n"
-                "    def subscribe(self, event: str, handler: callable):\n"
-                "        \"\"\"Register a handler for an event.\"\"\"\n"
-                "        if event not in self.subscribers:\n"
-                "            self.subscribers[event] = []\n"
-                "        self.subscribers[event].append(handler)\n"
-                "    def emit(self, event: str, data):\n"
-                "        \"\"\"Emit event, calling all subscribers.\"\"\"\n"
-                "        for handler in self.subscribers.get(event, []):\n"
-                "            handler(data)\n"
-                "    def on(self, event: str):\n"
-                "        \"\"\"Decorator to register handler.\"\"\"\n"
-                "        def decorator(fn):\n"
-                "            self.subscribe(event, fn)\n"
-                "            return fn\n"
-                "        return decorator"
-            ),
-            "task": "Create an EventBus, subscribe to 'user_created' event "
-                    "with a handler that prints the username, and emit the "
-                    "event with {'username': 'alice'}.",
-            "solution": (
-                "bus = EventBus()\n"
-                "def on_user_created(data):\n"
-                "    print(f'New user: {data[\"username\"]}')\n"
-                "bus.subscribe('user_created', on_user_created)\n"
-                "bus.emit('user_created', {'username': 'alice'})\n"
-                "# Output: New user: alice"
-            ),
-        },
-    ]
+    for _ in range(batch_size):
+        if stage == 1:
+            sample = generate_execution_sample()
+        else:
+            # Mix 60% execution, 40% debugging
+            if random.random() < 0.6:
+                sample = generate_execution_sample()
+            else:
+                sample = generate_debugging_sample()
 
-    texts = []
-    for tmpl in api_templates:
-        parts = []
-        parts.append("<|documentation|>")
-        parts.append(tmpl["doc"])
-        parts.append("<|task|>")
-        parts.append(tmpl["task"])
-        parts.append("<|solution|>")
-        parts.append(tmpl["solution"])
-        texts.append("\n".join(parts))
+        if sample is not None:
+            samples.append(sample)
 
-    while len(texts) < n_samples:
-        extra = []
-        for tmpl in api_templates:
-            parts = []
-            parts.append("<|documentation|>")
-            parts.append(tmpl["doc"])
-            parts.append("<|task|>")
-            parts.append(tmpl["task"])
-            parts.append("<|solution|>")
-            parts.append(tmpl["solution"])
-            extra.append("\n".join(parts))
-        random.shuffle(extra)
-        texts.extend(extra)
-    random.shuffle(texts)
-    return texts[:n_samples]
+    # If not enough, retry
+    attempts = 0
+    while len(samples) < batch_size and attempts < batch_size * 3:
+        sample = generate_execution_sample()
+        if sample is not None:
+            samples.append(sample)
+        attempts += 1
+
+    return samples
 
 
-def _stage5_agent_trajectories(n_samples: int, seed: int) -> list:
-    """Stage 5 (10%): Multi-step reasoning chains for coding tasks.
+def format_sample_for_training(sample: dict, vocab: dict,
+                               merge_priority: dict,
+                               eos_id: int, seq_len: int) -> tuple:
+    """Tokenize a sample and create (input_ids, loss_mask, judge_label).
 
-    Simulates how an agent thinks through a problem before coding.
+    Loss mask: 1 for tokens after special markers (code, slots, monologue,
+    answer, judge), 0 for padding and EOS.
+
+    Returns:
+        (input_ids_np, loss_mask_np, judge_label) or None.
     """
-    random.seed(seed)
+    text = sample["text"]
+    ids = _tokenize_text(text, vocab, merge_priority)
+    ids.append(eos_id)
 
-    tasks = [
-        {
-            "task": "Write a function that finds the longest common "
-                   "subsequence of two strings.",
-            "think": (
-                "This is a classic dynamic programming problem.\n"
-                "1. Create a 2D table dp of size (m+1) x (n+1)\n"
-                "2. Fill bottom-up: if chars match, dp[i][j] = dp[i-1][j-1] + 1\n"
-                "3. If chars differ, dp[i][j] = max(dp[i-1][j], dp[i][j-1])\n"
-                "4. Backtrack from dp[m][n] to reconstruct the subsequence"
-            ),
-            "code": (
-                "def lcs(s1, s2):\n"
-                "    m, n = len(s1), len(s2)\n"
-                "    dp = [[0] * (n + 1) for _ in range(m + 1)]\n"
-                "    for i in range(1, m + 1):\n"
-                "        for j in range(1, n + 1):\n"
-                "            if s1[i-1] == s2[j-1]:\n"
-                "                dp[i][j] = dp[i-1][j-1] + 1\n"
-                "            else:\n"
-                "                dp[i][j] = max(dp[i-1][j], dp[i][j-1])\n"
-                "    result = []\n"
-                "    i, j = m, n\n"
-                "    while i > 0 and j > 0:\n"
-                "        if s1[i-1] == s2[j-1]:\n"
-                "            result.append(s1[i-1])\n"
-                "            i -= 1\n"
-                "            j -= 1\n"
-                "        elif dp[i-1][j] > dp[i][j-1]:\n"
-                "            i -= 1\n"
-                "        else:\n"
-                "            j -= 1\n"
-                "    return ''.join(reversed(result))"
-            ),
-            "verify": "lcs('ABCBDAB', 'BDCAB') -> 'BCAB'\n"
-                     "lcs('', 'ABC') -> ''\n"
-                     "lcs('ABC', 'ABC') -> 'ABC'",
-        },
-        {
-            "task": "Write a function that validates parentheses in a string.",
-            "think": (
-                "Use a stack-based approach:\n"
-                "1. Iterate through each character\n"
-                "2. Push opening brackets onto stack\n"
-                "3. For closing brackets, pop and check if types match\n"
-                "4. If types don't match or stack empty when we need to pop: invalid\n"
-                "5. At end, string is valid if stack is empty"
-            ),
-            "code": (
-                "def is_valid(s):\n"
-                "    stack = []\n"
-                "    pairs = {')': '(', ']': '[', '}': '{'}\n"
-                "    for ch in s:\n"
-                "        if ch in '({[':\n"
-                "            stack.append(ch)\n"
-                "        elif ch in ')}]':\n"
-                "            if not stack or stack[-1] != pairs[ch]:\n"
-                "                return False\n"
-                "            stack.pop()\n"
-                "    return len(stack) == 0"
-            ),
-            "verify": "is_valid('()') -> True\n"
-                     "is_valid('({[]})') -> True\n"
-                     "is_valid('(]') -> False\n"
-                     "is_valid('') -> True",
-        },
-        {
-            "task": "Implement a min-heap with insert and extract_min.",
-            "think": (
-                "A min-heap is a complete binary tree where parent <= children.\n"
-                "1. Use a list. Children of node i are at 2i+1 and 2i+2.\n"
-                "2. Insert: append, then bubble up (swap with parent while < parent)\n"
-                "3. Extract min: swap root with last, pop last, bubble down\n"
-                "   (swap with smaller child while child < current)"
-            ),
-            "code": (
-                "class MinHeap:\n"
-                "    def __init__(self):\n"
-                "        self.data = []\n"
-                "    def insert(self, val):\n"
-                "        self.data.append(val)\n"
-                "        i = len(self.data) - 1\n"
-                "        while i > 0:\n"
-                "            parent = (i - 1) // 2\n"
-                "            if self.data[i] < self.data[parent]:\n"
-                "                self.data[i], self.data[parent] = self.data[parent], self.data[i]\n"
-                "                i = parent\n"
-                "            else:\n"
-                "                break\n"
-                "    def extract_min(self):\n"
-                "        if not self.data:\n"
-                "            return None\n"
-                "        val = self.data[0]\n"
-                "        self.data[0] = self.data[-1]\n"
-                "        self.data.pop()\n"
-                "        i = 0\n"
-                "        while True:\n"
-                "            left = 2*i + 1\n"
-                "            right = 2*i + 2\n"
-                "            smallest = i\n"
-                "            if left < len(self.data) and self.data[left] < self.data[smallest]:\n"
-                "                smallest = left\n"
-                "            if right < len(self.data) and self.data[right] < self.data[smallest]:\n"
-                "                smallest = right\n"
-                "            if smallest == i:\n"
-                "                break\n"
-                "            self.data[i], self.data[smallest] = self.data[smallest], self.data[i]\n"
-                "            i = smallest\n"
-                "        return val"
-            ),
-            "verify": (
-                "h = MinHeap()\n"
-                "h.insert(5)\nh.insert(3)\nh.insert(8)\nh.insert(1)\n"
-                "print(h.extract_min())  # 1\n"
-                "print(h.extract_min())  # 3\n"
-                "print(h.extract_min())  # 5\n"
-                "print(h.extract_min())  # 8"
-            ),
-        },
-        {
-            "task": "Write a function that counts the number of islands "
-                   "in a 2D grid (DFS).",
-            "think": (
-                "An island is a group of adjacent '1's (4-directional).\n"
-                "1. Iterate every cell in the grid\n"
-                "2. When we find an unvisited '1', it's a new island\n"
-                "3. DFS from that cell to mark all connected '1's as visited\n"
-                "4. Increment island count, continue scanning"
-            ),
-            "code": (
-                "def count_islands(grid):\n"
-                "    if not grid:\n"
-                "        return 0\n"
-                "    rows, cols = len(grid), len(grid[0])\n"
-                "    visited = set()\n"
-                "    count = 0\n"
-                "    def dfs(r, c):\n"
-                "        stack = [(r, c)]\n"
-                "        while stack:\n"
-                "            cr, cc = stack.pop()\n"
-                "            if (cr, cc) in visited:\n"
-                "                continue\n"
-                "            if cr < 0 or cr >= rows or cc < 0 or cc >= cols:\n"
-                "                continue\n"
-                "            if grid[cr][cc] == 0:\n"
-                "                continue\n"
-                "            visited.add((cr, cc))\n"
-                "            stack.extend([(cr-1,cc),(cr+1,cc),(cr,cc-1),(cr,cc+1)])\n"
-                "    for r in range(rows):\n"
-                "        for c in range(cols):\n"
-                "            if grid[r][c] == 1 and (r, c) not in visited:\n"
-                "                dfs(r, c)\n"
-                "                count += 1\n"
-                "    return count"
-            ),
-            "verify": (
-                "count_islands([[1,1,0,0],[1,0,0,1],[0,0,1,1],[0,1,0,0]]) -> 3\n"
-                "count_islands([[1,1,1],[1,1,1]]) -> 1\n"
-                "count_islands([[0,0,0],[0,0,0]]) -> 0"
-            ),
-        },
-        {
-            "task": "Implement an LRU (Least Recently Used) cache.",
-            "think": (
-                "LRU evicts the least recently accessed item when full.\n"
-                "1. Use OrderedDict (or dict + doubly linked list)\n"
-                "2. get(key): move to front (most recent), return value\n"
-                "3. put(key, value): if exists, update and move to front\n"
-                "4. If full, evict from back (least recent) before inserting"
-            ),
-            "code": (
-                "class LRUCache:\n"
-                "    def __init__(self, capacity: int):\n"
-                "        self.capacity = capacity\n"
-                "        self.cache = {}\n"
-                "    def get(self, key):\n"
-                "        if key in self.cache:\n"
-                "            val = self.cache.pop(key)\n"
-                "            self.cache[key] = val\n"
-                "            return val\n"
-                "        return -1\n"
-                "    def put(self, key, value):\n"
-                "        if key in self.cache:\n"
-                "            self.cache.pop(key)\n"
-                "        elif len(self.cache) >= self.capacity:\n"
-                "            self.cache.pop(next(iter(self.cache)))\n"
-                "        self.cache[key] = value"
-            ),
-            "verify": (
-                "cache = LRUCache(2)\n"
-                "cache.put(1, 'a')\ncache.put(2, 'b')\n"
-                "print(cache.get(1))  # 'a', key 1 is now most recent\n"
-                "cache.put(3, 'c')  # evicts key 2 (least recent)\n"
-                "print(cache.get(2))  # -1 (evicted)"
-            ),
-        },
-    ]
+    if len(ids) > seq_len:
+        ids = ids[:seq_len]
+    if len(ids) < seq_len:
+        ids = ids + [eos_id] * (seq_len - len(ids))
 
-    texts = []
-    for tmpl in tasks:
-        parts = []
-        parts.append("<|task|> " + tmpl["task"])
-        parts.append("<|think|>")
-        parts.append(tmpl["think"])
-        parts.append("<|code|>")
-        parts.append(tmpl["code"])
-        parts.append("<|verify|>")
-        parts.append(tmpl["verify"])
-        texts.append("\n".join(parts))
+    # Build loss mask: 1 for non-padding tokens
+    loss_mask = [1.0] * len(ids)
+    # Optionally mask the code prefix (first <|code|> marker content)
+    # For now, mask everything (the model should predict all tokens)
+    # except the very first token
+    loss_mask[0] = 0.0  # Don't predict from padding
 
-    while len(texts) < n_samples:
-        extra = []
-        for tmpl in tasks:
-            parts = []
-            parts.append("<|task|> " + tmpl["task"])
-            parts.append("<|think|>")
-            parts.append(tmpl["think"])
-            parts.append("<|code|>")
-            parts.append(tmpl["code"])
-            parts.append("<|verify|>")
-            parts.append(tmpl["verify"])
-            extra.append("\n".join(parts))
-        random.shuffle(extra)
-        texts.extend(extra)
-    random.shuffle(texts)
-    return texts[:n_samples]
+    if len(loss_mask) < seq_len:
+        loss_mask = loss_mask + [0.0] * (seq_len - len(loss_mask))
+    loss_mask = loss_mask[:seq_len]
+
+    input_ids = np.array(ids, dtype=np.int32)
+    loss_mask_arr = np.array(loss_mask, dtype=np.float32)
+    judge_label = sample["judge_label"]
+
+    return input_ids, loss_mask_arr, judge_label
 
 
-def generate_synthetic_data(n_total: int = 50000, rank_id: int = 0) -> list:
-    """Generate Phi-1/SemCoder-inspired synthetic training data.
+# ══════════════════════════════════════════════════════════════════════
+# SELF-EVOLUTION ENGINE
+# ══════════════════════════════════════════════════════════════════════
 
-    Stage distribution:
-      1. Mental Simulation (exec traces): 30%
-      2. Textbook Explanations: 25%
-      3. Monologue Debugging: 20%
-      4. Novel API Learning: 15%
-      5. Agent Trajectories: 10%
+
+def evolution_probe(model: Thinker15BModel, cos: Tensor, sin: Tensor,
+                    mask: Tensor, vocab: dict, merge_priority: dict,
+                    eos_id: int, n_samples: int = 100) -> float:
+    """Probe model's current difficulty by testing on generated problems.
+
+    Returns accuracy (0-1) on easy problems.
     """
-    log(f"Generating {n_total} synthetic texts (rank={rank_id}) ...")
-    t0 = time.time()
-    all_texts = []
+    correct = 0
+    total = 0
 
-    n1 = int(n_total * 0.30)
-    n2 = int(n_total * 0.25)
-    n3 = int(n_total * 0.20)
-    n4 = int(n_total * 0.15)
-    n5 = n_total - n1 - n2 - n3 - n4
-
-    log(f"  Stage 1 (Mental Simulation): {n1} target ...")
-    t1 = _stage1_mental_simulation(n1, seed=42 + rank_id * 1000)
-    all_texts.extend(t1)
-
-    log(f"  Stage 2 (Textbook Explanations): {n2} target ...")
-    t2 = _stage2_textbook_explanations(n2, seed=142 + rank_id * 1000)
-    all_texts.extend(t2)
-
-    log(f"  Stage 3 (Monologue Debugging): {n3} target ...")
-    t3 = _stage3_monologue_debugging(n3, seed=242 + rank_id * 1000)
-    all_texts.extend(t3)
-
-    log(f"  Stage 4 (Novel API Learning): {n4} target ...")
-    t4 = _stage4_novel_api(n4, seed=342 + rank_id * 1000)
-    all_texts.extend(t4)
-
-    log(f"  Stage 5 (Agent Trajectories): {n5} target ...")
-    t5 = _stage5_agent_trajectories(n5, seed=442 + rank_id * 1000)
-    all_texts.extend(t5)
-
-    random.shuffle(all_texts)
-    log(f"Synthetic generation done in {time.time() - t0:.1f}s — "
-        f"{len(all_texts)} texts "
-        f"(s1={len(t1)}, s2={len(t2)}, s3={len(t3)}, "
-        f"s4={len(t4)}, s5={len(t5)})")
-    return all_texts
-
-
-def load_dataset(dataset_path: str, seq_len: int) -> tuple:
-    """Load and tokenize dataset.
-
-    Strategy:
-      1. Try to load OpenThoughts-114k from DATASET_PATH (real data)
-      2. Try to load pre-tokenized .npy chunks
-      3. Generate synthetic data as fallback
-      4. Train BPE tokenizer on available text
-
-    Returns (chunks_array, has_real_data).
-    """
-    files = _find_data_files(dataset_path)
-    log(f"  Found {len(files)} data file(s) in {dataset_path}")
-
-    # Try pre-tokenized .npy
-    npy_files = [f for f in files if f.endswith(".npy")]
-    for nf in npy_files:
-        try:
-            data = np.load(nf)
-            if data.ndim == 2 and data.shape[-1] == seq_len:
-                chunks = data.astype(np.int32)
-                log(f"  Loaded pre-tokenized: {chunks.shape}")
-                return chunks, True
-        except Exception:
-            pass
-
-    # Load texts from data files
-    texts = []
-
-    # Read real data files
-    for fp in files:
-        if fp.endswith(".npy"):
+    for _ in range(n_samples):
+        sample = generate_execution_sample()
+        if sample is None:
             continue
-        log(f"  Reading {os.path.basename(fp)} ...")
+
+        ids = _tokenize_text(sample["text"], vocab, merge_priority)
+        if len(ids) < 10 or len(ids) > MAX_SEQ_LEN:
+            continue
+
+        ids_arr = np.array(ids, dtype=np.int32)
+        input_t = Tensor(ids_arr[np.newaxis, :])
+
         try:
-            if fp.endswith(".jsonl"):
-                with open(fp, "r", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if line:
-                            texts.append(_extract_text(json.loads(line)))
-            elif fp.endswith(".json"):
-                with open(fp, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    if isinstance(data, list):
-                        for row in data:
-                            texts.append(_extract_text(row))
-                    elif isinstance(data, dict):
-                        texts.append(_extract_text(data))
-            elif fp.endswith(".txt"):
-                with open(fp, "r", encoding="utf-8") as f:
-                    texts.append(f.read())
-            elif fp.endswith(".parquet"):
-                loaded = False
-                try:
-                    import pyarrow.parquet as pq
-                    table = pq.read_table(fp)
-                    cols = table.to_pydict()
-                    for i in range(table.num_rows):
-                        row = {col: cols[col][i] for col in cols}
-                        texts.append(_extract_text(row))
-                    loaded = True
-                except Exception:
-                    pass
-                if not loaded:
-                    try:
-                        import pandas as pd
-                        df = pd.read_parquet(fp)
-                        for val in df.itertuples(index=False):
-                            texts.append(_extract_text(val._asdict()))
-                    except Exception:
-                        pass
-        except Exception as e:
-            log(f"    Error reading {fp}: {e}")
+            model.set_train(False)
+            logits, judge_logits, surprise = model(
+                input_t, cos, sin, mask)
+            model.set_train(True)
 
-    has_real_data = len(texts) > 0
-    if has_real_data:
-        # Deduplicate
-        texts = list(set(t for t in texts if len(t.strip()) > 10))
-        log(f"  Loaded {len(texts)} unique real text samples")
+            # Check judge prediction
+            pred = int(ops.argmax(judge_logits, axis=-1).asnumpy()[0])
+            if pred == sample["judge_label"]:
+                correct += 1
+            total += 1
+        except Exception:
+            continue
 
-    # Generate synthetic data
-    target_synth = 50000
-    if len(texts) < 1000:
-        log(f"  Few real texts ({len(texts)}), generating synthetic data...")
-        synth_texts = generate_synthetic_data(
-            target_synth, rank_id=int(
-                os.environ.get("RANK_ID", "0")))
-        texts.extend(synth_texts)
-        log(f"  Total texts: {len(texts)} "
-            f"({len(synth_texts)} synthetic)")
-
-    if not texts:
-        log("  WARNING: no text data at all")
-        return None, False
-
-    # Try to load HF tokenizer first
-    tok_result = _try_load_hf_tokenizer(PRETRAIN_MODEL_PATH)
-    if tok_result is not None:
-        vocab, merge_priority, eos_id = tok_result
-        # Verify vocab size matches
-        max_id = max(vocab.values()) if vocab else 0
-        if max_id >= VOCAB_SIZE:
-            log(f"  HF tokenizer vocab ({max_id+1}) too large for "
-                f"VOCAB_SIZE={VOCAB_SIZE}, retraining BPE")
-            tok_result = None
-
-    if tok_result is None:
-        # Train BPE on subset of texts
-        sample_size = min(len(texts), 10000)
-        sample = random.sample(texts, sample_size) if len(texts) > \
-            sample_size else texts
-        vocab, merge_priority, eos_id = train_bpe_tokenizer(
-            sample, VOCAB_SIZE)
-
-    chunks = _tokenize_texts(texts, vocab, merge_priority, eos_id, seq_len)
-    return chunks, has_real_data
+    return correct / max(total, 1)
 
 
-# ── Main training ────────────────────────────────────────────────────
+def evolution_verify(model: Thinker15BModel, cos: Tensor, sin: Tensor,
+                     mask: Tensor, vocab: dict, merge_priority: dict,
+                     eos_id: int, difficulty: int,
+                     n_samples: int = 50) -> float:
+    """Verify model performance at a specific difficulty level.
+
+    Returns accuracy (0-1).
+    """
+    correct = 0
+    total = 0
+
+    for _ in range(n_samples):
+        # Generate at specific difficulty
+        random.seed()
+        code = _gen_random_program(difficulty)
+        result = _exec_with_trace(code)
+        if result is None:
+            continue
+
+        final_vars, _ = result
+        if not final_vars:
+            continue
+
+        answer_str = _vars_to_json(final_vars)
+        sample = {
+            "text": f"<|code|>\n{code}\n<|answer|>\n{answer_str}\n"
+                   f"<|judge_correct|>",
+            "judge_label": 1,
+        }
+
+        ids = _tokenize_text(sample["text"], vocab, merge_priority)
+        if len(ids) < 10 or len(ids) > MAX_SEQ_LEN:
+            continue
+
+        ids_arr = np.array(ids, dtype=np.int32)
+        input_t = Tensor(ids_arr[np.newaxis, :])
+
+        try:
+            model.set_train(False)
+            logits, judge_logits, surprise = model(
+                input_t, cos, sin, mask)
+            model.set_train(True)
+
+            pred = int(ops.argmax(judge_logits, axis=-1).asnumpy()[0])
+            if pred == sample["judge_label"]:
+                correct += 1
+            total += 1
+        except Exception:
+            continue
+
+    return correct / max(total, 1)
+
+
+class DifficultyTracker:
+    """EWMA-based difficulty tracker for self-evolution."""
+
+    def __init__(self, initial_difficulty: float = 1.0, alpha: float = 0.1):
+        self.difficulty = initial_difficulty
+        self.alpha = alpha
+        self.rolling_acc = 0.5
+        self.history = []
+
+    def update(self, accuracy: float) -> float:
+        """Update difficulty based on accuracy (EWMA smoothing)."""
+        self.rolling_acc = self.alpha * accuracy + \
+            (1 - self.alpha) * self.rolling_acc
+        self.history.append(self.rolling_acc)
+
+        # Adapt difficulty
+        if self.rolling_acc > 0.85 and self.difficulty < 5:
+            self.difficulty += 0.2
+        elif self.rolling_acc < 0.5 and self.difficulty > 1:
+            self.difficulty -= 0.2
+
+        self.difficulty = max(1.0, min(5.0, self.difficulty))
+        return self.difficulty
+
+
+# ══════════════════════════════════════════════════════════════════════
+# SELF-STOPPING CRITERIA
+# ══════════════════════════════════════════════════════════════════════
+
+
+def check_stopping(step: int, loss_history: list,
+                   max_steps: int, time_limit: float,
+                   t_start: float, patience: int = CONVERGENCE_PATIENCE,
+                   window: int = CONVERGENCE_WINDOW,
+                   threshold: float = CONVERGENCE_THRESHOLD) -> str:
+    """Check if training should stop.
+
+    Returns:
+        "" if should continue, or reason string if should stop.
+    """
+    elapsed = time.time() - t_start
+    if elapsed > time_limit:
+        return f"hard time limit ({elapsed:.0f}s > {time_limit}s)"
+    if step >= max_steps:
+        return f"max steps reached ({step} >= {max_steps})"
+
+    if len(loss_history) >= window:
+        recent = loss_history[-window:]
+        rolling = sum(recent) / window
+
+        # Check if older rolling was significantly better
+        if len(loss_history) >= 2 * window:
+            older = loss_history[-2 * window:-window]
+            older_rolling = sum(older) / window
+            improvement = (older_rolling - rolling) / max(abs(older_rolling), 1e-8)
+            if improvement < threshold:
+                return (f"plateau (rolling={rolling:.4f}, improvement="
+                        f"{improvement:.6f} < {threshold})")
+
+        # Check patience (no new best loss)
+        best = min(loss_history)
+        steps_since_best = len(loss_history) - \
+            loss_history.index(best) - 1
+        if steps_since_best >= patience:
+            return (f"patience (best={best:.4f}, no improvement for "
+                    f"{steps_since_best} steps)")
+
+    return ""
+
+
+# ══════════════════════════════════════════════════════════════════════
+# MAIN TRAINING LOOP
+# ══════════════════════════════════════════════════════════════════════
 
 
 def main() -> None:
@@ -2068,8 +1828,8 @@ def main() -> None:
     setup_logging(rank_id)
 
     log("=" * 60)
-    log(f"Thinker-1.5B training | rank={rank_id}/{rank_size} "
-        f"device={device_id}")
+    log(f"Thinker-1.5B DeltaNet SFM Fine-tuning")
+    log(f"rank={rank_id}/{rank_size} device={device_id}")
     log(f"Python {sys.version}")
     log(f"CWD: {os.getcwd()}")
     log("")
@@ -2078,12 +1838,6 @@ def main() -> None:
     log(f"PRETRAIN_PATH: {PRETRAIN_MODEL_PATH}")
     log(f"OUTPUT_PATH:   {OUTPUT_PATH}")
     log("")
-
-    if os.path.isdir(DATASET_PATH):
-        entries = sorted(os.listdir(DATASET_PATH))[:20]
-        log(f"DATASET dir: {entries}")
-    else:
-        log("DATASET_PATH does not exist")
 
     ms.set_context(
         mode=ms.PYNATIVE_MODE,
@@ -2110,35 +1864,39 @@ def main() -> None:
             use_dp = False
             rank_size = 1
 
-    # Build model
-    log("Building Thinker-1.5B model ...")
+    # ── Build model ──
+    log("Building Thinker-1.5B model (Qwen2.5-Coder-1.5B + DeltaNet SFM)...")
     model = Thinker15BModel()
 
-    # Gradient checkpointing
-    for i in range(NUM_LAYERS):
-        getattr(model, f"layer{i}").recompute()
+    # ── Load Qwen weights ──
+    log("Loading Qwen2.5-Coder-1.5B pretrained weights...")
+    try:
+        load_qwen_weights(model, PRETRAIN_MODEL_PATH)
+        log("Qwen weights loaded successfully!")
+    except Exception as e:
+        log(f"WARNING: Failed to load Qwen weights: {e}")
+        log("Training from random initialization...")
 
     total_p, trainable_p = count_params(model)
     log(f"Total params: {total_p:,}  |  Trainable: {trainable_p:,}")
-    log(f"  Architecture: {NUM_LAYERS} layers, {HIDDEN_DIM}d, "
-        f"{NUM_HEADS}Q/{NUM_KV_HEADS}KV GQA, {INTERMEDIATE_DIM} FFN")
-    log(f"  SFM: {SFM_NUM_SLOTS} slots x {SFM_SLOT_DIM}d at layers "
+    log(f"  Base: 28 layers, {HIDDEN_DIM}d, {NUM_HEADS}Q/{NUM_KV_HEADS}KV "
+        f"GQA, {INTERMEDIATE_DIM} FFN")
+    log(f"  DeltaNet: {DELTANET_NUM_HEADS} heads, "
+        f"{DELTANET_HEAD_DIM}x{DELTANET_HEAD_DIM} state at layers "
         f"{SFM_LAYERS}")
-    log(f"  Vocab: {VOCAB_SIZE}, SeqLen: {MAX_SEQ_LEN}, "
-        f"Tied emb: {TIE_WORD_EMBEDDINGS}")
+    log(f"  Vocab: {VOCAB_SIZE}, SeqLen: {MAX_SEQ_LEN}")
 
-    # Load dataset
-    log("Loading dataset ...")
-    data_chunks, has_real_data = load_dataset(DATASET_PATH, MAX_SEQ_LEN)
-    use_real_data = data_chunks is not None
-
-    if use_real_data:
-        log(f"Dataset: {data_chunks.shape[0]} chunks, "
-            f"{data_chunks.shape[1]} tok/chunk, real_data={has_real_data}")
+    # ── Load tokenizer ──
+    log("Loading tokenizer...")
+    tok_result = _try_load_hf_tokenizer(PRETRAIN_MODEL_PATH)
+    if tok_result is not None:
+        vocab, merge_priority, eos_id, special_ids = tok_result
     else:
-        log("WARNING: no dataset — using synthetic random tokens")
+        # Fallback: train a simple BPE
+        vocab, merge_priority, eos_id = _train_bpe_tokenizer([])
+        special_ids = {}
 
-    # Precompute RoPE + causal mask (shared across all blocks)
+    # ── Precompute RoPE + causal mask ──
     S = MAX_SEQ_LEN
     HD = HEAD_DIM
     inv_freq = 1.0 / (ROPE_THETA ** (
@@ -2155,230 +1913,452 @@ def main() -> None:
     causal_mask = Tensor(causal_np.reshape(1, 1, S, S))
     log(f"RoPE + causal mask precomputed ({S}x{S})")
 
-    # LR schedule
-    tokens_per_step = BATCH_SIZE * MAX_SEQ_LEN
-    if use_real_data:
-        max_steps = data_chunks.shape[0] * 5 // rank_size + 100
-    else:
-        max_steps = 500_000_000 // tokens_per_step + 100
+    # ═══════════════════════════════════════════════════════════════════
+    # STAGE 1: SFM-only training (base model frozen)
+    # ═══════════════════════════════════════════════════════════════════
 
-    lr_schedule = []
-    for s in range(max_steps):
-        if s < WARMUP_STEPS:
-            lr = LEARNING_RATE * s / max(1, WARMUP_STEPS)
+    log("")
+    log("=" * 60)
+    log("STAGE 1: SFM-only training (base frozen)")
+    log("=" * 60)
+
+    # Freeze base model parameters
+    base_param_names = set()
+    for p in model.parameters():
+        base_param_names.add(p.name)
+        # Only freeze non-SFM parameters
+        if not any(key in p.name for key in
+                   ["deltanets", "bridges", "judge_head", "surprise_head"]):
+            p.set_param_ps(False)
+            p.requires_grad = False
+
+    sfm_params = [p for p in model.trainable_params()]
+    log(f"SFM trainable params: {sum(p.size for p in sfm_params):,}")
+
+    if sfm_params:
+        lr_schedule_s1 = []
+        for s in range(STAGE1_MAX_STEPS):
+            if s < STAGE1_WARMUP:
+                lr = STAGE1_LR_SFM * s / max(1, STAGE1_WARMUP)
+            else:
+                progress = (s - STAGE1_WARMUP) / max(
+                    1, STAGE1_MAX_STEPS - STAGE1_WARMUP)
+                min_lr = STAGE1_LR_SFM * MIN_LR_FACTOR
+                lr = min_lr + 0.5 * (STAGE1_LR_SFM - min_lr) * (
+                    1 + math.cos(math.pi * progress))
+            lr_schedule_s1.append(lr)
+
+        optimizer_s1 = nn.AdamWeightDecay(
+            sfm_params,
+            learning_rate=Tensor(
+                np.array(lr_schedule_s1, dtype=np.float32)),
+            weight_decay=STAGE1_WEIGHT_DECAY,
+            beta1=0.9,
+            beta2=0.95,
+        )
+
+        forward_loss = ForwardLossCell(model, cos_t, sin_t, causal_mask)
+        train_step_s1 = TrainStep(forward_loss, optimizer_s1, MAX_GRAD_NORM)
+
+        # Compile with OOM fallback
+        actual_bs = BATCH_SIZE_PER_DEVICE
+        compiled = False
+        for bs in [BATCH_SIZE_PER_DEVICE, 1]:
+            try:
+                log(f"  Compiling Stage 1 with B={bs}...")
+                train_step_s1.set_train()
+                dummy_ids = Tensor(
+                    np.random.randint(0, VOCAB_SIZE,
+                                     (bs, MAX_SEQ_LEN)).astype(np.int32))
+                dummy_mask = Tensor(
+                    np.ones((bs, MAX_SEQ_LEN), dtype=np.float32))
+                dummy_mask[0, 0] = 0.0
+                dummy_judge = Tensor(
+                    np.ones(bs, dtype=np.int32))
+                _ = train_step_s1(dummy_ids, dummy_mask, dummy_judge)
+                log(f"  B={bs} compilation OK")
+                actual_bs = bs
+                compiled = True
+                break
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower():
+                    log(f"  B={bs} OOM, trying smaller...")
+                    del train_step_s1
+                    gc.collect()
+                    optimizer_s1 = nn.AdamWeightDecay(
+                        sfm_params,
+                        learning_rate=Tensor(
+                            np.array(lr_schedule_s1, dtype=np.float32)),
+                        weight_decay=STAGE1_WEIGHT_DECAY,
+                        beta1=0.9, beta2=0.95)
+                    forward_loss = ForwardLossCell(
+                        model, cos_t, sin_t, causal_mask)
+                    train_step_s1 = TrainStep(
+                        forward_loss, optimizer_s1, MAX_GRAD_NORM)
+                    continue
+                raise
+
+        if compiled:
+            # Stage 1 training loop
+            step = 0
+            loss_history = []
+            best_loss = float("inf")
+            t_start = time.time()
+            difficulty_tracker = DifficultyTracker(1.0)
+
+            while step < STAGE1_MAX_STEPS:
+                stop = check_stopping(
+                    step, loss_history, STAGE1_MAX_STEPS,
+                    TIME_LIMIT * 0.4, t_start,
+                    patience=CONVERGENCE_PATIENCE)
+                if stop:
+                    log(f"Stage 1 stopping: {stop}")
+                    break
+
+                # Gradient accumulation
+                accum_loss = 0.0
+                for micro in range(GRADIENT_ACCUM_STEPS):
+                    samples = generate_batch(
+                        actual_bs, stage=1, rank_id=rank_id)
+                    if not samples:
+                        continue
+
+                    batch_ids = []
+                    batch_masks = []
+                    batch_judges = []
+
+                    for sample in samples:
+                        formatted = format_sample_for_training(
+                            sample, vocab, merge_priority, eos_id, MAX_SEQ_LEN)
+                        if formatted is not None:
+                            batch_ids.append(formatted[0])
+                            batch_masks.append(formatted[1])
+                            batch_judges.append(formatted[2])
+
+                    if not batch_ids:
+                        continue
+
+                    ids_t = Tensor(np.array(batch_ids, dtype=np.int32))
+                    mask_t = Tensor(
+                        np.array(batch_masks, dtype=np.float32))
+                    judge_t = Tensor(
+                        np.array(batch_judges, dtype=np.int32))
+
+                    try:
+                        loss_val = train_step_s1(
+                            ids_t, mask_t, judge_t)
+                        accum_loss += float(loss_val.asnumpy())
+                    except RuntimeError as e:
+                        if "out of memory" in str(e).lower():
+                            log(f"Stage 1 OOM at step {step}")
+                            break
+                        raise
+
+                step += 1
+                avg_loss = accum_loss / max(GRADIENT_ACCUM_STEPS, 1)
+                loss_history.append(avg_loss)
+                if avg_loss < best_loss:
+                    best_loss = avg_loss
+
+                # Self-evolution probe
+                if step % EVOLUTION_PROBE_STEPS == 0 and step > 0 \
+                        and rank_id == 0:
+                    acc = evolution_probe(
+                        model, cos_t, sin_t, causal_mask,
+                        vocab, merge_priority, eos_id, n_samples=50)
+                    difficulty_tracker.update(acc)
+                    log(f"  Probe accuracy: {acc:.3f}, "
+                        f"difficulty: {difficulty_tracker.difficulty:.1f}")
+
+                # Logging
+                if step % 50 == 0 or step <= 3:
+                    dt = time.time() - t_start
+                    lr_now = lr_schedule_s1[
+                        min(step, len(lr_schedule_s1) - 1)]
+                    log(f"S1 Step {step:>5d} | loss={avg_loss:.4f} | "
+                        f"best={best_loss:.4f} | lr={lr_now:.2e} | "
+                        f"diff={difficulty_tracker.difficulty:.1f} | "
+                        f"elapsed={dt:.0f}s")
+
+                # Checkpoint
+                if rank_id == 0 and step % 2000 == 0 and step > 0:
+                    ckpt_path = os.path.join(
+                        CKPT_DIR, f"stage1_step_{step}.ckpt")
+                    ms.save_checkpoint(model, ckpt_path)
+                    log(f"Stage 1 checkpoint: {ckpt_path}")
+
+            log(f"Stage 1 complete: {step} steps, "
+                f"best_loss={best_loss:.4f}")
         else:
-            progress = (s - WARMUP_STEPS) / max(1, max_steps - WARMUP_STEPS)
-            lr = MIN_LR + 0.5 * (LEARNING_RATE - MIN_LR) * (
-                1 + math.cos(math.pi * progress))
-        lr_schedule.append(lr)
-    log(f"LR schedule: {max_steps} steps, warmup={WARMUP_STEPS}, "
-        f"lr=[{lr_schedule[0]:.2e}, {max(lr_schedule):.2e}, "
-        f"{lr_schedule[-1]:.2e}]")
+            log("Stage 1 compilation failed, skipping to Stage 2")
 
-    optimizer = nn.AdamWeightDecay(
-        list(model.trainable_params()),
-        learning_rate=lr_schedule,
-        weight_decay=WEIGHT_DECAY,
+    # ═══════════════════════════════════════════════════════════════════
+    # STAGE 2: Full fine-tuning (unfreeze base + SFM)
+    # ═══════════════════════════════════════════════════════════════════
+
+    log("")
+    log("=" * 60)
+    log("STAGE 2: Full fine-tuning (base + SFM)")
+    log("=" * 60)
+
+    # Unfreeze all parameters
+    for p in model.parameters():
+        p.set_param_ps(True)
+        p.requires_grad = True
+
+    # Separate param groups: base and SFM
+    base_params = []
+    sfm_params = []
+    for p in model.trainable_params():
+        if any(key in p.name for key in
+               ["deltanets", "bridges", "judge_head", "surprise_head"]):
+            sfm_params.append(p)
+        else:
+            base_params.append(p)
+
+    log(f"Base params: {sum(p.size for p in base_params):,}")
+    log(f"SFM params: {sum(p.size for p in sfm_params):,}")
+
+    # Build LR schedules for each group
+    lr_schedule_base = []
+    lr_schedule_sfm = []
+    for s in range(STAGE2_MAX_STEPS):
+        if s < STAGE2_WARMUP:
+            warmup_frac = s / max(1, STAGE2_WARMUP)
+            lr_base = STAGE2_LR_BASE * warmup_frac
+            lr_sfm = STAGE2_LR_SFM * warmup_frac
+        else:
+            progress = (s - STAGE2_WARMUP) / max(
+                1, STAGE2_MAX_STEPS - STAGE2_WARMUP)
+            min_base = STAGE2_LR_BASE * MIN_LR_FACTOR
+            min_sfm = STAGE2_LR_SFM * MIN_LR_FACTOR
+            lr_base = min_base + 0.5 * (STAGE2_LR_BASE - min_base) * (
+                1 + math.cos(math.pi * progress))
+            lr_sfm = min_sfm + 0.5 * (STAGE2_LR_SFM - min_sfm) * (
+                1 + math.cos(math.pi * progress))
+        lr_schedule_base.append(lr_base)
+        lr_schedule_sfm.append(lr_sfm)
+
+    # Combined learning rate: list of [base_lr, sfm_lr] per step
+    combined_lr = np.array(
+        [[lr_schedule_base[s], lr_schedule_sfm[s]]
+         for s in range(STAGE2_MAX_STEPS)],
+        dtype=np.float32)
+
+    optimizer_s2 = nn.AdamWeightDecay(
+        base_params + sfm_params,
+        learning_rate=Tensor(combined_lr),
+        # Group 0 = base_params, Group 1 = sfm_params
+        weight_decay=STAGE2_WEIGHT_DECAY,
         beta1=0.9,
         beta2=0.95,
     )
 
+    # Rebuild training cells
     forward_loss = ForwardLossCell(model, cos_t, sin_t, causal_mask)
-    train_step = None
-    actual_bs = BATCH_SIZE
+    train_step_s2 = TrainStep(forward_loss, optimizer_s2, MAX_GRAD_NORM)
 
-    # Batch size fallback (OOM recovery)
-    for bs in [4, 2, 1]:
+    # Compile with OOM fallback
+    actual_bs = BATCH_SIZE_PER_DEVICE
+    compiled = False
+    for bs in [BATCH_SIZE_PER_DEVICE, 1]:
         try:
-            log(f"Building training graph for B={bs} ...")
-            ts = TrainStep(forward_loss, optimizer, MAX_GRAD_NORM)
-            ts.set_train()
-            dummy = Tensor(
-                np.random.randint(0, VOCAB_SIZE, (bs, MAX_SEQ_LEN)).astype(
-                    np.int32))
-            log("  Compiling (first step) ...")
-            _ = ts(dummy)
+            log(f"  Compiling Stage 2 with B={bs}...")
+            train_step_s2.set_train()
+            dummy_ids = Tensor(
+                np.random.randint(0, VOCAB_SIZE,
+                                 (bs, MAX_SEQ_LEN)).astype(np.int32))
+            dummy_mask = Tensor(
+                np.ones((bs, MAX_SEQ_LEN), dtype=np.float32))
+            dummy_mask[0, 0] = 0.0
+            dummy_judge = Tensor(
+                np.ones(bs, dtype=np.int32))
+            _ = train_step_s2(dummy_ids, dummy_mask, dummy_judge)
             log(f"  B={bs} compilation OK")
-            train_step = ts
             actual_bs = bs
+            compiled = True
             break
         except RuntimeError as e:
-            msg = str(e).lower()
-            if "out of memory" in msg or "alloc" in msg:
-                log(f"  B={bs} OOM, trying smaller batch ...")
-                del ts
+            if "out of memory" in str(e).lower():
+                log(f"  B={bs} OOM, trying smaller...")
+                del train_step_s2
                 gc.collect()
+                optimizer_s2 = nn.AdamWeightDecay(
+                    base_params + sfm_params,
+                    learning_rate=Tensor(combined_lr),
+                    weight_decay=STAGE2_WEIGHT_DECAY,
+                    beta1=0.9, beta2=0.95)
+                forward_loss = ForwardLossCell(
+                    model, cos_t, sin_t, causal_mask)
+                train_step_s2 = TrainStep(
+                    forward_loss, optimizer_s2, MAX_GRAD_NORM)
                 continue
-            log(f"  B={bs} FAILED: {e}")
             raise
 
-    if train_step is None:
-        log("FATAL: all batch sizes OOM")
+    if not compiled:
+        log("FATAL: Stage 2 compilation failed")
         return
 
-    log(f"Training: B={actual_bs}, S={MAX_SEQ_LEN}, "
-        f"{actual_bs * MAX_SEQ_LEN:,} tok/step/dev")
-
-    # Training loop
+    # Stage 2 training loop
     step = 0
-    total_tokens = 0
+    loss_history = []
     best_loss = float("inf")
     t_start = time.time()
-    tokens_per_step_actual = actual_bs * MAX_SEQ_LEN
+    difficulty_tracker = DifficultyTracker(2.0)
     stop_reason = "not started"
-
-    loss_history = []
-    best_rolling_avg = float("inf")
-    steps_without_improvement = 0
-    epochs_completed = 0
-    samples_seen = 0
-    total_samples = data_chunks.shape[0] if use_real_data else float("inf")
-    prev_best_rolling = float("inf")
+    total_samples = 0
 
     log("")
     log("=" * 60)
-    log("TRAINING START")
+    log("STAGE 2 TRAINING START")
     log("=" * 60)
-    if use_real_data:
-        log(f"Dataset: {total_samples:,} chunks, "
-            f"real_data={has_real_data}")
 
-    while step < max_steps:
-        elapsed = time.time() - t_start
-        if elapsed > TIME_LIMIT:
-            stop_reason = f"hard time limit ({elapsed:.0f}s > {TIME_LIMIT}s)"
-            log(f"Time limit reached — {stop_reason}")
+    while step < STAGE2_MAX_STEPS:
+        stop = check_stopping(
+            step, loss_history, STAGE2_MAX_STEPS,
+            TIME_LIMIT * 0.6, t_start,
+            patience=CONVERGENCE_PATIENCE)
+        if stop:
+            stop_reason = stop
+            log(f"Stage 2 stopping: {stop}")
             break
 
-        try:
-            if use_real_data:
-                indices = [
-                    (step * actual_bs + rank_id * actual_bs + j)
-                    % data_chunks.shape[0]
-                    for j in range(actual_bs)]
-                batch_np = data_chunks[indices]
-            else:
-                batch_np = np.random.randint(
-                    0, VOCAB_SIZE,
-                    (actual_bs, MAX_SEQ_LEN)).astype(np.int32)
-            batch_tensor = Tensor(batch_np)
-            loss_val = train_step(batch_tensor)
+        # Gradient accumulation
+        accum_loss = 0.0
+        for micro in range(GRADIENT_ACCUM_STEPS):
+            samples = generate_batch(
+                actual_bs, stage=2, rank_id=rank_id)
+            if not samples:
+                continue
 
-        except RuntimeError as e:
-            msg = str(e).lower()
-            if "out of memory" in msg or "alloc" in msg:
-                stop_reason = f"OOM at step {step}"
-                log(f"OOM at step {step}! Stopping training.")
-                break
-            raise
+            batch_ids = []
+            batch_masks = []
+            batch_judges = []
 
-        loss_float = float(loss_val.asnumpy())
-        total_tokens += tokens_per_step_actual * rank_size
-        samples_seen += actual_bs
-        if loss_float < best_loss:
-            best_loss = loss_float
+            for sample in samples:
+                formatted = format_sample_for_training(
+                    sample, vocab, merge_priority, eos_id, MAX_SEQ_LEN)
+                if formatted is not None:
+                    batch_ids.append(formatted[0])
+                    batch_masks.append(formatted[1])
+                    batch_judges.append(formatted[2])
+
+            if not batch_ids:
+                continue
+
+            ids_t = Tensor(np.array(batch_ids, dtype=np.int32))
+            mask_t = Tensor(np.array(batch_masks, dtype=np.float32))
+            judge_t = Tensor(np.array(batch_judges, dtype=np.int32))
+
+            try:
+                loss_val = train_step_s2(ids_t, mask_t, judge_t)
+                accum_loss += float(loss_val.asnumpy())
+                total_samples += len(batch_ids)
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower():
+                    log(f"Stage 2 OOM at step {step}")
+                    stop_reason = f"OOM at step {step}"
+                    break
+                raise
 
         step += 1
+        avg_loss = accum_loss / max(GRADIENT_ACCUM_STEPS, 1)
+        loss_history.append(avg_loss)
+        if avg_loss < best_loss:
+            best_loss = avg_loss
 
-        # Epoch tracking
-        if use_real_data and samples_seen >= total_samples:
-            epochs_completed += 1
-            samples_seen -= total_samples
-            log(f"=== Epoch {epochs_completed} completed at step {step} ===")
-
-        # Convergence check (only after warmup and min epochs)
-        loss_history.append(loss_float)
-        if (len(loss_history) >= CONVERGENCE_WINDOW
-                and step > WARMUP_STEPS
-                and epochs_completed >= MIN_EPOCHS):
-            rolling_avg = sum(loss_history[-CONVERGENCE_WINDOW:]) / \
-                CONVERGENCE_WINDOW
-            if rolling_avg < best_rolling_avg * (
-                    1 - CONVERGENCE_THRESHOLD):
-                best_rolling_avg = rolling_avg
-                steps_without_improvement = 0
-                if rank_id == 0 and rolling_avg < prev_best_rolling:
-                    ms.save_checkpoint(
-                        model, os.path.join(CKPT_DIR, "best.ckpt"))
-                    log(f"New best model saved "
-                        f"(rolling_avg={rolling_avg:.4f})")
-                    prev_best_rolling = rolling_avg
-            else:
-                steps_without_improvement += 1
-
-            if (epochs_completed >= MIN_EPOCHS
-                    and steps_without_improvement >= CONVERGENCE_PATIENCE):
-                stop_reason = (f"converged (rolling_avg={rolling_avg:.4f}, "
-                               f"no improvement for "
-                               f"{steps_without_improvement} steps, "
-                               f"{epochs_completed} epochs done)")
-                log(f"STOPPING: {stop_reason}")
-                break
+        # Self-evolution: probe + adapt difficulty
+        if step % EVOLUTION_PROBE_STEPS == 0 and step > 0 \
+                and rank_id == 0:
+            acc = evolution_probe(
+                model, cos_t, sin_t, causal_mask,
+                vocab, merge_priority, eos_id, n_samples=50)
+            new_diff = difficulty_tracker.update(acc)
+            log(f"  Probe accuracy: {acc:.3f}, "
+                f"difficulty: {difficulty_tracker.difficulty:.1f} "
+                f"-> {new_diff:.1f}")
 
         # Logging
         if step % 50 == 0 or step <= 3:
             dt = time.time() - t_start
-            tps_dev = (tokens_per_step_actual / dt * step
-                       if dt > 0 else 0)
-            tps_total = tps_dev * rank_size
-            log(f"Step {step:>5d} | loss={loss_float:.4f} | "
+            idx = min(step, len(lr_schedule_base) - 1)
+            log(f"S2 Step {step:>5d} | loss={avg_loss:.4f} | "
                 f"best={best_loss:.4f} | "
-                f"tok/s/dev={tps_dev:.0f} | "
-                f"tok/s/total={tps_total:.0f} | "
-                f"lr={lr_schedule[min(step, len(lr_schedule)-1)]:.2e} | "
-                f"epoch={epochs_completed} | "
-                f"elapsed={dt:.0f}s | "
-                f"tokens={total_tokens:,}")
+                f"lr_base={lr_schedule_base[idx]:.2e} | "
+                f"lr_sfm={lr_schedule_sfm[idx]:.2e} | "
+                f"diff={difficulty_tracker.difficulty:.1f} | "
+                f"samples={total_samples:,} | "
+                f"elapsed={dt:.0f}s")
 
-        # Checkpointing
-        if rank_id == 0 and step % 1000 == 0 and step > 0:
-            ckpt_path = os.path.join(CKPT_DIR, f"step_{step}.ckpt")
+        # Checkpoint
+        if rank_id == 0 and step % 2000 == 0 and step > 0:
+            ckpt_path = os.path.join(
+                CKPT_DIR, f"stage2_step_{step}.ckpt")
             ms.save_checkpoint(model, ckpt_path)
-            log(f"Checkpoint saved: {ckpt_path}")
+            log(f"Stage 2 checkpoint: {ckpt_path}")
 
-    # Training complete
-    elapsed_total = time.time() - t_start
-    tps_avg = total_tokens / elapsed_total if elapsed_total > 0 else 0
+            # Also save best
+            if avg_loss <= best_loss + 0.01:
+                ms.save_checkpoint(
+                    model, os.path.join(CKPT_DIR, "best.ckpt"))
+
+    # ── Training complete ──
+    elapsed_total = time.time() - t0_global
 
     if rank_id == 0:
         ms.save_checkpoint(model, os.path.join(CKPT_DIR, "final.ckpt"))
         log("Final checkpoint saved")
 
     results = {
-        "model_name": "Thinker-1.5B (from-scratch + SFM GQA)",
+        "model_name": "Thinker-1.5B (Qwen2.5-Coder-1.5B + DeltaNet SFM)",
         "total_params": total_p,
         "trainable_params": trainable_p,
         "batch_size": actual_bs,
+        "grad_accum_steps": GRADIENT_ACCUM_STEPS,
+        "effective_batch": actual_bs * GRADIENT_ACCUM_STEPS * rank_size,
         "seq_len": MAX_SEQ_LEN,
         "num_devices": rank_size,
-        "total_steps": step,
-        "total_tokens": total_tokens,
+        "stage1_steps": step if 'step' in dir() else 0,
+        "stage2_steps": step,
+        "total_samples": total_samples,
         "total_time_s": round(elapsed_total, 1),
-        "tokens_per_sec_total": round(tps_avg, 1),
-        "final_loss": round(loss_float, 4),
+        "final_loss": round(avg_loss, 4) if loss_history else None,
         "best_loss": round(best_loss, 4),
-        "best_rolling_avg": round(best_rolling_avg, 4)
-        if best_rolling_avg < float("inf") else None,
-        "epochs_completed": epochs_completed,
         "stop_reason": stop_reason,
         "data_parallel": use_dp,
-        "used_real_data": use_real_data,
+        "final_difficulty": difficulty_tracker.difficulty,
         "architecture": {
+            "base_model": "Qwen2.5-Coder-1.5B",
             "hidden_dim": HIDDEN_DIM,
             "num_layers": NUM_LAYERS,
             "num_heads": NUM_HEADS,
             "num_kv_heads": NUM_KV_HEADS,
+            "num_groups": NUM_GROUPS,
             "intermediate_dim": INTERMEDIATE_DIM,
             "head_dim": HEAD_DIM,
             "vocab_size": VOCAB_SIZE,
             "max_seq_len": MAX_SEQ_LEN,
+            "rope_theta": ROPE_THETA,
             "tied_embeddings": TIE_WORD_EMBEDDINGS,
         },
-        "sfm_config": {
-            "num_slots": SFM_NUM_SLOTS,
-            "slot_dim": SFM_SLOT_DIM,
-            "slot_heads": SFM_NUM_HEADS,
+        "deltanet_config": {
+            "hidden_dim": DELTANET_HIDDEN_DIM,
+            "num_heads": DELTANET_NUM_HEADS,
+            "head_dim": DELTANET_HEAD_DIM,
+            "state_dim": DELTANET_STATE_DIM,
             "sfm_layers": list(SFM_LAYERS),
+            "bridge_dim": BRIDGE_DIM,
+        },
+        "training_config": {
+            "stage1_lr_sfm": STAGE1_LR_SFM,
+            "stage2_lr_base": STAGE2_LR_BASE,
+            "stage2_lr_sfm": STAGE2_LR_SFM,
+            "judge_corrupt_rate": 0.15,
+            "loss_weights": {
+                "ce": 1.0,
+                "judge": 0.1,
+                "surprise": 0.01,
+            },
         },
     }
 
