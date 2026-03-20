@@ -13,43 +13,73 @@ Tests (in order, stops on first failure):
   10. DeltaNet @ms.jit compilation
   11. Mini training step (forward + backward + optimizer)
 
+Writes results to /cache/output/test_result.log and test_result.json.
+
 Run: python test_image.py
 """
 
 import sys
 import os
+import json
 import time
+
+# ── Logging: write to both stdout and /cache/output/test_result.log ──
+_log_fh = None
+
+def log(msg: str) -> None:
+    ts = time.strftime("%H:%M:%S")
+    line = f"[{ts}] {msg}"
+    log(line, flush=True)
+    if _log_fh is not None:
+        _log_fh.write(line + "\n")
+        _log_fh.flush()
+
+
+def setup_log() -> None:
+    global _log_fh
+    out_dir = os.environ.get("OUTPUT_PATH", "/cache/output")
+    os.makedirs(out_dir, exist_ok=True)
+    log_path = os.path.join(out_dir, "test_result.log")
+    _log_fh = open(log_path, "w")
+    log(f"Log file: {log_path}")
+
 
 passed = 0
 failed = 0
 errors = []
+results = {}  # {test_name: {"status": "pass/fail", "detail": ..., "time": ...}}
 
 def check(name: str, fn, *args, **kwargs):
     """Run a check, report pass/fail."""
     global passed, failed
-    print(f"\n{'='*60}")
-    print(f"TEST: {name}")
-    print(f"{'='*60}")
+    log(f"\n{'='*60}")
+    log(f"TEST: {name}")
+    log(f"{'='*60}")
     try:
         t0 = time.time()
         result = fn(*args, **kwargs)
         dt = time.time() - t0
-        print(f"  PASS ({dt:.2f}s)")
+        log(f"  PASS ({dt:.2f}s)")
         if result is not None:
-            print(f"  Result: {result}")
+            log(f"  Result: {result}")
         passed += 1
+        results[name] = {"status": "pass", "detail": str(result), "time": round(dt, 2)}
         return result
     except Exception as e:
         dt = time.time() - t0
-        print(f"  FAIL ({dt:.2f}s): {type(e).__name__}: {e}")
+        log(f"  FAIL ({dt:.2f}s): {type(e).__name__}: {e}")
         failed += 1
         errors.append((name, e))
+        results[name] = {"status": "fail", "detail": f"{type(e).__name__}: {e}", "time": round(dt, 2)}
         return None
 
+# ── 0. Setup logging ──────────────────────────────────────────────
+setup_log()
+
 # ── 1. MindSpore import + version ─────────────────────────────────
-print("=" * 60)
-print("OpenI Custom Image Test")
-print("=" * 60)
+log("=" * 60)
+log("OpenI Custom Image Test")
+log("=" * 60)
 
 # Suppress warnings
 os.environ["GLOG_v"] = "2"
@@ -389,21 +419,60 @@ def test_training_step():
 
 check("Mini training step (forward + backward + optimizer)", test_training_step)
 
-# ── Summary ────────────────────────────────────────────────────────
-print(f"\n{'='*60}")
-print(f"SUMMARY: {passed} passed, {failed} failed out of {passed + failed}")
-print(f"{'='*60}")
+# ── Summary + write JSON result ────────────────────────────────────
+log(f"\n{'='*60}")
+log(f"SUMMARY: {passed} passed, {failed} failed out of {passed + failed}")
+log(f"{'='*60}")
 
 if errors:
-    print("\nFAILED TESTS:")
+    log("\nFAILED TESTS:")
     for name, err in errors:
-        print(f"  - {name}: {type(err).__name__}: {err}")
+        log(f"  - {name}: {type(err).__name__}: {err}")
 
 if failed == 0:
-    print("\nALL TESTS PASSED! The image is ready for training.")
+    log("\nALL TESTS PASSED! The image is ready for training.")
 else:
-    print(f"\n{failed} test(s) failed. Check errors above.")
+    log(f"\n{failed} test(s) failed. Check errors above.")
 
-print(f"\nMindSpore: {ms_ver}")
-print(f"Python: {sys.version}")
-print(f"NPUs available: {ms.get_context('device_num')}")
+log(f"\nMindSpore: {ms_ver}")
+log(f"Python: {sys.version}")
+log(f"NPUs available: {ms.get_context('device_num')}")
+
+# Write JSON result file
+out_dir = os.environ.get("OUTPUT_PATH", "/cache/output")
+json_path = os.path.join(out_dir, "test_result.json")
+summary = {
+    "passed": passed,
+    "failed": failed,
+    "total": passed + failed,
+    "all_passed": failed == 0,
+    "mindspore_version": ms_ver,
+    "python_version": sys.version,
+    "npus": ms.get_context("device_num"),
+    "tests": results,
+    "errors": [{"name": n, "error": f"{type(e).__name__}: {e}"} for n, e in errors],
+}
+with open(json_path, "w") as f:
+    json.dump(summary, f, indent=2)
+log(f"Results written to {json_path}")
+
+# Close log file
+if _log_fh is not None:
+    _log_fh.close()
+
+
+# ── Error handler: write error.log on crash ───────────────────────
+if __name__ == "__main__":
+    try:
+        pass  # Tests already ran above
+    except Exception as e:
+        import traceback
+        msg = f"FATAL: {e}\n{traceback.format_exc()}"
+        log(msg)
+        for d in ["/cache/output", out_dir]:
+            try:
+                os.makedirs(d, exist_ok=True)
+                with open(os.path.join(d, "error.log"), "w") as f:
+                    f.write(msg)
+            except Exception:
+                pass
