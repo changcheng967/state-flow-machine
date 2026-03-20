@@ -563,7 +563,7 @@ class DeltaNetCell(nn.Cell):
         x_f32 = x.astype(ms.float32)
         K = self.key_proj(x_f32).astype(ms.float16)   # (B, S, D)
         V = self.value_proj(x_f32).astype(ms.float16)  # (B, S, D)
-        beta = ops.sigmoid(self.beta_proj(x_f32))      # (B, S, NH)
+        beta = ops.sigmoid(self.beta_proj(x_f32)).astype(ms.float16)  # (B, S, NH)
 
         # Initialize state: broadcast to batch
         state = ops.Tile()(self.initial_state, (B, 1, 1, 1))  # (B, NH, HD, HD)
