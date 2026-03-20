@@ -888,7 +888,15 @@ def load_qwen_weights(model: Thinker15BModel,
             continue
 
         if ms_name in model_params:
-            param_dict[ms_name] = Tensor(array.astype(np.float32))
+            # Validate shape matches
+            target_shape = model_params[ms_name].shape
+            if array.shape != target_shape:
+                not_found.append(
+                    f"{hf_name} -> {ms_name} (shape {array.shape} "
+                    f"!= {target_shape})")
+                continue
+            param_dict[ms_name] = ms.Parameter(
+                Tensor(array.astype(np.float32)), name=ms_name)
             loaded += 1
         else:
             not_found.append(f"{hf_name} -> {ms_name}")
@@ -1950,14 +1958,10 @@ def main() -> None:
     log("STAGE 1: SFM-only training (base frozen)")
     log("=" * 60)
 
-    # Freeze base model parameters
-    base_param_names = set()
+    # Freeze base model parameters (SFM params keep requires_grad=True)
     for p in model.get_parameters():
-        base_param_names.add(p.name)
-        # Only freeze non-SFM parameters
         if not any(key in p.name for key in
                    ["deltanets", "bridges", "judge_head", "surprise_head"]):
-            p.set_param_ps(False)
             p.requires_grad = False
 
     sfm_params = [p for p in model.trainable_params()]
@@ -2131,7 +2135,6 @@ def main() -> None:
 
     # Unfreeze all parameters
     for p in model.get_parameters():
-        p.set_param_ps(True)
         p.requires_grad = True
 
     # Separate param groups: base and SFM
