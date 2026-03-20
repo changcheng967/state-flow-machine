@@ -73,7 +73,7 @@ warnings.filterwarnings("ignore")
 # custom install are missing. We replicate what .bashrc's __fix_cann
 # does: source our CANN 9.0 set_env.sh and strip the old pre-installed
 # CANN paths from PATH/LD_LIBRARY_PATH/PYTHONPATH.
-_CANN_ENV_SH = "/home/ma-user/Ascend/cann/set_env.sh"
+_CANN_ENV_SH = "/home/ma-user/Ascend/cann-9.0.0-beta.1/set_env.sh"
 _OLD_CANN_PREFIXES = (
     "/usr/local/Ascend/ascend-toolkit",
     "/usr/local/Ascend/toolbox",
