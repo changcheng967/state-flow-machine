@@ -1970,10 +1970,11 @@ def main() -> None:
     log("")
 
     ms.set_context(
-        mode=ms.PYNATIVE_MODE,
+        mode=ms.GRAPH_MODE,  # PYNATIVE StubTensors crash CANN 7 Mul SelectFormat
         device_target="Ascend",
         device_id=device_id,
         memory_optimize_level="O1",
+        max_call_depth=100000,  # DeltaNet 2048-step sequential scan
     )
 
     # Data parallel init
