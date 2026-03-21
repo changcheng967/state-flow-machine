@@ -553,11 +553,21 @@ class TransformerBlock(nn.Cell):
         Q = Q * cos + ops.concat([-Q[..., HD2:], Q[..., :HD2]], -1) * sin
         K = K * cos + ops.concat([-K[..., HD2:], K[..., :HD2]], -1) * sin
 
-        attn = self.bmm_tb(Q, K) * self.scale
+        # Reshape to 3D for BatchMatMul (CANN 7 doesn't support 4D BMM)
+        B_NH = B * NH
+        Q3 = Q.reshape(B_NH, S, HD)
+        K3 = K.reshape(B_NH, S, HD)
+        V3 = V.reshape(B_NH, S, HD)
+
+        attn = self.bmm_tb(Q3, K3) * self.scale
+        # Reshape back to 4D for mask broadcast + softmax
+        attn = attn.reshape(B, NH, S, S)
         attn = attn + mask[:, :, :S, :S]
         attn = self.softmax(attn)
-        out = self.bmm(attn, V)
-        out = out.transpose(0, 2, 1, 3).reshape(B, S, NH * HD)
+        attn = attn.reshape(B_NH, S, S)
+        out = self.bmm(attn, V3)
+        # (B*NH, S, HD) -> reshape to (B, NH, S, HD) -> transpose to (B, S, NH, HD)
+        out = out.reshape(B, NH, S, HD).transpose(0, 2, 1, 3).reshape(B, S, NH * HD)
         out = self.o_proj(out.astype(ms.float32)).astype(ms.float16)
         x = x + out
 
@@ -643,6 +653,7 @@ class DeltaNetCell(nn.Cell):
 
         # Sequential scan — core of state tracking.
         outputs = ()
+        B_NH = B * NH
         for t in range(S):
             kt = K[:, t, None, :]   # (B, D, 1)
             vt = V[:, t, None, :]   # (B, D, 1)
@@ -651,8 +662,13 @@ class DeltaNetCell(nn.Cell):
             # delta rule: S = S - beta*(S@k - v)*k^T
             k_head = kt.reshape(B, NH, HD, 1)  # (B, NH, HD, 1)
             v_head = vt.reshape(B, NH, HD, 1)  # (B, NH, HD, 1)
-            residual = self.bmm(state, k_head) - v_head
-            update = bt * self.bmm_tb(residual, k_head)
+            # Use 3D BMM (CANN 7 doesn't support 4D BMM)
+            s3 = state.reshape(B_NH, HD, HD)
+            k3 = k_head.reshape(B_NH, HD, 1)
+            v3 = v_head.reshape(B_NH, HD, 1)
+            residual = self.bmm(s3, k3).reshape(B, NH, HD, 1) - v_head
+            update = bt * self.bmm_tb(
+                residual.reshape(B_NH, HD, 1), k3).reshape(B, NH, HD, HD)
             state = state - update
 
             out_t = state[:, :, -1, :]  # (B, NH, HD)
