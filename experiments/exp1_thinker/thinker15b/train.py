@@ -812,16 +812,37 @@ class Thinker15BModel(nn.Cell):
         B = input_ids.shape[0]
         x = self.embedding(input_ids).astype(ms.float16)
 
-        sfm_idx = 0
-        for i in range(NUM_LAYERS):
+        # Unrolled loop — GRAPH_MODE requires all CellList indices to be
+        # compile-time constants (no variable sfm_idx).
+        # SFM_LAYERS = (6, 13, 20, 27), 28 layers total.
+
+        # Layers 0-6 (7 layers), then SFM 0
+        for i in range(7):
             x = self.layers[i](x, cos, sin, mask)
-            if i in self.sfm_layer_set:
-                # Project to bridge dim, run DeltaNet, bridge back
-                sfm_input = self.bridges[sfm_idx].down_proj(
-                    x.astype(ms.float32)).astype(ms.float16)
-                sfm_out = self.deltanets[sfm_idx](sfm_input)
-                x = self.bridges[sfm_idx](x, sfm_out)
-                sfm_idx += 1
+        sfm_in = self.bridges[0].down_proj(
+            x.astype(ms.float32)).astype(ms.float16)
+        x = self.bridges[0](x, self.deltanets[0](sfm_in))
+
+        # Layers 7-13 (7 layers), then SFM 1
+        for i in range(7, 14):
+            x = self.layers[i](x, cos, sin, mask)
+        sfm_in = self.bridges[1].down_proj(
+            x.astype(ms.float32)).astype(ms.float16)
+        x = self.bridges[1](x, self.deltanets[1](sfm_in))
+
+        # Layers 14-20 (7 layers), then SFM 2
+        for i in range(14, 21):
+            x = self.layers[i](x, cos, sin, mask)
+        sfm_in = self.bridges[2].down_proj(
+            x.astype(ms.float32)).astype(ms.float16)
+        x = self.bridges[2](x, self.deltanets[2](sfm_in))
+
+        # Layers 21-27 (7 layers), then SFM 3
+        for i in range(21, 28):
+            x = self.layers[i](x, cos, sin, mask)
+        sfm_in = self.bridges[3].down_proj(
+            x.astype(ms.float32)).astype(ms.float16)
+        x = self.bridges[3](x, self.deltanets[3](sfm_in))
 
         x = self.norm(x)
 
