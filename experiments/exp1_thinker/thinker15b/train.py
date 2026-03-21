@@ -673,29 +673,36 @@ class DeltaNetCell(nn.Cell):
                            (B, 1, 1, 1))  # (B, NH, HD, HD) FP32
 
         # Sequential scan — core of state tracking.
-        outputs = ()
+        # CANN 7's Pack/unpack (used by ops.stack) has a max input limit,
+        # so we chunk outputs into CHUNK_SIZE pieces and concat.
+        CHUNK_SIZE = 64
         B_NH = B * NH
-        for t in range(S):
-            kt = K[:, t, None, :]   # (B, D, 1)
-            vt = V[:, t, None, :]   # (B, D, 1)
-            bt = beta[:, t, :, None, None]  # (B, NH, 1, 1)
+        chunk_results = ()
+        for c in range(S // CHUNK_SIZE):
+            current_chunk = ()
+            for t in range(c * CHUNK_SIZE, (c + 1) * CHUNK_SIZE):
+                kt = K[:, t, None, :]   # (B, D, 1)
+                vt = V[:, t, None, :]   # (B, D, 1)
+                bt = beta[:, t, :, None, None]  # (B, NH, 1, 1)
 
-            # delta rule: S = S - beta*(S@k - v)*k^T
-            k_head = kt.reshape(B, NH, HD, 1)  # (B, NH, HD, 1)
-            v_head = vt.reshape(B, NH, HD, 1)  # (B, NH, HD, 1)
-            # Use 3D BMM (CANN 7 doesn't support 4D BMM)
-            s3 = state.reshape(B_NH, HD, HD)
-            k3 = k_head.reshape(B_NH, HD, 1)
-            v3 = v_head.reshape(B_NH, HD, 1)
-            residual = self.bmm(s3, k3).reshape(B, NH, HD, 1) - v_head
-            update = bt * self.bmm_tb(
-                residual.reshape(B_NH, HD, 1), k3).reshape(B, NH, HD, HD)
-            state = state - update
+                # delta rule: S = S - beta*(S@k - v)*k^T
+                k_head = kt.reshape(B, NH, HD, 1)  # (B, NH, HD, 1)
+                v_head = vt.reshape(B, NH, HD, 1)  # (B, NH, HD, 1)
+                # Use 3D BMM (CANN 7 doesn't support 4D BMM)
+                s3 = state.reshape(B_NH, HD, HD)
+                k3 = k_head.reshape(B_NH, HD, 1)
+                v3 = v_head.reshape(B_NH, HD, 1)
+                residual = self.bmm(s3, k3).reshape(B, NH, HD, 1) - v_head
+                update = bt * self.bmm_tb(
+                    residual.reshape(B_NH, HD, 1), k3).reshape(B, NH, HD, HD)
+                state = state - update
 
-            out_t = state[:, :, -1, :]  # (B, NH, HD)
-            outputs = outputs + (out_t,)
+                out_t = state[:, :, -1, :]  # (B, NH, HD)
+                current_chunk = current_chunk + (out_t,)
+            chunk_results = chunk_results + (
+                ops.stack(current_chunk, axis=0),)  # (CHUNK, B, NH, HD)
 
-        stacked = ops.stack(outputs, axis=0)  # (S, B, NH, HD)
+        stacked = ops.Concat(axis=0)(chunk_results)  # (S, B, NH, HD)
         stacked = self.transpose_op(stacked, (1, 0, 2, 3))  # (B, S, NH, HD)
         output = stacked.reshape(B, S, NH * HD)   # (B, S, D)
 
