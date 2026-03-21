@@ -182,8 +182,6 @@ RANK_SIZE = 4
 
 # Self-evolution
 EVOLUTION_PROBE_STEPS = 500
-EVOLUTION_VERIFY_SAMPLES = 200
-EVOLUTION_ADAPT_FACTOR = 0.2
 
 # Convergence
 CONVERGENCE_WINDOW = 200
@@ -926,7 +924,7 @@ class TrainStep:
         norm_sq = Tensor(0.0, ms.float32)
         for g in grads:
             if g is not None:
-                norm_sq = norm_sq + ops.reduce_sum(
+                norm_sq = norm_sq + ops.ReduceSum()(
                     ops.square(g.astype(ms.float32)))
         global_norm = ops.sqrt(norm_sq)
         clip_coef = ops.minimum(
@@ -1824,59 +1822,6 @@ def evolution_probe(model: Thinker15BModel, cos: Tensor, sin: Tensor,
             model.set_train(True)
 
             # Check judge prediction
-            pred = int(ops.argmax(judge_logits, axis=-1).asnumpy()[0])
-            if pred == sample["judge_label"]:
-                correct += 1
-            total += 1
-        except Exception:
-            continue
-
-    return correct / max(total, 1)
-
-
-def evolution_verify(model: Thinker15BModel, cos: Tensor, sin: Tensor,
-                     mask: Tensor, vocab: dict, merge_priority: dict,
-                     eos_id: int, difficulty: int,
-                     n_samples: int = 50) -> float:
-    """Verify model performance at a specific difficulty level.
-
-    Returns accuracy (0-1).
-    """
-    correct = 0
-    total = 0
-
-    for _ in range(n_samples):
-        # Generate at specific difficulty
-        random.seed()
-        code = _gen_random_program(difficulty)
-        result = _exec_with_trace(code)
-        if result is None:
-            continue
-
-        final_vars, _ = result
-        if not final_vars:
-            continue
-
-        answer_str = _vars_to_json(final_vars)
-        sample = {
-            "text": f"<|code|>\n{code}\n<|answer|>\n{answer_str}\n"
-                   f"<|judge_correct|>",
-            "judge_label": 1,
-        }
-
-        ids = _tokenize_text(sample["text"], vocab, merge_priority)
-        if len(ids) < 10 or len(ids) > MAX_SEQ_LEN:
-            continue
-
-        ids_arr = np.array(ids, dtype=np.int32)
-        input_t = Tensor(ids_arr[np.newaxis, :])
-
-        try:
-            model.set_train(False)
-            logits, judge_logits, surprise = model(
-                input_t, cos, sin, mask)
-            model.set_train(True)
-
             pred = int(ops.argmax(judge_logits, axis=-1).asnumpy()[0])
             if pred == sample["judge_label"]:
                 correct += 1
