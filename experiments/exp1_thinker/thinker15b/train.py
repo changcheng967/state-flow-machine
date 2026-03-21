@@ -71,7 +71,7 @@ warnings.filterwarnings("ignore")
 # ── Environment vars (BEFORE importing MindSpore) ────────────────────
 os.environ.update({
     "MS_COMPILER_CACHE_ENABLE": "1",
-    "MS_COMPILER_CACHE_PATH": "/home/ma-user/work/graph_cache",
+    "MS_COMPILER_CACHE_PATH": "/cache/output/graph_cache",
     "MS_BUILD_PROCESS_NUM": "24",
     "TASK_QUEUE_ENABLE": "2",
     "CPU_AFFINITY_CONF": "1",
@@ -668,7 +668,9 @@ class DeltaNetCell(nn.Cell):
         beta = ops.sigmoid(self.beta_proj(x_f32))    # (B, S, NH) FP32
 
         # Initialize state: broadcast to batch, keep FP32 for precision
-        state = ops.Tile()(self.initial_state, (B, 1, 1, 1))  # (B, NH, HD, HD) FP32
+        # Must reshape 3D (NH,HD,HD) to 4D (1,NH,HD,HD) before Tile
+        state = ops.Tile()(self.initial_state.reshape(1, NH, HD, HD),
+                           (B, 1, 1, 1))  # (B, NH, HD, HD) FP32
 
         # Sequential scan — core of state tracking.
         outputs = ()
