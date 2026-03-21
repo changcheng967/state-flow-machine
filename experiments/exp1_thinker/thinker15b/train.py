@@ -525,6 +525,8 @@ class TransformerBlock(nn.Cell):
         self.ffn_norm = RMSNorm(H)
 
         self.scale = HD ** -0.5  # Python float — CANN 7 can't Mul scalar Tensor with 4D
+        self.bmm = ops.BatchMatMul()
+        self.bmm_tb = ops.BatchMatMul(transpose_b=True)
         self.tile = ops.Tile()
         self.softmax = ops.Softmax(axis=-1)
 
@@ -551,10 +553,10 @@ class TransformerBlock(nn.Cell):
         Q = Q * cos + ops.concat([-Q[..., HD2:], Q[..., :HD2]], -1) * sin
         K = K * cos + ops.concat([-K[..., HD2:], K[..., :HD2]], -1) * sin
 
-        attn = ops.matmul(Q, K.transpose(0, 1, 3, 2)) * self.scale
+        attn = self.bmm_tb(Q, K) * self.scale
         attn = attn + mask[:, :, :S, :S]
         attn = self.softmax(attn)
-        out = ops.matmul(attn, V)
+        out = self.bmm(attn, V)
         out = out.transpose(0, 2, 1, 3).reshape(B, S, NH * HD)
         out = self.o_proj(out.astype(ms.float32)).astype(ms.float16)
         x = x + out
@@ -606,6 +608,8 @@ class DeltaNetCell(nn.Cell):
 
         self.NH = NH
         self.HD = HD
+        self.bmm = ops.BatchMatMul()
+        self.bmm_tb = ops.BatchMatMul(transpose_b=True)
 
     def construct(self, x: Tensor) -> Tensor:
         """Process sequence through delta rule (sequential scan).
@@ -647,8 +651,8 @@ class DeltaNetCell(nn.Cell):
             # delta rule: S = S - beta*(S@k - v)*k^T
             k_head = kt.reshape(B, NH, HD, 1)  # (B, NH, HD, 1)
             v_head = vt.reshape(B, NH, HD, 1)  # (B, NH, HD, 1)
-            residual = ops.matmul(state, k_head) - v_head
-            update = bt * ops.matmul(residual, k_head.transpose(0, 1, 3, 2))
+            residual = self.bmm(state, k_head) - v_head
+            update = bt * self.bmm_tb(residual, k_head)
             state = state - update
 
             out_t = state[:, :, -1, :]  # (B, NH, HD)
