@@ -530,7 +530,8 @@ class TransformerBlock(nn.Cell):
 
     def construct(self, x: Tensor, cos: Tensor, sin: Tensor,
                   mask: Tensor) -> Tensor:
-        B, S, _ = x.shape
+        B = x.shape[0]
+        S = x.shape[1]
         NH = NUM_HEADS
         NKV = NUM_KV_HEADS
         HD = HEAD_DIM
@@ -620,7 +621,8 @@ class DeltaNetCell(nn.Cell):
         Returns:
             output: (B, S, DELTANET_HIDDEN_DIM) delta net output.
         """
-        B, S, _ = x.shape
+        B = x.shape[0]
+        S = x.shape[1]
         D = DELTANET_HIDDEN_DIM
         NH = self.NH
         HD = self.HD
