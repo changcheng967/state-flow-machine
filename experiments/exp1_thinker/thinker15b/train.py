@@ -70,39 +70,89 @@ warnings.filterwarnings("ignore")
 
 # ── CANN 9.0 activation (BEFORE importing MindSpore) ───────────────
 # Training tasks don't source .bashrc, so CANN 9.0 paths from the
-# custom install are missing. We replicate what .bashrc's __fix_cann
-# does: source our CANN 9.0 set_env.sh and strip the old pre-installed
-# CANN paths from PATH/LD_LIBRARY_PATH/PYTHONPATH.
-_CANN_ENV_SH = "/home/ma-user/Ascend/cann-9.0.0-beta.1/set_env.sh"
+# custom install are missing. We directly set env vars (no subprocess)
+# and strip the old pre-installed CANN paths from PATH/LD_LIBRARY_PATH/
+# PYTHONPATH — same logic as .bashrc's __fix_cann.
+_CANN_ROOT = "/home/ma-user/Ascend/cann-9.0.0-beta.1"
 _OLD_CANN_PREFIXES = (
     "/usr/local/Ascend/ascend-toolkit",
     "/usr/local/Ascend/toolbox",
 )
 
 def _activate_cann():
-    """Source CANN 9.0 env and strip old pre-installed CANN paths."""
-    if not os.path.isfile(_CANN_ENV_SH):
-        return  # Pre-installed CANN already on PATH — no fix needed
-
-    try:
-        proc = subprocess.run(
-            f"bash -c 'source {_CANN_ENV_SH} 2>/dev/null && env'",
-            shell=True, capture_output=True, text=True, timeout=30)
-    except Exception:
+    """Activate CANN 9.0 by directly setting env vars (no subprocess)."""
+    if not os.path.isdir(_CANN_ROOT):
         return
 
-    for line in proc.stdout.splitlines():
-        if "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        # Strip old CANN paths from PATH-like vars
-        if key in ("PATH", "LD_LIBRARY_PATH", "PYTHONPATH"):
-            filtered = [p for p in value.split(":")
-                        if not any(old in p for old in _OLD_CANN_PREFIXES)]
-            value = ":".join(filtered)
-        os.environ[key] = value
+    os.environ["ASCEND_HOME_PATH"] = _CANN_ROOT
+    os.environ["ASCEND_TOOLKIT_HOME"] = _CANN_ROOT
+
+    cann_bins = [
+        os.path.join(_CANN_ROOT, "bin"),
+        os.path.join(_CANN_ROOT, "compiler", "ccec_compiler", "bin"),
+    ]
+    cann_libs = [
+        os.path.join(_CANN_ROOT, "lib64"),
+        os.path.join(_CANN_ROOT, "lib64", "plugin", "opskernel"),
+        os.path.join(_CANN_ROOT, "lib64", "plugin", "nnengine"),
+        os.path.join(_CANN_ROOT, "runtime", "lib64"),
+        os.path.join(_CANN_ROOT, "runtime", "lib64", "stub"),
+        os.path.join(_CANN_ROOT, "compiler", "lib64"),
+    ]
+    cann_python = [
+        os.path.join(_CANN_ROOT, "python", "site-packages"),
+    ]
+
+    def _prepend_and_strip(var, new_paths, strip_prefixes):
+        old = os.environ.get(var, "")
+        parts = [p for p in old.split(":") if p and
+                 not any(s in p for s in strip_prefixes)]
+        existing = [p for p in new_paths if os.path.isdir(p)]
+        os.environ[var] = ":".join(existing + parts)
+
+    _prepend_and_strip("PATH", cann_bins, _OLD_CANN_PREFIXES)
+    _prepend_and_strip("LD_LIBRARY_PATH", cann_libs, _OLD_CANN_PREFIXES)
+    _prepend_and_strip("PYTHONPATH", cann_python, _OLD_CANN_PREFIXES)
 
 _activate_cann()
+
+# ── DIAGNOSTIC DUMP (remove after debugging) ────────────────────────
+try:
+    os.makedirs("/cache/output", exist_ok=True)
+    with open("/cache/output/diag.log", "w") as _df:
+        _df.write(f"PID={os.getpid()}\n")
+        _df.write(f"CANN_ROOT exists: {os.path.isdir(_CANN_ROOT)}\n")
+        _df.write(f"ASCEND_HOME_PATH={os.environ.get('ASCEND_HOME_PATH','UNSET')}\n")
+        _df.write(f"PATH={os.environ.get('PATH','')[:500]}\n")
+        _df.write(f"LD_LIBRARY_PATH={os.environ.get('LD_LIBRARY_PATH','')[:500]}\n")
+        _df.write(f"PYTHONPATH={os.environ.get('PYTHONPATH','')[:500]}\n")
+
+        # Check if mindspore can even import
+        try:
+            import mindspore as _ms_test
+            _df.write(f"MindSpore version: {_ms_test.__version__}\n")
+            _df.write(f"MindSpore file: {_ms_test.__file__}\n")
+        except Exception as _e:
+            _df.write(f"MindSpore import FAILED: {_e}\n")
+
+        # Check conda env
+        _df.write(f"Python: {sys.executable}\n")
+        _df.write(f"sys.path[:5]: {sys.path[:5]}\n")
+
+        # Check if old CANN paths are still polluting
+        for v in ["PATH", "LD_LIBRARY_PATH", "PYTHONPATH"]:
+            val = os.environ.get(v, "")
+            old_hits = [p for p in val.split(":")
+                       if "/usr/local/Ascend/ascend-toolkit" in p]
+            if old_hits:
+                _df.write(f"WARNING: old CANN still in {v}: {old_hits}\n")
+            else:
+                _df.write(f"OK: no old CANN in {v}\n")
+
+        _df.write("diag complete\n")
+        _df.flush()
+except Exception:
+    pass
 
 # ── Environment vars (BEFORE importing MindSpore) ────────────────────
 os.environ.update({
