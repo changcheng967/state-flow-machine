@@ -296,20 +296,29 @@ try:
         try:
             return _orig_shape_getter(self)
         except (RuntimeError, ValueError):
-            # StubTensor stores correct shape in _shape (set at construction).
-            # CANN uses this for kernel compilation — (1,1) causes SelectFormat crash.
-            shape = getattr(self, '_shape', None)
-            if shape is not None:
-                return tuple(shape)
+            # Use __dict__ only to avoid parent class _shape method.
+            # StubTensor.__init__ sets virtual_abstract from output.abstract.
+            cached = self.__dict__.get('stub_shape')
+            if cached is not None:
+                return tuple(cached)
+            abstract = self.__dict__.get('virtual_abstract')
+            if abstract is not None:
+                try:
+                    return tuple(abstract.shape)
+                except Exception:
+                    pass
             return (1, 1)
 
     def _safe_stub_sync(self):
         try:
             return _orig_stub_sync(self)
         except (RuntimeError, ValueError):
-            shape = getattr(self, '_shape', None)
-            if shape is not None:
-                return np.zeros(tuple(shape), dtype=np.float32)
+            abstract = self.__dict__.get('virtual_abstract')
+            if abstract is not None:
+                try:
+                    return np.zeros(tuple(abstract.shape), dtype=np.float32)
+                except Exception:
+                    pass
             return np.zeros((1, 1), dtype=np.float32)
 
     _StubTensor.dtype = property(_safe_dtype)
