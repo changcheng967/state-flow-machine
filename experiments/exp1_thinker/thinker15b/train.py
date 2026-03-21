@@ -524,7 +524,7 @@ class TransformerBlock(nn.Cell):
         self.down_proj = _make_dense(A, H, has_bias=False)
         self.ffn_norm = RMSNorm(H)
 
-        self.scale = Tensor(HD ** -0.5, ms.float16)
+        self.scale = HD ** -0.5  # Python float — CANN 7 can't Mul scalar Tensor with 4D
         self.tile = ops.Tile()
         self.softmax = ops.Softmax(axis=-1)
 
