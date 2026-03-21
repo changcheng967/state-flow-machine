@@ -2100,7 +2100,10 @@ def main() -> None:
                                      (bs, MAX_SEQ_LEN)).astype(np.int32))
                 dummy_mask = Tensor(
                     np.ones((bs, MAX_SEQ_LEN), dtype=np.float32))
-                dummy_mask[0, 0] = 0.0
+                # GRAPH_MODE: can't do tensor[0,0]=0.0, create correctly
+                mask_np = np.ones((bs, MAX_SEQ_LEN), dtype=np.float32)
+                mask_np[0, 0] = 0.0
+                dummy_mask = Tensor(mask_np)
                 dummy_judge = Tensor(
                     np.ones(bs, dtype=np.int32))
                 _ = forward_loss(dummy_ids, dummy_mask, dummy_judge)
@@ -2309,9 +2312,9 @@ def main() -> None:
             dummy_ids = Tensor(
                 np.random.randint(0, VOCAB_SIZE,
                                  (bs, MAX_SEQ_LEN)).astype(np.int32))
-            dummy_mask = Tensor(
-                np.ones((bs, MAX_SEQ_LEN), dtype=np.float32))
-            dummy_mask[0, 0] = 0.0
+            mask_np2 = np.ones((bs, MAX_SEQ_LEN), dtype=np.float32)
+            mask_np2[0, 0] = 0.0
+            dummy_mask = Tensor(mask_np2)
             dummy_judge = Tensor(
                 np.ones(bs, dtype=np.int32))
             _ = forward_loss(dummy_ids, dummy_mask, dummy_judge)
