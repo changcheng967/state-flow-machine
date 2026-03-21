@@ -68,13 +68,12 @@ except Exception:
 import subprocess
 warnings.filterwarnings("ignore")
 
-# ── Environment activation (BEFORE importing MindSpore) ─────────────
-# Training tasks don't source .bashrc. We use subprocess to run bash
-# that sources conda + CANN, then apply the captured env vars.
-
+# ── Diagnostics (BEFORE importing MindSpore) ────────────────────────
+# Write diagnostics to /cache/output/diag.log so we can see what's
+# available in the training container. No subprocess, no activation.
 
 def _diag(msg):
-    """Write diagnostic line to /cache/output/diag.log (never fails)."""
+    """Write diagnostic line to /cache/output/diag.log."""
     try:
         os.makedirs("/cache/output", exist_ok=True)
         with open("/cache/output/diag.log", "a") as f:
@@ -83,79 +82,28 @@ def _diag(msg):
     except Exception:
         pass
 
-
-# ── Write pre-activation diagnostics IMMEDIATELY ────────────────────
 _diag(f"script started pid={os.getpid()}")
 _diag(f"python={sys.executable}")
 _diag(f"argv={sys.argv[:3]}")
 _diag(f"PATH={os.environ.get('PATH','')[:300]}")
-
-_CONDA_ENV_NAME = "PyTorch-2.1.0"
-_CANN_ENV_SH = "/home/ma-user/Ascend/cann-9.0.0-beta.1/set_env.sh"
-
-# OpenI platform-injected vars we must never overwrite
-_PLATFORM_VARS = {"RANK_ID", "DEVICE_ID", "RANK_SIZE", "MASTER_ADDR",
-                 "MASTER_PORT", "SFM_OUTPUT_PATH", "SFM_DATASET_PATH",
-                 "SFM_PRETRAIN_PATH", "SFM_CODE_PATH"}
-
 _diag(f"RANK_ID={os.environ.get('RANK_ID','UNSET')}")
 
-# ── Activate conda + CANN via subprocess ─────────────────────────────
-_diag("attempting conda activation...")
-
-bash_cmd = (
-    f"source /home/ma-user/anaconda3/etc/profile.d/conda.sh 2>/dev/null && "
-    f"conda activate {_CONDA_ENV_NAME} 2>/dev/null && "
-    f"test -f {_CANN_ENV_SH} && source {_CANN_ENV_SH} 2>/dev/null; "
-    f"env -0"
-)
-
-try:
-    proc = subprocess.run(
-        ["bash", "-c", bash_cmd],
-        capture_output=True, text=True, timeout=30)
-    _diag(f"subprocess rc={proc.returncode} stdout_len={len(proc.stdout)} stderr={proc.stderr[:200]}")
-except Exception as e:
-    _diag(f"subprocess EXCEPTION: {type(e).__name__}: {e}")
-
-# If subprocess succeeded, apply the captured environment
-if proc.returncode == 0 and proc.stdout:
-    platform_vals = {k: os.environ[k] for k in _PLATFORM_VARS if k in os.environ}
-    count = 0
-    for entry in proc.stdout.split("\0"):
-        if "=" not in entry:
-            continue
-        key, _, value = entry.partition("=")
-        if key in _PLATFORM_VARS and key in platform_vals:
-            continue
-        os.environ[key] = value
-        count += 1
-    for k, v in platform_vals.items():
-        os.environ[k] = v
-
-    conda_prefix = os.environ.get("CONDA_PREFIX", "")
-    if conda_prefix:
-        py_ver = f"{sys.version_info.major}.{sys.version_info.minor}"
-        sp = os.path.join(conda_prefix, "lib", f"python{py_ver}",
-                          "site-packages")
-        if os.path.isdir(sp) and sp not in sys.path:
-            sys.path.insert(0, sp)
-    _diag(f"env applied: {count} vars, CONDA_PREFIX={conda_prefix}")
+# Direct conda env path insertion (no subprocess, no fork)
+py_ver = f"{sys.version_info.major}.{sys.version_info.minor}"
+_conda_sp = (f"/home/ma-user/anaconda3/envs/PyTorch-2.1.0"
+             f"/lib/python{py_ver}/site-packages")
+if os.path.isdir(_conda_sp) and _conda_sp not in sys.path:
+    sys.path.insert(0, _conda_sp)
+    _diag(f"added conda site-packages: {_conda_sp}")
 else:
-    _diag("env activation FAILED — continuing with pre-installed env")
+    _diag(f"conda site-packages NOT found at {_conda_sp}")
+    # Check conda3 base
+    _base_sp = f"/home/ma-user/anaconda3/lib/python{py_ver}/site-packages"
+    if os.path.isdir(_base_sp):
+        _diag(f"found anaconda3 base site-packages: {_base_sp}")
 
-# ── Post-activation diagnostics ─────────────────────────────────────
-_diag(f"CONDA_PREFIX={os.environ.get('CONDA_PREFIX','UNSET')}")
-_diag(f"ASCEND_HOME_PATH={os.environ.get('ASCEND_HOME_PATH','UNSET')}")
-
-try:
-    import mindspore as _ms_test
-    _diag(f"MindSpore version={_ms_test.__version__}")
-    _diag(f"MindSpore file={_ms_test.__file__}")
-except Exception as _e:
-    _diag(f"MindSpore import FAILED: {_e}")
-
-_diag("diag complete — continuing to main code")
+_diag(f"sys.path[:5]={sys.path[:5]}")
+_diag("diag complete")
 
 # ── Environment vars (BEFORE importing MindSpore) ────────────────────
 os.environ.update({
@@ -369,7 +317,12 @@ print(f"[worker] RANK_ID={os.environ.get('RANK_ID')}, "
 import numpy as np
 import mindspore as ms
 from mindspore import nn, ops, value_and_grad
-from mindspore import mint
+try:
+    from mindspore import mint
+    _HAS_MINT = True
+except ImportError:
+    _HAS_MINT = False
+    mint = ops  # fallback: use ops if mint not available
 from mindspore.common.tensor import Tensor
 
 # ── StubTensor safety net (MS 2.8 compatibility) ────────────────────
