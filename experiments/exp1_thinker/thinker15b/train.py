@@ -1988,7 +1988,6 @@ def main() -> None:
         device_target="Ascend",
         device_id=device_id,
         memory_optimize_level="O1",
-        jit_config={"jit_level": "O1"},
     )
 
     # Data parallel init
