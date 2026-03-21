@@ -527,6 +527,7 @@ class TransformerBlock(nn.Cell):
         self.scale = HD ** -0.5  # Python float — CANN 7 can't Mul scalar Tensor with 4D
         self.bmm = ops.BatchMatMul()
         self.bmm_tb = ops.BatchMatMul(transpose_b=True)
+        self.transpose_op = ops.Transpose()
         self.tile = ops.Tile()
         self.softmax = ops.Softmax(axis=-1)
 
@@ -540,9 +541,9 @@ class TransformerBlock(nn.Cell):
         NG = NUM_GROUPS
 
         h = self.input_norm(x).astype(ms.float32)
-        Q = self.q_proj(h).reshape(B, S, NH, HD).transpose(0, 2, 1, 3).astype(ms.float16)
-        K = self.k_proj(h).reshape(B, S, NKV, HD).transpose(0, 2, 1, 3).astype(ms.float16)
-        V = self.v_proj(h).reshape(B, S, NKV, HD).transpose(0, 2, 1, 3).astype(ms.float16)
+        Q = self.transpose_op(self.q_proj(h).reshape(B, S, NH, HD), (0, 2, 1, 3)).astype(ms.float16)
+        K = self.transpose_op(self.k_proj(h).reshape(B, S, NKV, HD), (0, 2, 1, 3)).astype(ms.float16)
+        V = self.transpose_op(self.v_proj(h).reshape(B, S, NKV, HD), (0, 2, 1, 3)).astype(ms.float16)
 
         # GQA: tile KV heads to match Q heads (repeat 6x)
         K = self.tile(K, (1, NG, 1, 1))
@@ -567,7 +568,7 @@ class TransformerBlock(nn.Cell):
         attn = attn.reshape(B_NH, S, S)
         out = self.bmm(attn, V3)
         # (B*NH, S, HD) -> reshape to (B, NH, S, HD) -> transpose to (B, S, NH, HD)
-        out = out.reshape(B, NH, S, HD).transpose(0, 2, 1, 3).reshape(B, S, NH * HD)
+        out = self.transpose_op(out.reshape(B, NH, S, HD), (0, 2, 1, 3)).reshape(B, S, NH * HD)
         out = self.o_proj(out.astype(ms.float32)).astype(ms.float16)
         x = x + out
 
@@ -620,6 +621,7 @@ class DeltaNetCell(nn.Cell):
         self.HD = HD
         self.bmm = ops.BatchMatMul()
         self.bmm_tb = ops.BatchMatMul(transpose_b=True)
+        self.transpose_op = ops.Transpose()
 
     def construct(self, x: Tensor) -> Tensor:
         """Process sequence through delta rule (sequential scan).
@@ -675,7 +677,7 @@ class DeltaNetCell(nn.Cell):
             outputs = outputs + (out_t,)
 
         stacked = ops.stack(outputs, axis=0)  # (S, B, NH, HD)
-        stacked = stacked.transpose(1, 0, 2, 3)  # (B, S, NH, HD)
+        stacked = self.transpose_op(stacked, (1, 0, 2, 3))  # (B, S, NH, HD)
         output = stacked.reshape(B, S, NH * HD)   # (B, S, D)
 
         return output.astype(ms.float16)
