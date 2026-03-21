@@ -69,130 +69,116 @@ import subprocess
 warnings.filterwarnings("ignore")
 
 # ── Environment activation (BEFORE importing MindSpore) ─────────────
-# Training tasks don't source .bashrc, so conda env and CANN 9.0 are
-# not activated. .bashrc also has a non-interactive guard that blocks
-# 'source ~/.bashrc' from bash -c. So we set env vars directly.
-#
-# Two things needed:
-#   1. CANN 9.0: ASCEND_HOME_PATH, lib64, runtime on LD_LIBRARY_PATH
-#   2. Conda env: site-packages with MindSpore 2.8 on sys.path
-#
-# No subprocess, no os.execv — direct os.environ + sys.path manipulation.
+# Training tasks don't source .bashrc. .bashrc also has a non-interactive
+# guard. We use subprocess to run bash -c that sources conda, activates
+# the env, and dumps the full environment (null-separated). Then we
+# apply those env vars to os.environ — same effect as being inside
+# the conda env. We also source CANN 9.0 set_env.sh if it exists.
 
-_OLD_CANN_PREFIXES = (
-    "/usr/local/Ascend/ascend-toolkit",
-    "/usr/local/Ascend/toolbox",
-)
+_CONDA_ENV_NAME = "PyTorch-2.1.0"
+_CANN_ENV_SH = "/home/ma-user/Ascend/cann-9.0.0-beta.1/set_env.sh"
 
-
-def _prepend_and_strip(var, new_paths, strip_prefixes):
-    """Prepend new_paths to env var, removing entries matching strip_prefixes."""
-    old = os.environ.get(var, "")
-    parts = [p for p in old.split(":") if p and
-             not any(s in p for s in strip_prefixes)]
-    existing = [p for p in new_paths if os.path.isdir(p)]
-    os.environ[var] = ":".join(existing + parts)
+# OpenI platform-injected vars we must never overwrite
+_PLATFORM_VARS = {"RANK_ID", "DEVICE_ID", "RANK_SIZE", "MASTER_ADDR",
+                 "MASTER_PORT", "SFM_OUTPUT_PATH", "SFM_DATASET_PATH",
+                 "SFM_PRETRAIN_PATH", "SFM_CODE_PATH"}
 
 
-def _activate_cann():
-    """Activate CANN 9.0 by directly setting env vars."""
-    cann_root = "/home/ma-user/Ascend/cann-9.0.0-beta.1"
-    if not os.path.isdir(cann_root):
-        return
-    os.environ["ASCEND_HOME_PATH"] = cann_root
-    os.environ["ASCEND_TOOLKIT_HOME"] = cann_root
-    _prepend_and_strip("PATH", [
-        os.path.join(cann_root, "bin"),
-        os.path.join(cann_root, "compiler", "ccec_compiler", "bin"),
-    ], _OLD_CANN_PREFIXES)
-    _prepend_and_strip("LD_LIBRARY_PATH", [
-        os.path.join(cann_root, "lib64"),
-        os.path.join(cann_root, "lib64", "plugin", "opskernel"),
-        os.path.join(cann_root, "lib64", "plugin", "nnengine"),
-        os.path.join(cann_root, "runtime", "lib64"),
-        os.path.join(cann_root, "runtime", "lib64", "stub"),
-        os.path.join(cann_root, "compiler", "lib64"),
-    ], _OLD_CANN_PREFIXES)
-    _prepend_and_strip("PYTHONPATH", [
-        os.path.join(cann_root, "python", "site-packages"),
-    ], _OLD_CANN_PREFIXES)
+def _activate_env():
+    """Source conda + CANN via subprocess, apply env vars to this process."""
+    # Build the bash command: source conda, activate env, source CANN, dump env
+    bash_cmd = (
+        f"source /home/ma-user/anaconda3/etc/profile.d/conda.sh 2>/dev/null && "
+        f"conda activate {_CONDA_ENV_NAME} 2>/dev/null && "
+        f"test -f {_CANN_ENV_SH} && source {_CANN_ENV_SH} 2>/dev/null; "
+        f"env -0"
+    )
 
-
-def _activate_conda_env():
-    """Find conda env with MindSpore 2.8 and add to sys.path."""
-    py_ver = f"{sys.version_info.major}.{sys.version_info.minor}"
-    conda_base = "/home/ma-user/anaconda3"
-    if not os.path.isdir(conda_base):
-        conda_base = "/home/ma-user/miniconda3"
-    if not os.path.isdir(conda_base):
-        return
-
-    envs_dir = os.path.join(conda_base, "envs")
-    if not os.path.isdir(envs_dir):
-        return
-
-    # Try common env names first, then scan all
-    candidates = ["PyTorch-2.1.0", "mindspore", "ms28", "base", "ascend"]
     try:
-        all_envs = sorted(os.listdir(envs_dir))
-    except Exception:
-        all_envs = []
-    for name in candidates + all_envs:
-        env_path = os.path.join(envs_dir, name)
-        sp = os.path.join(env_path, "lib", f"python{py_ver}",
-                          "site-packages")
-        ms_dir = os.path.join(sp, "mindspore")
-        if not os.path.isdir(ms_dir):
+        proc = subprocess.run(
+            ["bash", "-c", bash_cmd],
+            capture_output=True, text=True, timeout=30)
+    except Exception as e:
+        _diag(f"subprocess FAILED: {e}")
+        return
+
+    if proc.returncode != 0:
+        _diag(f"subprocess returned {proc.returncode}: {proc.stderr[:500]}")
+        return
+
+    # Parse null-separated env output and apply to os.environ
+    # Preserve platform-injected vars from the parent
+    platform_vals = {k: os.environ[k] for k in _PLATFORM_VARS if k in os.environ}
+
+    count = 0
+    for entry in proc.stdout.split("\0"):
+        if "=" not in entry:
             continue
-        # Found mindspore in this env — add to sys.path
-        if sp not in sys.path:
+        key, _, value = entry.partition("=")
+        # Don't let conda/CANN overwrite platform-injected vars
+        if key in _PLATFORM_VARS and key in platform_vals:
+            continue
+        os.environ[key] = value
+        count += 1
+
+    # Restore platform vars that might have been overwritten
+    for k, v in platform_vals.items():
+        os.environ[k] = v
+
+    # Add conda env site-packages to sys.path so Python can find
+    # packages without a full interpreter re-exec
+    conda_prefix = os.environ.get("CONDA_PREFIX", "")
+    if conda_prefix:
+        py_ver = f"{sys.version_info.major}.{sys.version_info.minor}"
+        sp = os.path.join(conda_prefix, "lib", f"python{py_ver}",
+                          "site-packages")
+        if os.path.isdir(sp) and sp not in sys.path:
             sys.path.insert(0, sp)
-        # Also add env bin to PATH for any tools
-        env_bin = os.path.join(env_path, "bin")
-        if os.path.isdir(env_bin):
-            os.environ["PATH"] = (env_bin + ":" +
-                                  os.environ.get("PATH", ""))
-        break
+
+    _diag(f"env activated: {count} vars, CONDA_PREFIX={conda_prefix}")
 
 
-_activate_cann()
-_activate_conda_env()
+def _diag(msg):
+    """Write diagnostic line to /cache/output/diag.log."""
+    try:
+        os.makedirs("/cache/output", exist_ok=True)
+        with open("/cache/output/diag.log", "a") as f:
+            f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+    except Exception:
+        pass
+
+
+_activate_env()
 
 # ── DIAGNOSTIC DUMP (remove after debugging) ────────────────────────
+_diag(f"PID={os.getpid()}")
+_diag(f"Python={sys.executable}")
+_diag(f"CONDA_PREFIX={os.environ.get('CONDA_PREFIX','UNSET')}")
+_diag(f"CONDA_DEFAULT_ENV={os.environ.get('CONDA_DEFAULT_ENV','UNSET')}")
+_diag(f"ASCEND_HOME_PATH={os.environ.get('ASCEND_HOME_PATH','UNSET')}")
+_diag(f"PATH={os.environ.get('PATH','')[:500]}")
+_diag(f"LD_LIBRARY_PATH={os.environ.get('LD_LIBRARY_PATH','')[:500]}")
+_diag(f"sys.path[:5]={sys.path[:5]}")
+
+# Check if mindspore can even import
 try:
-    os.makedirs("/cache/output", exist_ok=True)
-    with open("/cache/output/diag.log", "w") as _df:
-        _df.write(f"PID={os.getpid()}\n")
-        _df.write(f"Python: {sys.executable}\n")
-        _df.write(f"CONDA_PREFIX={os.environ.get('CONDA_PREFIX','UNSET')}\n")
-        _df.write(f"ASCEND_HOME_PATH={os.environ.get('ASCEND_HOME_PATH','UNSET')}\n")
-        _df.write(f"PATH={os.environ.get('PATH','')[:500]}\n")
-        _df.write(f"LD_LIBRARY_PATH={os.environ.get('LD_LIBRARY_PATH','')[:500]}\n")
-        _df.write(f"PYTHONPATH={os.environ.get('PYTHONPATH','')[:500]}\n")
-        _df.write(f"sys.path[:5]: {sys.path[:5]}\n")
+    import mindspore as _ms_test
+    _diag(f"MindSpore version={_ms_test.__version__}")
+    _diag(f"MindSpore file={_ms_test.__file__}")
+except Exception as _e:
+    _diag(f"MindSpore import FAILED: {_e}")
 
-        # Check if mindspore can even import
-        try:
-            import mindspore as _ms_test
-            _df.write(f"MindSpore version: {_ms_test.__version__}\n")
-            _df.write(f"MindSpore file: {_ms_test.__file__}\n")
-        except Exception as _e:
-            _df.write(f"MindSpore import FAILED: {_e}\n")
+# Check if old CANN paths are still polluting
+for v in ["PATH", "LD_LIBRARY_PATH", "PYTHONPATH"]:
+    val = os.environ.get(v, "")
+    old_hits = [p for p in val.split(":")
+               if "/usr/local/Ascend/ascend-toolkit" in p]
+    if old_hits:
+        _diag(f"WARNING: old CANN still in {v}: {old_hits}")
+    else:
+        _diag(f"OK: no old CANN in {v}")
 
-        # Check if old CANN paths are still polluting
-        for v in ["PATH", "LD_LIBRARY_PATH", "PYTHONPATH"]:
-            val = os.environ.get(v, "")
-            old_hits = [p for p in val.split(":")
-                       if "/usr/local/Ascend/ascend-toolkit" in p]
-            if old_hits:
-                _df.write(f"WARNING: old CANN still in {v}: {old_hits}\n")
-            else:
-                _df.write(f"OK: no old CANN in {v}\n")
-
-        _df.write("diag complete\n")
-        _df.flush()
-except Exception:
-    pass
+_diag("diag complete")
 
 # ── Environment vars (BEFORE importing MindSpore) ────────────────────
 os.environ.update({
