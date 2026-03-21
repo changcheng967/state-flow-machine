@@ -884,10 +884,10 @@ class TrainStep:
         self.rank_size = rank_size
         if optimizer2 is not None:
             self.weights = ms.ParameterTuple(
-                list(optimizer.params) + list(optimizer2.params))
-            self.n_base = len(optimizer.params)
+                list(optimizer.parameters) + list(optimizer2.parameters))
+            self.n_base = len(optimizer.parameters)
         else:
-            self.weights = ms.ParameterTuple(optimizer.params)
+            self.weights = ms.ParameterTuple(optimizer.parameters)
             self.n_base = 0
         self.max_grad_norm = max_grad_norm
 
