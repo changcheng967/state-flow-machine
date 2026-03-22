@@ -675,47 +675,39 @@ class DeltaNetCell(nn.Cell):
 
         # Sequential scan — core of state tracking.
         # CANN 7's TBE unpack (backward of ops.stack) rejects even 64
-        # outputs ("input number is too much"). Use ExpandDims + hierarchical
-        # Concat instead. The backward of Concat uses Slice, not Unpack,
-        # so no CANN limits are hit. All Concat ops have exactly 8 inputs.
-        #
-        # 3-level hierarchy with CHUNK=8:
-        #   Inner:  64 concat(8) → 64 tensors of shape (8, B, NH, HD)
-        #   Middle:  8 concat(8) →  8 tensors of shape (64, B, NH, HD)
-        #   Final:  1 concat(8) →  1 tensor  of shape (512, B, NH, HD)
+        # outputs ("input number is too much"). Use ExpandDims + Concat
+        # instead. The backward of Concat uses Slice (not Unpack), so
+        # no CANN 7 limits apply. 2-level hierarchy:
+        #   Inner: 64 concat(8) → 64 chunks of (8, B, NH, HD)
+        #   Final:  1 concat(64) → (512, B, NH, HD)
         CHUNK = 8
         B_NH = B * NH
-        l2 = ()  # level 2 results: groups of CHUNK*CHUNK=64 timesteps
-        for g in range(S // (CHUNK * CHUNK)):  # 8 groups
-            group_chunks = ()
-            for c in range(CHUNK):  # 8 chunks per group
-                current = ()
-                for t in range(g * CHUNK * CHUNK + c * CHUNK,
-                               g * CHUNK * CHUNK + (c + 1) * CHUNK):
-                    kt = K[:, t, None, :]   # (B, D, 1)
-                    vt = V[:, t, None, :]   # (B, D, 1)
-                    bt = beta[:, t, :, None, None]  # (B, NH, 1, 1)
+        chunks = ()
+        for c in range(S // CHUNK):  # 64 chunks
+            current = ()
+            for t in range(c * CHUNK, (c + 1) * CHUNK):
+                kt = K[:, t, None, :]   # (B, D, 1)
+                vt = V[:, t, None, :]   # (B, D, 1)
+                bt = beta[:, t, :, None, None]  # (B, NH, 1, 1)
 
-                    # delta rule: S = S - beta*(S@k - v)*k^T
-                    k_head = kt.reshape(B, NH, HD, 1)
-                    v_head = vt.reshape(B, NH, HD, 1)
-                    s3 = state.reshape(B_NH, HD, HD)
-                    k3 = k_head.reshape(B_NH, HD, 1)
-                    v3 = v_head.reshape(B_NH, HD, 1)
-                    residual = self.bmm(s3, k3).reshape(
-                        B, NH, HD, 1) - v_head
-                    update = bt * self.bmm_tb(
-                        residual.reshape(B_NH, HD, 1),
-                        k3).reshape(B, NH, HD, HD)
-                    state = state - update
+                # delta rule: S = S - beta*(S@k - v)*k^T
+                k_head = kt.reshape(B, NH, HD, 1)
+                v_head = vt.reshape(B, NH, HD, 1)
+                s3 = state.reshape(B_NH, HD, HD)
+                k3 = k_head.reshape(B_NH, HD, 1)
+                v3 = v_head.reshape(B_NH, HD, 1)
+                residual = self.bmm(s3, k3).reshape(
+                    B, NH, HD, 1) - v_head
+                update = bt * self.bmm_tb(
+                    residual.reshape(B_NH, HD, 1),
+                    k3).reshape(B, NH, HD, HD)
+                state = state - update
 
-                    out_t = state[:, :, -1, :]  # (B, NH, HD)
-                    current = current + (out_t.reshape(1, B, NH, HD),)
-                group_chunks = group_chunks + (
-                    self.concat_op(current),)  # (8, B, NH, HD)
-            l2 = l2 + (self.concat_op(group_chunks),)  # (64, B, NH, HD)
+                out_t = state[:, :, -1, :]  # (B, NH, HD)
+                current = current + (out_t.reshape(1, B, NH, HD),)
+            chunks = chunks + (self.concat_op(current),)  # (8, B, NH, HD)
 
-        stacked = self.concat_op(l2)  # (S, B, NH, HD)
+        stacked = self.concat_op(chunks)  # (S, B, NH, HD)
         stacked = self.transpose_op(stacked, (1, 0, 2, 3))  # (B, S, NH, HD)
         output = stacked.reshape(B, S, NH * HD)   # (B, S, D)
 
