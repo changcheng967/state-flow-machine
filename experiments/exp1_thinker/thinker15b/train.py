@@ -964,6 +964,7 @@ class TrainStep:
             self.weights = ms.ParameterTuple(optimizer.parameters)
             self.n_base = 0
         self.max_grad_norm = max_grad_norm
+        self.has_opt2 = optimizer2 is not None
 
         # Build value_and_grad function using forward_loss Cell.
         # grad_position=None: don't differentiate w.r.t. inputs,
@@ -974,50 +975,50 @@ class TrainStep:
             weights=self.weights,
             has_aux=False)
 
-        # AllReduce op for DATA_PARALLEL gradient sync
-        if rank_size > 1:
-            self.all_reduce = ops.AllReduce(op=ops.ReduceOp.SUM)
-
     def set_train(self, mode: bool = True) -> None:
         """Pass-through to forward_loss."""
         self.forward_loss.set_train(mode)
 
+    @ms.jit
     def step(self, input_ids: Tensor, loss_mask: Tensor,
              judge_label: Tensor) -> Tensor:
-        """Execute one training step: forward → grad → allreduce → clip → update."""
-        # Forward + backward in one call (no StubTensors!)
+        """Execute one training step: forward → grad → allreduce → clip → update.
+
+        Wrapped in @ms.jit so AllReduce runs inside the compiled graph
+        where HCCL communicator is available. In GRAPH_MODE, ops.AllReduce
+        called eagerly (outside jit) has a null hccl_comm pointer.
+        """
+        # Forward + backward
         loss, grads = self.grad_fn(input_ids, loss_mask, judge_label)
 
-        # Manual AllReduce for DATA_PARALLEL (value_and_grad doesn't
-        # auto-allreduce like GradOperation with gradients_mean=True)
+        # AllReduce inside compiled graph (HCCL available here)
         if self.rank_size > 1:
-            grads = tuple(
-                (self.all_reduce(g) / self.rank_size
-                 if g is not None else g)
-                for g in grads)
+            ar = ops.AllReduce(op=ops.ReduceOp.SUM)
+            ar_grads = ()
+            for g in grads:
+                ar_grads = ar_grads + (ar(g) / self.rank_size,)
+            grads = ar_grads
 
         # Gradient clipping (clip by global norm)
         norm_sq = Tensor(0.0, ms.float32)
         for g in grads:
-            if g is not None:
-                norm_sq = norm_sq + ops.ReduceSum()(
-                    ops.square(g.astype(ms.float32)))
+            norm_sq = norm_sq + ops.ReduceSum()(
+                ops.square(g.astype(ms.float32)))
         global_norm = ops.sqrt(norm_sq)
         clip_coef = ops.minimum(
             Tensor(1.0, ms.float32),
             Tensor(self.max_grad_norm, ms.float32) /
             ops.maximum(global_norm, Tensor(1e-6, ms.float32)))
-        grads = tuple(
-            (g.astype(ms.float32) * clip_coef
-             if g is not None else g)
-            for g in grads)
+        clipped = ()
+        for g in grads:
+            clipped = clipped + (g.astype(ms.float32) * clip_coef,)
 
-        # Apply optimizer(s)
-        if self.optimizer2 is not None:
-            self.optimizer(grads[:self.n_base])
-            self.optimizer2(grads[self.n_base:])
+        # Optimizer update
+        if self.has_opt2:
+            self.optimizer(clipped[:self.n_base])
+            self.optimizer2(clipped[self.n_base:])
         else:
-            self.optimizer(grads)
+            self.optimizer(clipped)
 
         return loss
 
