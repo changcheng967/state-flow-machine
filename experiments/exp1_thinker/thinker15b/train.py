@@ -159,7 +159,7 @@ SURPRISE_DIM = 64
 
 # ── Training hyperparameters ─────────────────────────────────────────
 # Stage 1: SFM-only training (base frozen)
-STAGE1_CKPT = None  # Set to path (e.g. "/cache/output/stage1_best.ckpt") to skip Stage 1 and resume from checkpoint
+STAGE1_CKPT_ENV = "SFM_STAGE1_CKPT"  # Set env var to override, e.g. "/cache/pretrainmodel/stage1_best.ckpt"
 STAGE1_LR_SFM = 1e-3
 STAGE1_WARMUP = 200
 STAGE1_MAX_STEPS = 10000
@@ -2086,12 +2086,15 @@ def main() -> None:
     # ═══════════════════════════════════════════════════════════════════
 
     skip_stage1 = False
-    if STAGE1_CKPT is not None and os.path.isfile(STAGE1_CKPT):
+    stage1_ckpt = os.environ.get(
+        STAGE1_CKPT_ENV,
+        os.path.join(PRETRAIN_MODEL_PATH, "stage1_best.ckpt"))
+    if os.path.isfile(stage1_ckpt):
         log("")
         log("=" * 60)
-        log(f"STAGE 1: Skipping — loading checkpoint: {STAGE1_CKPT}")
+        log(f"STAGE 1: Skipping — loading checkpoint: {stage1_ckpt}")
         log("=" * 60)
-        param_dict = ms.load_checkpoint(STAGE1_CKPT)
+        param_dict = ms.load_checkpoint(stage1_ckpt)
         load_param_into_net(model, param_dict)
         log(f"Loaded {len(param_dict)} params from Stage 1 checkpoint")
         skip_stage1 = True
