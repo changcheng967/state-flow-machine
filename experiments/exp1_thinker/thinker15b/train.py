@@ -159,6 +159,7 @@ SURPRISE_DIM = 64
 
 # ── Training hyperparameters ─────────────────────────────────────────
 # Stage 1: SFM-only training (base frozen)
+STAGE1_CKPT = None  # Set to path (e.g. "/cache/output/stage1_best.ckpt") to skip Stage 1 and resume from checkpoint
 STAGE1_LR_SFM = 1e-3
 STAGE1_WARMUP = 200
 STAGE1_MAX_STEPS = 10000
@@ -2084,186 +2085,203 @@ def main() -> None:
     # STAGE 1: SFM-only training (base model frozen)
     # ═══════════════════════════════════════════════════════════════════
 
-    log("")
-    log("=" * 60)
-    log("STAGE 1: SFM-only training (base frozen)")
-    log("=" * 60)
+    skip_stage1 = False
+    if STAGE1_CKPT is not None and os.path.isfile(STAGE1_CKPT):
+        log("")
+        log("=" * 60)
+        log(f"STAGE 1: Skipping — loading checkpoint: {STAGE1_CKPT}")
+        log("=" * 60)
+        param_dict = ms.load_checkpoint(STAGE1_CKPT)
+        load_param_into_net(model, param_dict)
+        log(f"Loaded {len(param_dict)} params from Stage 1 checkpoint")
+        skip_stage1 = True
+        compiled = True
+        best_loss = float("inf")
+        step = 0
 
-    # Freeze base model parameters (SFM params keep requires_grad=True)
-    for p in model.get_parameters():
-        if not any(key in p.name for key in
-                   ["deltanets", "bridges", "judge_head", "surprise_head"]):
-            p.requires_grad = False
+    if not skip_stage1:
+        log("")
+        log("=" * 60)
+        log("STAGE 1: SFM-only training (base frozen)")
+        log("=" * 60)
 
-    sfm_params = [p for p in model.trainable_params()]
-    log(f"SFM trainable params: {sum(p.size for p in sfm_params):,}")
+        # Freeze base model parameters (SFM params keep requires_grad=True)
+        for p in model.get_parameters():
+            if not any(key in p.name for key in
+                       ["deltanets", "bridges", "judge_head", "surprise_head"]):
+                p.requires_grad = False
 
-    if sfm_params:
-        lr_schedule_s1 = []
-        for s in range(STAGE1_MAX_STEPS):
-            if s < STAGE1_WARMUP:
-                lr = STAGE1_LR_SFM * s / max(1, STAGE1_WARMUP)
-            else:
-                progress = (s - STAGE1_WARMUP) / max(
-                    1, STAGE1_MAX_STEPS - STAGE1_WARMUP)
-                min_lr = STAGE1_LR_SFM * MIN_LR_FACTOR
-                lr = min_lr + 0.5 * (STAGE1_LR_SFM - min_lr) * (
-                    1 + math.cos(math.pi * progress))
-            lr_schedule_s1.append(lr)
+        sfm_params = [p for p in model.trainable_params()]
+        log(f"SFM trainable params: {sum(p.size for p in sfm_params):,}")
 
-        optimizer_s1 = nn.AdamWeightDecay(
-            sfm_params,
-            learning_rate=Tensor(
-                np.array(lr_schedule_s1, dtype=np.float32)),
-            weight_decay=STAGE1_WEIGHT_DECAY,
-            beta1=0.9,
-            beta2=0.95,
-        )
+        if sfm_params:
+            lr_schedule_s1 = []
+            for s in range(STAGE1_MAX_STEPS):
+                if s < STAGE1_WARMUP:
+                    lr = STAGE1_LR_SFM * s / max(1, STAGE1_WARMUP)
+                else:
+                    progress = (s - STAGE1_WARMUP) / max(
+                        1, STAGE1_MAX_STEPS - STAGE1_WARMUP)
+                    min_lr = STAGE1_LR_SFM * MIN_LR_FACTOR
+                    lr = min_lr + 0.5 * (STAGE1_LR_SFM - min_lr) * (
+                        1 + math.cos(math.pi * progress))
+                lr_schedule_s1.append(lr)
 
-        forward_loss = ForwardLossCell(model, cos_t, sin_t, causal_mask)
-        train_step_s1 = TrainStep(forward_loss, optimizer_s1,
-                                   max_grad_norm=MAX_GRAD_NORM,
-                                   rank_size=rank_size)
-        actual_bs = BATCH_SIZE_PER_DEVICE
-        compiled = False
-        for bs in [BATCH_SIZE_PER_DEVICE, 1]:
-            try:
-                log(f"  Compiling Stage 1 with B={bs}...")
-                # Test forward pass only (value_and_grad handles
-                # grad computation without needing set_train)
-                dummy_ids = Tensor(
-                    np.random.randint(0, VOCAB_SIZE,
-                                     (bs, MAX_SEQ_LEN)).astype(np.int32))
-                dummy_mask = Tensor(
-                    np.ones((bs, MAX_SEQ_LEN), dtype=np.float32))
-                # GRAPH_MODE: can't do tensor[0,0]=0.0, create correctly
-                mask_np = np.ones((bs, MAX_SEQ_LEN), dtype=np.float32)
-                mask_np[0, 0] = 0.0
-                dummy_mask = Tensor(mask_np)
-                dummy_judge = Tensor(
-                    np.ones(bs, dtype=np.int32))
-                _ = forward_loss(dummy_ids, dummy_mask, dummy_judge)
-                log(f"  B={bs} forward compilation OK")
-                actual_bs = bs
-                compiled = True
-                break
-            except RuntimeError as e:
-                if "out of memory" in str(e).lower():
-                    log(f"  B={bs} OOM, trying smaller...")
-                    del train_step_s1
-                    gc.collect()
-                    optimizer_s1 = nn.AdamWeightDecay(
-                        sfm_params,
-                        learning_rate=Tensor(
-                            np.array(lr_schedule_s1, dtype=np.float32)),
-                        weight_decay=STAGE1_WEIGHT_DECAY,
-                        beta1=0.9, beta2=0.95)
-                    forward_loss = ForwardLossCell(
-                        model, cos_t, sin_t, causal_mask)
-                    train_step_s1 = TrainStep(
-                        forward_loss, optimizer_s1,
-                        max_grad_norm=MAX_GRAD_NORM,
-                        rank_size=rank_size)
-                    continue
-                raise
+            optimizer_s1 = nn.AdamWeightDecay(
+                sfm_params,
+                learning_rate=Tensor(
+                    np.array(lr_schedule_s1, dtype=np.float32)),
+                weight_decay=STAGE1_WEIGHT_DECAY,
+                beta1=0.9,
+                beta2=0.95,
+            )
 
-        if compiled:
-            # Stage 1 training loop
-            step = 0
-            loss_history = []
-            best_loss = float("inf")
-            t_start = time.time()
-            difficulty_tracker = DifficultyTracker(1.0)
-
-            while step < STAGE1_MAX_STEPS:
-                stop = check_stopping(
-                    step, loss_history, STAGE1_MAX_STEPS,
-                    TIME_LIMIT * 0.4, t_start,
-                    patience=CONVERGENCE_PATIENCE)
-                if stop:
-                    log(f"Stage 1 stopping: {stop}")
+            forward_loss = ForwardLossCell(model, cos_t, sin_t, causal_mask)
+            train_step_s1 = TrainStep(forward_loss, optimizer_s1,
+                                       max_grad_norm=MAX_GRAD_NORM,
+                                       rank_size=rank_size)
+            actual_bs = BATCH_SIZE_PER_DEVICE
+            compiled = False
+            for bs in [BATCH_SIZE_PER_DEVICE, 1]:
+                try:
+                    log(f"  Compiling Stage 1 with B={bs}...")
+                    # Test forward pass only (value_and_grad handles
+                    # grad computation without needing set_train)
+                    dummy_ids = Tensor(
+                        np.random.randint(0, VOCAB_SIZE,
+                                         (bs, MAX_SEQ_LEN)).astype(np.int32))
+                    dummy_mask = Tensor(
+                        np.ones((bs, MAX_SEQ_LEN), dtype=np.float32))
+                    # GRAPH_MODE: can't do tensor[0,0]=0.0, create correctly
+                    mask_np = np.ones((bs, MAX_SEQ_LEN), dtype=np.float32)
+                    mask_np[0, 0] = 0.0
+                    dummy_mask = Tensor(mask_np)
+                    dummy_judge = Tensor(
+                        np.ones(bs, dtype=np.int32))
+                    _ = forward_loss(dummy_ids, dummy_mask, dummy_judge)
+                    log(f"  B={bs} forward compilation OK")
+                    actual_bs = bs
+                    compiled = True
                     break
-
-                # Gradient accumulation
-                accum_loss = 0.0
-                for micro in range(GRADIENT_ACCUM_STEPS):
-                    samples = generate_batch(
-                        actual_bs, stage=1, rank_id=rank_id)
-                    if not samples:
+                except RuntimeError as e:
+                    if "out of memory" in str(e).lower():
+                        log(f"  B={bs} OOM, trying smaller...")
+                        del train_step_s1
+                        gc.collect()
+                        optimizer_s1 = nn.AdamWeightDecay(
+                            sfm_params,
+                            learning_rate=Tensor(
+                                np.array(lr_schedule_s1, dtype=np.float32)),
+                            weight_decay=STAGE1_WEIGHT_DECAY,
+                            beta1=0.9, beta2=0.95)
+                        forward_loss = ForwardLossCell(
+                            model, cos_t, sin_t, causal_mask)
+                        train_step_s1 = TrainStep(
+                            forward_loss, optimizer_s1,
+                            max_grad_norm=MAX_GRAD_NORM,
+                            rank_size=rank_size)
                         continue
+                    raise
 
-                    batch_ids = []
-                    batch_masks = []
-                    batch_judges = []
+            if compiled:
+                # Stage 1 training loop
+                step = 0
+                loss_history = []
+                best_loss = float("inf")
+                t_start = time.time()
+                difficulty_tracker = DifficultyTracker(1.0)
 
-                    for sample in samples:
-                        formatted = format_sample_for_training(
-                            sample, vocab, merge_priority, eos_id, MAX_SEQ_LEN)
-                        if formatted is not None:
-                            batch_ids.append(formatted[0])
-                            batch_masks.append(formatted[1])
-                            batch_judges.append(formatted[2])
+                while step < STAGE1_MAX_STEPS:
+                    stop = check_stopping(
+                        step, loss_history, STAGE1_MAX_STEPS,
+                        TIME_LIMIT * 0.4, t_start,
+                        patience=CONVERGENCE_PATIENCE)
+                    if stop:
+                        log(f"Stage 1 stopping: {stop}")
+                        break
 
-                    if not batch_ids:
-                        continue
+                    # Gradient accumulation
+                    accum_loss = 0.0
+                    for micro in range(GRADIENT_ACCUM_STEPS):
+                        samples = generate_batch(
+                            actual_bs, stage=1, rank_id=rank_id)
+                        if not samples:
+                            continue
 
-                    ids_t = Tensor(np.array(batch_ids, dtype=np.int32))
-                    mask_t = Tensor(
-                        np.array(batch_masks, dtype=np.float32))
-                    judge_t = Tensor(
-                        np.array(batch_judges, dtype=np.int32))
+                        batch_ids = []
+                        batch_masks = []
+                        batch_judges = []
 
-                    try:
-                        loss_val = train_step_s1.step(
-                            ids_t, mask_t, judge_t)
-                        accum_loss += float(loss_val.asnumpy())
-                    except RuntimeError as e:
-                        if "out of memory" in str(e).lower():
-                            log(f"Stage 1 OOM at step {step}")
-                            break
-                        raise
+                        for sample in samples:
+                            formatted = format_sample_for_training(
+                                sample, vocab, merge_priority, eos_id, MAX_SEQ_LEN)
+                            if formatted is not None:
+                                batch_ids.append(formatted[0])
+                                batch_masks.append(formatted[1])
+                                batch_judges.append(formatted[2])
 
-                step += 1
-                avg_loss = accum_loss / max(GRADIENT_ACCUM_STEPS, 1)
-                loss_history.append(avg_loss)
-                if avg_loss < best_loss:
-                    best_loss = avg_loss
-                    if rank_id == 0:
-                        ms.save_checkpoint(
-                            model,
-                            os.path.join(CKPT_DIR,
-                                         "stage1_best.ckpt"))
+                        if not batch_ids:
+                            continue
 
-                # Self-evolution probe
-                if step % EVOLUTION_PROBE_STEPS == 0 and step > 0 \
-                        and rank_id == 0:
-                    acc = evolution_probe(
-                        model, cos_t, sin_t, causal_mask,
-                        vocab, merge_priority, eos_id, n_samples=50)
-                    difficulty_tracker.update(acc)
-                    log(f"  Probe accuracy: {acc:.3f}, "
-                        f"difficulty: {difficulty_tracker.difficulty:.1f}")
-                # Logging
-                if step % 50 == 0 or step <= 3:
-                    dt = time.time() - t_start
-                    lr_now = lr_schedule_s1[
-                        min(step, len(lr_schedule_s1) - 1)]
-                    log(f"S1 Step {step:>5d} | loss={avg_loss:.4f} | "
-                        f"best={best_loss:.4f} | lr={lr_now:.2e} | "
-                        f"diff={difficulty_tracker.difficulty:.1f} | "
-                        f"elapsed={dt:.0f}s")
+                        ids_t = Tensor(np.array(batch_ids, dtype=np.int32))
+                        mask_t = Tensor(
+                            np.array(batch_masks, dtype=np.float32))
+                        judge_t = Tensor(
+                            np.array(batch_judges, dtype=np.int32))
 
-                # Checkpoint
-                if rank_id == 0 and step % 2000 == 0 and step > 0:
-                    ckpt_path = os.path.join(
-                        CKPT_DIR, f"stage1_step_{step}.ckpt")
-                    ms.save_checkpoint(model, ckpt_path)
-                    log(f"Stage 1 checkpoint: {ckpt_path}")
+                        try:
+                            loss_val = train_step_s1.step(
+                                ids_t, mask_t, judge_t)
+                            accum_loss += float(loss_val.asnumpy())
+                        except RuntimeError as e:
+                            if "out of memory" in str(e).lower():
+                                log(f"Stage 1 OOM at step {step}")
+                                break
+                            raise
 
-            log(f"Stage 1 complete: {step} steps, "
-                f"best_loss={best_loss:.4f}")
+                    step += 1
+                    avg_loss = accum_loss / max(GRADIENT_ACCUM_STEPS, 1)
+                    loss_history.append(avg_loss)
+                    if avg_loss < best_loss:
+                        best_loss = avg_loss
+                        if rank_id == 0:
+                            ms.save_checkpoint(
+                                model,
+                                os.path.join(CKPT_DIR,
+                                             "stage1_best.ckpt"))
+
+                    # Self-evolution probe
+                    if step % EVOLUTION_PROBE_STEPS == 0 and step > 0 \
+                            and rank_id == 0:
+                        acc = evolution_probe(
+                            model, cos_t, sin_t, causal_mask,
+                            vocab, merge_priority, eos_id, n_samples=50)
+                        difficulty_tracker.update(acc)
+                        log(f"  Probe accuracy: {acc:.3f}, "
+                            f"difficulty: {difficulty_tracker.difficulty:.1f}")
+                    # Logging
+                    if step % 50 == 0 or step <= 3:
+                        dt = time.time() - t_start
+                        lr_now = lr_schedule_s1[
+                            min(step, len(lr_schedule_s1) - 1)]
+                        log(f"S1 Step {step:>5d} | loss={avg_loss:.4f} | "
+                            f"best={best_loss:.4f} | lr={lr_now:.2e} | "
+                            f"diff={difficulty_tracker.difficulty:.1f} | "
+                            f"elapsed={dt:.0f}s")
+
+                    # Checkpoint
+                    if rank_id == 0 and step % 2000 == 0 and step > 0:
+                        ckpt_path = os.path.join(
+                            CKPT_DIR, f"stage1_step_{step}.ckpt")
+                        ms.save_checkpoint(model, ckpt_path)
+                        log(f"Stage 1 checkpoint: {ckpt_path}")
+
+                log(f"Stage 1 complete: {step} steps, "
+                    f"best_loss={best_loss:.4f}")
+            else:
+                log("Stage 1 compilation failed, skipping to Stage 2")
         else:
-            log("Stage 1 compilation failed, skipping to Stage 2")
+            log("No SFM params found, skipping Stage 1")
 
     # Save Stage 1 results before Stage 2 overwrites step/best_loss
     stage1_steps_done = step if compiled else 0
