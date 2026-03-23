@@ -2332,6 +2332,9 @@ def main() -> None:
         beta1=0.9,
         beta2=0.95,
     )
+    # Rename internal global_step to avoid duplicate parameter name
+    # when both optimizers are inlined into the same @ms.jit graph.
+    optimizer_sfm_s2.global_step.name = "sfm_global_step"
 
     # Rebuild training cells with two-optimizer TrainStep
     forward_loss = ForwardLossCell(model, cos_t, sin_t, causal_mask)
@@ -2373,6 +2376,8 @@ def main() -> None:
                     learning_rate=Tensor(lr_s2_sfm),
                     weight_decay=STAGE2_WEIGHT_DECAY,
                     beta1=0.9, beta2=0.95)
+                # Rename internal global_step to avoid duplicate name
+                optimizer_sfm_s2.global_step.name = "sfm_global_step"
                 forward_loss = ForwardLossCell(
                     model, cos_t, sin_t, causal_mask)
                 train_step_s2 = TrainStep(
