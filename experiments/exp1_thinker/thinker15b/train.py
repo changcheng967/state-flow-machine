@@ -2091,29 +2091,26 @@ def main() -> None:
         # Search in pretrain model path, then dataset path
         for base in [PRETRAIN_MODEL_PATH, DATASET_PATH]:
             candidate = os.path.join(base, "stage1_best.ckpt")
-            if os.path.isfile(candidate):
-                stage1_ckpt = candidate
-                break
             # OpenI may mount single-file models as a dir containing the file
+            candidates = [candidate]
             if os.path.isdir(candidate):
-                inner = os.path.join(candidate, "stage1_best.ckpt")
-                if os.path.isfile(inner):
-                    stage1_ckpt = inner
+                candidates.append(
+                    os.path.join(candidate, "stage1_best.ckpt"))
+            for c in candidates:
+                if os.path.isfile(c) and os.path.getsize(c) > 0:
+                    stage1_ckpt = c
                     break
-    log(f"Stage 1 checkpoint check: {stage1_ckpt or 'NOT FOUND'} "
-        f"(exists={os.path.isfile(stage1_ckpt) if stage1_ckpt else False})")
+            if stage1_ckpt:
+                break
+    if not stage1_ckpt or not os.path.isfile(stage1_ckpt) \
+            or os.path.getsize(stage1_ckpt) == 0:
+        if stage1_ckpt:
+            log(f"Stage 1 checkpoint found but EMPTY (0 bytes), "
+                f"skipping load: {stage1_ckpt}")
+        stage1_ckpt = ""
+    log(f"Stage 1 checkpoint: {stage1_ckpt or 'NOT FOUND (will train Stage 1)'} "
+        f"(size={os.path.getsize(stage1_ckpt) if stage1_ckpt else 0})")
     if os.path.isfile(stage1_ckpt):
-        # Diagnostics: check file size and header before loading
-        ckpt_size = os.path.getsize(stage1_ckpt)
-        expected_size = 6190925819  # known size of stage1_best.ckpt
-        with open(stage1_ckpt, "rb") as _f:
-            header = _f.read(32)
-        log(f"Stage 1 ckpt size: {ckpt_size} bytes "
-            f"(expected: {expected_size}, match: {ckpt_size == expected_size})")
-        log(f"Stage 1 ckpt header (hex): {header[:16].hex()}")
-        log(f"Stage 1 ckpt header (ascii): {repr(header[:32])}")
-        valid_header = header[0] == 0x0a and header[3:8] == b"model"
-        log(f"Stage 1 ckpt valid protobuf header: {valid_header}")
         log("")
         log("=" * 60)
         log(f"STAGE 1: Skipping — loading checkpoint: {stage1_ckpt}")
