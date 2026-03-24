@@ -2086,14 +2086,22 @@ def main() -> None:
     # ═══════════════════════════════════════════════════════════════════
 
     skip_stage1 = False
-    stage1_ckpt = os.environ.get(
-        STAGE1_CKPT_ENV,
-        os.path.join(PRETRAIN_MODEL_PATH, "stage1_best.ckpt"))
-    # OpenI may mount single-file models as a directory containing the file
-    if not os.path.isfile(stage1_ckpt) and os.path.isdir(stage1_ckpt):
-        stage1_ckpt = os.path.join(stage1_ckpt, "stage1_best.ckpt")
-    log(f"Stage 1 checkpoint check: {stage1_ckpt} "
-        f"(exists={os.path.isfile(stage1_ckpt)})")
+    stage1_ckpt = os.environ.get(STAGE1_CKPT_ENV, "")
+    if not stage1_ckpt:
+        # Search in pretrain model path, then dataset path
+        for base in [PRETRAIN_MODEL_PATH, DATASET_PATH]:
+            candidate = os.path.join(base, "stage1_best.ckpt")
+            if os.path.isfile(candidate):
+                stage1_ckpt = candidate
+                break
+            # OpenI may mount single-file models as a dir containing the file
+            if os.path.isdir(candidate):
+                inner = os.path.join(candidate, "stage1_best.ckpt")
+                if os.path.isfile(inner):
+                    stage1_ckpt = inner
+                    break
+    log(f"Stage 1 checkpoint check: {stage1_ckpt or 'NOT FOUND'} "
+        f"(exists={os.path.isfile(stage1_ckpt) if stage1_ckpt else False})")
     if os.path.isfile(stage1_ckpt):
         log("")
         log("=" * 60)
