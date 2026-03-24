@@ -2089,6 +2089,11 @@ def main() -> None:
     stage1_ckpt = os.environ.get(
         STAGE1_CKPT_ENV,
         os.path.join(PRETRAIN_MODEL_PATH, "stage1_best.ckpt"))
+    # OpenI may mount single-file models as a directory containing the file
+    if not os.path.isfile(stage1_ckpt) and os.path.isdir(stage1_ckpt):
+        stage1_ckpt = os.path.join(stage1_ckpt, "stage1_best.ckpt")
+    log(f"Stage 1 checkpoint check: {stage1_ckpt} "
+        f"(exists={os.path.isfile(stage1_ckpt)})")
     if os.path.isfile(stage1_ckpt):
         log("")
         log("=" * 60)
