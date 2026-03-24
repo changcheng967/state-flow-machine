@@ -444,6 +444,56 @@ def _load_single_safetensors(sf_path: str) -> dict:
     return weights
 
 
+def _dtype_to_str(dtype) -> str:
+    """Convert numpy dtype to safetensors dtype string."""
+    mapping = {
+        np.dtype(np.float32): "F32",
+        np.dtype(np.float16): "F16",
+        np.dtype(np.int32): "I32",
+        np.dtype(np.int64): "I64",
+        np.dtype(np.bool_): "BOOL",
+        np.dtype(np.uint8): "U8",
+    }
+    return mapping.get(dtype, "F32")
+
+
+def save_safetensors_checkpoint(model, path: str) -> None:
+    """Save model parameters as a safetensors file.
+
+    Safetensors format: 8-byte header size + JSON header + raw data.
+    This format survives OpenI model upload (unlike .ckpt protobuf).
+    """
+    header = {}
+    tensors = []
+    data_offset = 0
+    for p in model.get_parameters():
+        arr = p.asnumpy()
+        nbytes = arr.nbytes
+        header[p.name] = {
+            "dtype": _dtype_to_str(arr.dtype),
+            "shape": list(arr.shape),
+            "data_offsets": [data_offset, data_offset + nbytes],
+        }
+        tensors.append(arr.tobytes())
+        data_offset += nbytes
+
+    # Pad header to multiple of 8 bytes
+    header_json = json.dumps(header).encode("utf-8")
+    pad = (8 - len(header_json) % 8) % 8
+    header_json += b" " * pad
+
+    with open(path, "wb") as f:
+        f.write(struct.pack("<Q", len(header_json)))
+        f.write(header_json)
+        for t in tensors:
+            f.write(t)
+
+
+def load_safetensors_checkpoint(path: str) -> dict:
+    """Load safetensors checkpoint into {name: numpy_array} dict."""
+    return _load_single_safetensors(path)
+
+
 def load_safetensors(model_dir: str) -> dict:
     """Load all safetensors files from model_dir.
 
@@ -2088,40 +2138,55 @@ def main() -> None:
     skip_stage1 = False
     stage1_ckpt = os.environ.get(STAGE1_CKPT_ENV, "")
     if not stage1_ckpt:
-        # Search in pretrain model path, then dataset path
-        for base in [PRETRAIN_MODEL_PATH, DATASET_PATH]:
-            candidate = os.path.join(base, "stage1_best.ckpt")
-            # OpenI may mount single-file models as a dir containing the file
-            candidates = [candidate]
-            if os.path.isdir(candidate):
-                candidates.append(
-                    os.path.join(candidate, "stage1_best.ckpt"))
-            for c in candidates:
-                if os.path.isfile(c) and os.path.getsize(c) > 0:
-                    stage1_ckpt = c
+        # Search for stage1_best in both .ckpt and .safetensors formats
+        for fname in ["stage1_best.safetensors", "stage1_best.ckpt"]:
+            for base in [PRETRAIN_MODEL_PATH, DATASET_PATH]:
+                candidate = os.path.join(base, fname)
+                candidates = [candidate]
+                if os.path.isdir(candidate):
+                    candidates.append(os.path.join(candidate, fname))
+                for c in candidates:
+                    if os.path.isfile(c) and os.path.getsize(c) > 0:
+                        stage1_ckpt = c
+                        break
+                if stage1_ckpt:
                     break
             if stage1_ckpt:
                 break
     if not stage1_ckpt or not os.path.isfile(stage1_ckpt) \
             or os.path.getsize(stage1_ckpt) == 0:
-        if stage1_ckpt:
-            log(f"Stage 1 checkpoint found but EMPTY (0 bytes), "
-                f"skipping load: {stage1_ckpt}")
         stage1_ckpt = ""
     log(f"Stage 1 checkpoint: {stage1_ckpt or 'NOT FOUND (will train Stage 1)'} "
         f"(size={os.path.getsize(stage1_ckpt) if stage1_ckpt else 0})")
-    if os.path.isfile(stage1_ckpt):
+    if stage1_ckpt:
         log("")
         log("=" * 60)
         log(f"STAGE 1: Skipping — loading checkpoint: {stage1_ckpt}")
         log("=" * 60)
-        param_dict = ms.load_checkpoint(stage1_ckpt)
-        load_param_into_net(model, param_dict)
-        log(f"Loaded {len(param_dict)} params from Stage 1 checkpoint")
-        skip_stage1 = True
-        compiled = True
-        best_loss = float("inf")
-        step = 0
+        loaded = False
+        if stage1_ckpt.endswith(".safetensors"):
+            param_dict = load_safetensors_checkpoint(stage1_ckpt)
+            param_dict_ms = {}
+            for name, arr in param_dict.items():
+                param_dict_ms[name] = ms.Parameter(
+                    ms.Tensor(arr), name=name)
+            load_param_into_net(model, param_dict_ms)
+            loaded = True
+            log(f"Loaded {len(param_dict)} params from safetensors")
+        else:
+            try:
+                param_dict = ms.load_checkpoint(stage1_ckpt)
+                load_param_into_net(model, param_dict)
+                loaded = True
+                log(f"Loaded {len(param_dict)} params from .ckpt")
+            except Exception as e:
+                log(f"Failed to load .ckpt: {e}")
+                log("Falling back to Stage 1 training")
+        if loaded:
+            skip_stage1 = True
+            compiled = True
+            best_loss = float("inf")
+            step = 0
 
     if not skip_stage1:
         log("")
@@ -2273,6 +2338,10 @@ def main() -> None:
                                 model,
                                 os.path.join(CKPT_DIR,
                                              "stage1_best.ckpt"))
+                            save_safetensors_checkpoint(
+                                model,
+                                os.path.join(CKPT_DIR,
+                                             "stage1_best.safetensors"))
 
                     # Self-evolution probe
                     if step % EVOLUTION_PROBE_STEPS == 0 and step > 0 \
@@ -2298,6 +2367,11 @@ def main() -> None:
                         ckpt_path = os.path.join(
                             CKPT_DIR, f"stage1_step_{step}.ckpt")
                         ms.save_checkpoint(model, ckpt_path)
+                        save_safetensors_checkpoint(
+                            model,
+                            os.path.join(
+                                CKPT_DIR,
+                                f"stage1_step_{step}.safetensors"))
                         log(f"Stage 1 checkpoint: {ckpt_path}")
 
                 log(f"Stage 1 complete: {step} steps, "
@@ -2512,6 +2586,8 @@ def main() -> None:
             if rank_id == 0:
                 ms.save_checkpoint(
                     model, os.path.join(CKPT_DIR, "best.ckpt"))
+                save_safetensors_checkpoint(
+                    model, os.path.join(CKPT_DIR, "best.safetensors"))
                 log(f"  New best loss: {avg_loss:.4f}")
 
         # Self-evolution: probe + adapt difficulty
@@ -2541,6 +2617,11 @@ def main() -> None:
             ckpt_path = os.path.join(
                 CKPT_DIR, f"stage2_step_{step}.ckpt")
             ms.save_checkpoint(model, ckpt_path)
+            save_safetensors_checkpoint(
+                model,
+                os.path.join(
+                    CKPT_DIR,
+                    f"stage2_step_{step}.safetensors"))
             log(f"Stage 2 checkpoint: {ckpt_path}")
 
     # ── Training complete ──
@@ -2549,6 +2630,8 @@ def main() -> None:
     if rank_id == 0:
         ms.save_checkpoint(
             model, os.path.join(CKPT_DIR, "final.ckpt"))
+        save_safetensors_checkpoint(
+            model, os.path.join(CKPT_DIR, "final.safetensors"))
         log("Final checkpoint saved")
 
     results = {
