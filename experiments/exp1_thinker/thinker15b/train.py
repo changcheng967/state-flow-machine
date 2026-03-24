@@ -2103,6 +2103,17 @@ def main() -> None:
     log(f"Stage 1 checkpoint check: {stage1_ckpt or 'NOT FOUND'} "
         f"(exists={os.path.isfile(stage1_ckpt) if stage1_ckpt else False})")
     if os.path.isfile(stage1_ckpt):
+        # Diagnostics: check file size and header before loading
+        ckpt_size = os.path.getsize(stage1_ckpt)
+        expected_size = 6190925819  # known size of stage1_best.ckpt
+        with open(stage1_ckpt, "rb") as _f:
+            header = _f.read(32)
+        log(f"Stage 1 ckpt size: {ckpt_size} bytes "
+            f"(expected: {expected_size}, match: {ckpt_size == expected_size})")
+        log(f"Stage 1 ckpt header (hex): {header[:16].hex()}")
+        log(f"Stage 1 ckpt header (ascii): {repr(header[:32])}")
+        valid_header = header[0] == 0x0a and header[3:8] == b"model"
+        log(f"Stage 1 ckpt valid protobuf header: {valid_header}")
         log("")
         log("=" * 60)
         log(f"STAGE 1: Skipping — loading checkpoint: {stage1_ckpt}")
