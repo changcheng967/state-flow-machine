@@ -1001,21 +1001,15 @@ class TrainStep:
     """
 
     def __init__(self, forward_loss: ForwardLossCell, optimizer,
-                 optimizer2=None, max_grad_norm: float = 1.0,
-                 rank_size: int = 1):
+                 max_grad_norm: float = 1.0, rank_size: int = 1,
+                 n_base: int = 0, grad_scale: float = 1.0):
         self.forward_loss = forward_loss
         self.optimizer = optimizer
-        self.optimizer2 = optimizer2
         self.rank_size = rank_size
-        if optimizer2 is not None:
-            self.weights = ms.ParameterTuple(
-                list(optimizer.parameters) + list(optimizer2.parameters))
-            self.n_base = len(optimizer.parameters)
-        else:
-            self.weights = ms.ParameterTuple(optimizer.parameters)
-            self.n_base = 0
+        self.n_base = n_base
+        self.grad_scale = grad_scale
+        self.weights = ms.ParameterTuple(optimizer.parameters)
         self.max_grad_norm = max_grad_norm
-        self.has_opt2 = optimizer2 is not None
 
         # Build value_and_grad function using forward_loss Cell.
         # grad_position=None: don't differentiate w.r.t. inputs,
@@ -1031,12 +1025,13 @@ class TrainStep:
         self.forward_loss.set_train(mode)
 
     @ms.jit
-    def compute(self, input_ids: Tensor, loss_mask: Tensor,
-                judge_label: Tensor) -> tuple:
-        """Forward + backward + AllReduce + gradient clipping.
+    def step(self, input_ids: Tensor, loss_mask: Tensor,
+             judge_label: Tensor) -> Tensor:
+        """Execute one training step: forward → grad → allreduce → clip → update.
 
         Wrapped in @ms.jit so AllReduce runs inside the compiled graph
-        where HCCL communicator is available.
+        where HCCL communicator is available. In GRAPH_MODE, ops.AllReduce
+        called eagerly (outside jit) has a null hccl_comm pointer.
         """
         # Forward + backward
         loss, grads = self.grad_fn(input_ids, loss_mask, judge_label)
@@ -1063,22 +1058,23 @@ class TrainStep:
         for g in grads:
             clipped = clipped + (g.astype(ms.float32) * clip_coef,)
 
-        return loss, clipped
+        # Gradient scaling for SFM params (simulates higher LR)
+        # When grad_scale > 1, SFM gradients are multiplied by this factor
+        # so a single optimizer with base LR effectively gives SFM params
+        # a higher effective LR. This avoids needing two AdamWeightDecay
+        # instances which clash in @ms.jit (duplicate internal param names).
+        if self.grad_scale > 1.0:
+            scaled = ()
+            idx = 0
+            for g in clipped:
+                if idx < self.n_base:
+                    scaled = scaled + (g,)
+                else:
+                    scaled = scaled + (g * self.grad_scale,)
+                idx = idx + 1
+            clipped = scaled
 
-    def step(self, input_ids: Tensor, loss_mask: Tensor,
-             judge_label: Tensor) -> Tensor:
-        """Execute one training step: compute gradients then update.
-
-        Optimizer calls are outside @ms.jit so each optimizer compiles
-        independently — avoids duplicate parameter name collision when
-        two AdamWeightDecay instances are in the same graph.
-        """
-        loss, clipped = self.compute(input_ids, loss_mask, judge_label)
-        if self.has_opt2:
-            self.optimizer(clipped[:self.n_base])
-            self.optimizer2(clipped[self.n_base:])
-        else:
-            self.optimizer(clipped)
+        self.optimizer(clipped)
         return loss
 
 
@@ -2419,49 +2415,43 @@ def main() -> None:
     log(f"Base params: {sum(p.size for p in base_params):,}")
     log(f"SFM params: {sum(p.size for p in sfm_params):,}")
 
-    # Build LR schedules for each group
+    # Build LR schedule (base LR; SFM gets effective LR via grad scaling)
     lr_schedule_base = []
-    lr_schedule_sfm = []
     for s in range(STAGE2_MAX_STEPS):
         if s < STAGE2_WARMUP:
             warmup_frac = s / max(1, STAGE2_WARMUP)
             lr_base = STAGE2_LR_BASE * warmup_frac
-            lr_sfm = STAGE2_LR_SFM * warmup_frac
         else:
             progress = (s - STAGE2_WARMUP) / max(
                 1, STAGE2_MAX_STEPS - STAGE2_WARMUP)
             min_base = STAGE2_LR_BASE * MIN_LR_FACTOR
-            min_sfm = STAGE2_LR_SFM * MIN_LR_FACTOR
             lr_base = min_base + 0.5 * (STAGE2_LR_BASE - min_base) * (
                 1 + math.cos(math.pi * progress))
-            lr_sfm = min_sfm + 0.5 * (STAGE2_LR_SFM - min_sfm) * (
-                1 + math.cos(math.pi * progress))
         lr_schedule_base.append(lr_base)
-        lr_schedule_sfm.append(lr_sfm)
 
-    # Two separate optimizers for different param group LRs
+    # Single optimizer with base LR. SFM params get higher effective LR
+    # via gradient scaling (grad_scale = lr_sfm / lr_base).
+    # This avoids two AdamWeightDecay instances clashing in @ms.jit.
     lr_s2_base = np.array(lr_schedule_base, dtype=np.float32)
-    lr_s2_sfm = np.array(lr_schedule_sfm, dtype=np.float32)
-    optimizer_base_s2 = nn.AdamWeightDecay(
-        base_params,
+    all_params = base_params + sfm_params
+    n_base_params = len(base_params)
+    grad_scale_s2 = STAGE2_LR_SFM / STAGE2_LR_BASE  # 25.0
+    log(f"Single optimizer: {len(all_params)} params "
+        f"(base={n_base_params}, sfm={len(sfm_params)}), "
+        f"grad_scale={grad_scale_s2:.1f}")
+    optimizer_s2 = nn.AdamWeightDecay(
+        all_params,
         learning_rate=Tensor(lr_s2_base),
         weight_decay=STAGE2_WEIGHT_DECAY,
         beta1=0.9,
         beta2=0.95,
     )
-    optimizer_sfm_s2 = nn.AdamWeightDecay(
-        sfm_params,
-        learning_rate=Tensor(lr_s2_sfm),
-        weight_decay=STAGE2_WEIGHT_DECAY,
-        beta1=0.9,
-        beta2=0.95,
-    )
 
-    # Rebuild training cells with two-optimizer TrainStep
     forward_loss = ForwardLossCell(model, cos_t, sin_t, causal_mask)
     train_step_s2 = TrainStep(
-        forward_loss, optimizer_base_s2, optimizer2=optimizer_sfm_s2,
-        max_grad_norm=MAX_GRAD_NORM, rank_size=rank_size)
+        forward_loss, optimizer_s2,
+        max_grad_norm=MAX_GRAD_NORM, rank_size=rank_size,
+        n_base=n_base_params, grad_scale=grad_scale_s2)
 
     # Compile with OOM fallback (forward pass only)
     actual_bs = BATCH_SIZE_PER_DEVICE
@@ -2487,23 +2477,18 @@ def main() -> None:
                 log(f"  B={bs} OOM, trying smaller...")
                 del train_step_s2
                 gc.collect()
-                optimizer_base_s2 = nn.AdamWeightDecay(
-                    base_params,
+                optimizer_s2 = nn.AdamWeightDecay(
+                    all_params,
                     learning_rate=Tensor(lr_s2_base),
-                    weight_decay=STAGE2_WEIGHT_DECAY,
-                    beta1=0.9, beta2=0.95)
-                optimizer_sfm_s2 = nn.AdamWeightDecay(
-                    sfm_params,
-                    learning_rate=Tensor(lr_s2_sfm),
                     weight_decay=STAGE2_WEIGHT_DECAY,
                     beta1=0.9, beta2=0.95)
                 forward_loss = ForwardLossCell(
                     model, cos_t, sin_t, causal_mask)
                 train_step_s2 = TrainStep(
-                    forward_loss, optimizer_base_s2,
-                    optimizer2=optimizer_sfm_s2,
+                    forward_loss, optimizer_s2,
                     max_grad_norm=MAX_GRAD_NORM,
-                    rank_size=rank_size)
+                    rank_size=rank_size,
+                    n_base=n_base_params, grad_scale=grad_scale_s2)
                 continue
             raise
 
