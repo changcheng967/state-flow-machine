@@ -1031,13 +1031,12 @@ class TrainStep:
         self.forward_loss.set_train(mode)
 
     @ms.jit
-    def step(self, input_ids: Tensor, loss_mask: Tensor,
-             judge_label: Tensor) -> Tensor:
-        """Execute one training step: forward → grad → allreduce → clip → update.
+    def compute(self, input_ids: Tensor, loss_mask: Tensor,
+                judge_label: Tensor) -> tuple:
+        """Forward + backward + AllReduce + gradient clipping.
 
         Wrapped in @ms.jit so AllReduce runs inside the compiled graph
-        where HCCL communicator is available. In GRAPH_MODE, ops.AllReduce
-        called eagerly (outside jit) has a null hccl_comm pointer.
+        where HCCL communicator is available.
         """
         # Forward + backward
         loss, grads = self.grad_fn(input_ids, loss_mask, judge_label)
@@ -1064,13 +1063,22 @@ class TrainStep:
         for g in grads:
             clipped = clipped + (g.astype(ms.float32) * clip_coef,)
 
-        # Optimizer update
+        return loss, clipped
+
+    def step(self, input_ids: Tensor, loss_mask: Tensor,
+             judge_label: Tensor) -> Tensor:
+        """Execute one training step: compute gradients then update.
+
+        Optimizer calls are outside @ms.jit so each optimizer compiles
+        independently — avoids duplicate parameter name collision when
+        two AdamWeightDecay instances are in the same graph.
+        """
+        loss, clipped = self.compute(input_ids, loss_mask, judge_label)
         if self.has_opt2:
             self.optimizer(clipped[:self.n_base])
             self.optimizer2(clipped[self.n_base:])
         else:
             self.optimizer(clipped)
-
         return loss
 
 
@@ -2448,13 +2456,6 @@ def main() -> None:
         beta1=0.9,
         beta2=0.95,
     )
-    # Rename internal parameters to avoid duplicate names when both
-    # optimizers are inlined into the same @ms.jit graph.
-    for p in optimizer_sfm_s2.parameters:
-        if p.name == "global_step":
-            p.name = "sfm_global_step"
-        elif p.name == "learning_rate":
-            p.name = "sfm_learning_rate"
 
     # Rebuild training cells with two-optimizer TrainStep
     forward_loss = ForwardLossCell(model, cos_t, sin_t, causal_mask)
@@ -2496,12 +2497,6 @@ def main() -> None:
                     learning_rate=Tensor(lr_s2_sfm),
                     weight_decay=STAGE2_WEIGHT_DECAY,
                     beta1=0.9, beta2=0.95)
-                # Rename internal params to avoid duplicate names
-                for p in optimizer_sfm_s2.parameters:
-                    if p.name == "global_step":
-                        p.name = "sfm_global_step"
-                    elif p.name == "learning_rate":
-                        p.name = "sfm_learning_rate"
                 forward_loss = ForwardLossCell(
                     model, cos_t, sin_t, causal_mask)
                 train_step_s2 = TrainStep(
